@@ -92,7 +92,13 @@ function handleFsAction(
   return fileListResponse(fsPrefix, path)
 }
 
-function handleFileDownload(pathname: string): Response {
+function handleFileDownload(encodedPathname: string): Response {
+  let pathname = encodedPathname
+  try {
+    pathname = decodeURIComponent(encodedPathname)
+  } catch {
+    return new Response('Bad request', { status: 400 })
+  }
   const fsPath = pathname.startsWith('/sd/')
     ? pathname
     : '/localfs/' + pathname.split('/').slice(2).join('/')

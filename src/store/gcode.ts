@@ -8,7 +8,7 @@ import {
   type WorkOffset,
 } from '../lib/gcode'
 import { useMachineStore } from '../store'
-import { getBase, sendCommand } from '../lib/http'
+import { encodeFilePath, getBase, sendCommand } from '../lib/http'
 import { MM_PER_INCH } from '../lib/units'
 import { sendRaw } from '../lib/ws'
 import {
@@ -61,6 +61,8 @@ interface GCodeStore {
   is3DReady: boolean
   /** SD-card path currently being uploaded for the selected preview. */
   sdUploadPath: string | null
+  /** Why the last selected file could not be previewed, if it failed. */
+  loadError: string | null
 
   // Job completion feedback
   trackedJob: { source: TrackedJobSource; startedAt: number } | null
@@ -169,6 +171,23 @@ async function getParseOptions(): Promise<ParseGCodeOptions> {
   return { activeWcs, currentWco, workOffsets }
 }
 
+/** Store fields that describe a loaded preview. */
+const NO_PREVIEW = {
+  loadedPath: null,
+  fileName: null,
+  sourceText: null,
+  restartSource: null,
+  activeSourceLine: null,
+  model: null,
+  renderLines: null,
+  paths2D: null,
+  geometry3D: null,
+} as const
+
+function loadErrorMessage(name: string, error: unknown) {
+  return `Could not load ${name} (${error instanceof Error ? error.message : String(error)}).`
+}
+
 /**
  * Parses and prepares the 2D preview in short time slices, so multi-million
  * line laser jobs do not freeze the page. Progress runs from 5 to 100.
@@ -217,6 +236,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
   processing3DProgress: 0,
   is3DReady: false,
   sdUploadPath: null,
+  loadError: null,
   trackedJob: null,
   finishedJobElapsedMs: null,
 
@@ -231,6 +251,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
 
     set({
       loading: true,
+      loadError: null,
       pendingPath: path,
       pendingFileName: path.split('/').pop() ?? path,
       downloadProgress: 0,
@@ -245,7 +266,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     })
 
     try {
-      const url = `${getBase()}${path}`
+      const url = `${getBase()}${encodeFilePath(path)}`
       abortController = new AbortController()
       const res = await fetch(url, { signal: abortController.signal })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -332,6 +353,9 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       if (requestId === loadRequestId && (!(e instanceof Error) || e.message !== 'stale-load')) {
         if (!(e instanceof DOMException && e.name === 'AbortError')) {
           console.error('Failed to load G-code:', e)
+          // Keep nothing of the previous file: Start would otherwise run it
+          // instead of the one that was selected.
+          set({ ...NO_PREVIEW, loadError: loadErrorMessage(path.split('/').pop() ?? path, e) })
         }
       }
     } finally {
@@ -359,6 +383,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
 
     set({
       loading: true,
+      loadError: null,
       pendingPath: null,
       pendingFileName: name,
       downloadProgress: 100,
@@ -413,6 +438,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     } catch (e) {
       if (requestId === loadRequestId && (!(e instanceof Error) || e.message !== 'stale-load')) {
         console.error('Failed to load G-code from text:', e)
+        set({ ...NO_PREVIEW, loadError: loadErrorMessage(name, e) })
       }
     } finally {
       if (requestId === loadRequestId) {
@@ -559,6 +585,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       processing3DProgress: 0,
       is3DReady: false,
       sdUploadPath: null,
+      loadError: null,
     })
   },
 }))

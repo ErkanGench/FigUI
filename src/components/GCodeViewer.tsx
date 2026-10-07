@@ -1363,6 +1363,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const processing3DProgress = useGCodeStore(s => s.processing3DProgress)
   const is3DReady = useGCodeStore(s => s.is3DReady)
   const sdUploadPath = useGCodeStore(s => s.sdUploadPath)
+  const loadError = useGCodeStore(s => s.loadError)
   const showRapids = useGCodeStore(s => s.showRapids)
   const setShowRapids = useGCodeStore(s => s.setShowRapids)
   const storePaths2D = useGCodeStore(s => s.paths2D)
@@ -3563,8 +3564,17 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
         {!model && !loading && (
           <div className="absolute inset-0 flex flex-col items-center justify-center text-text-dim text-2xl gap-2">
-            <Eye size={24} className="opacity-30" />
-            <span>Click a G-code file to preview</span>
+            {loadError ? (
+              <>
+                <AlertTriangle size={24} className="text-warn" />
+                <span className="max-w-md px-4 text-center text-base text-warn" role="alert">{loadError}</span>
+              </>
+            ) : (
+              <>
+                <Eye size={24} className="opacity-30" />
+                <span>Click a G-code file to preview</span>
+              </>
+            )}
           </div>
         )}
 
