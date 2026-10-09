@@ -2021,6 +2021,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const finishedJobElapsedMs = useGCodeStore(s => s.finishedJobElapsedMs)
   const dismissFinishedJobNotice = useGCodeStore(s => s.dismissFinishedJobNotice)
+  const interruptedJob = useGCodeStore(s => s.interruptedJob)
+  const dismissInterruptedJobNotice = useGCodeStore(s => s.dismissInterruptedJobNotice)
   const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
   const runtime = useJobRuntimeEstimate(
     status,
@@ -3779,6 +3781,35 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 className="text-text-dim hover:text-text-primary"
                 onClick={dismissFinishedJobNotice}
                 aria-label="Dismiss job finished message"
+                title="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+        {interruptedJob && (
+          <div className="rounded border border-warn/40 bg-warn/10 px-3 py-2" role="alert">
+            <div className="flex items-start justify-between gap-3 text-sm">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 font-semibold text-warn">
+                  <AlertTriangle size={14} className="shrink-0" />
+                  {interruptedJob.controllerRestarted ? 'Controller restarted during the job' : 'Job end not confirmed'}
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-text-primary">
+                  {interruptedJob.controllerRestarted ? 'The job stopped' : 'The connection was lost'} after{' '}
+                  <span className="font-mono">{formatRuntime(interruptedJob.elapsedMs / 1000)}</span>
+                  {interruptedJob.sdPercent != null && <> at <span className="font-mono">{Math.round(interruptedJob.sdPercent)}%</span></>}
+                  {interruptedJob.line != null && <>, near line <span className="font-mono">{interruptedJob.line.toLocaleString()}</span></>}
+                  {interruptedJob.controllerRestarted
+                    ? '. Its position was reset to zero but the toolhead stayed where it stopped, so home or set the work zero again before restarting.'
+                    : ', and the controller was not running the job when it came back. Check the work before treating the job as finished.'}
+                </p>
+              </div>
+              <button
+                className="text-text-dim hover:text-text-primary"
+                onClick={dismissInterruptedJobNotice}
+                aria-label="Dismiss interrupted job message"
                 title="Dismiss"
               >
                 <X size={14} />

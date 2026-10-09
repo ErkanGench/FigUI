@@ -23,7 +23,7 @@ import { AboutModal } from './components/AboutModal'
 import { JobControl } from './components/JobControl'
 import { PluginLauncher } from './components/PluginLauncher'
 import { WifiOff, RefreshCw, Crosshair, Monitor, FolderOpen, TerminalSquare, AlertTriangle } from 'lucide-react'
-import type { Plugin, SidebarTab, ActiveLayout } from './types'
+import type { Plugin, Position, SidebarTab, ActiveLayout } from './types'
 import { getEffectiveLayout } from './types'
 import { PluginFrame } from './components/PluginFrame'
 import { DesktopLayout } from './components/DesktopLayout'
@@ -41,6 +41,10 @@ const SIDEBAR_TABS: { id: SidebarTab; label: string }[] = [
 type MobilePanel = 'control' | 'viewer' | 'right' | 'terminal'
 
 type Phase = 'connecting' | 'error' | 'ready'
+
+function isZeroPosition(p: Position): boolean {
+  return p.x === 0 && p.y === 0 && p.z === 0 && !p.a && !p.b && !p.c
+}
 
 function useActiveLayout(layoutMode: 'auto' | 'tablet' | 'desktop'): ActiveLayout {
   const { innerWidth: width } = useViewportMetrics()
@@ -84,6 +88,7 @@ function AppContent() {
   const clearTerminal = useTerminalStore(s => s.clear)
   const machineState = useMachineStore(s => s.status.state)
   const spindleSpeed = useMachineStore(s => s.status.spindle)
+  const statusReportCount = useMachineStore(s => s.statusReportCount)
   const spindleSpinupMs = useMachineStore(s => s.controllerSettings.spindleSpinupMs ?? 0)
   const activeLayout = useActiveLayout(layoutMode)
   const { isCompactLandscape } = useViewportMetrics()
@@ -98,6 +103,7 @@ function AppContent() {
   const activeJobStartedAt = useGCodeStore(s => s.trackedJob?.startedAt)
   const finishTrackedJob = useGCodeStore(s => s.finishTrackedJob)
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
+  const interruptTrackedJob = useGCodeStore(s => s.interruptTrackedJob)
   const [phase, setPhase]   = useState<Phase>('connecting')
   const [errMsg, setErrMsg] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -160,6 +166,12 @@ function AppContent() {
   const controllerJobAwaitingRunAfterSpinupRef = useRef(false)
   const controllerJobSpinupSeenRef = useRef(false)
   const controllerTrackedJobStartedAtRef = useRef<number | null>(null)
+  const controllerJobConnectionLossRef = useRef<{
+    reportCount: number
+    sdPercent: number | null
+    line: number | null
+    mpos: Position
+  } | null>(null)
 
   useEffect(() => {
     if (activeJobSource !== 'local') return
@@ -173,6 +185,7 @@ function AppContent() {
       controllerJobAwaitingRunAfterSpinupRef.current = false
       controllerJobSpinupSeenRef.current = false
       controllerTrackedJobStartedAtRef.current = null
+      controllerJobConnectionLossRef.current = null
       return
     }
 
@@ -181,6 +194,39 @@ function AppContent() {
       controllerJobAwaitingRunAfterSpinupRef.current = false
       controllerJobSpinupSeenRef.current = false
       controllerTrackedJobStartedAtRef.current = activeJobStartedAt ?? null
+      controllerJobConnectionLossRef.current = null
+    }
+
+    // The machine state is kept across a dropped connection. Remember where the
+    // job was, and judge it only by reports that arrive after reconnecting.
+    if (!connected) {
+      if (controllerJobWasRunningRef.current && !controllerJobConnectionLossRef.current) {
+        const { status, statusReportCount } = useMachineStore.getState()
+        controllerJobConnectionLossRef.current = {
+          reportCount: statusReportCount,
+          sdPercent: status.sdPercent ?? null,
+          line: useGCodeStore.getState().activeSourceLine,
+          mpos: status.mpos,
+        }
+      }
+      return
+    }
+    const loss = controllerJobConnectionLossRef.current
+    if (loss) {
+      if (statusReportCount === loss.reportCount) return
+      controllerJobConnectionLossRef.current = null
+      if (machineState !== 'Run' && machineState !== 'Hold') {
+        // A controller that restarts drops the connection and comes back idle,
+        // which used to read as a finished job. Without homing, it also comes
+        // back with its machine position at zero while the toolhead stayed put.
+        const mpos = useMachineStore.getState().status.mpos
+        interruptTrackedJob('controller', {
+          sdPercent: loss.sdPercent,
+          line: loss.line,
+          controllerRestarted: isZeroPosition(mpos) && !isZeroPosition(loss.mpos),
+        })
+        return
+      }
     }
 
     if (machineState === 'Run' || machineState === 'Hold') {
@@ -207,11 +253,14 @@ function AppContent() {
   }, [
     activeJobSource,
     activeJobStartedAt,
+    connected,
     machineState,
+    statusReportCount,
     spindleSpeed,
     spindleSpinupMs,
     finishTrackedJob,
     cancelTrackedJob,
+    interruptTrackedJob,
   ])
 
   useEffect(() => {
