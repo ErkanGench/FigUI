@@ -1935,6 +1935,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
    * into place and stroked again once the view settles.
    */
   function drawStatic2DLayer(ctx: CanvasRenderingContext2D, paths: Static2DPaths, t: Transform, w: number, h: number, lineCount: number) {
+    // A hidden viewer has no size; a zero-sized layer canvas cannot be drawn.
+    if (w < 1 || h < 1) return
     const dpr = window.devicePixelRatio || 1
     const showRapids = showRapidsRef.current
     const hiddenTools = hiddenToolsRef.current
