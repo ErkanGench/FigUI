@@ -24,6 +24,8 @@ export interface RestartAnalysis {
   resumeText: string
   context: Array<{ line: number; text: string; resume: boolean }>
   state: RestartModalState
+  /** False when no line commands Z, as in hand-focused laser jobs. The restart then leaves Z alone. */
+  movesZ: boolean
   warnings: string[]
   blockers: string[]
 }
@@ -127,11 +129,14 @@ function addUnique(target: string[], message: string) {
   if (!target.includes(message)) target.push(message)
 }
 
+/** Reports program-wide blockers and returns whether any line commands Z. */
 function scanProgramWideSafety(lines: string[], blockers: string[]) {
+  let movesZ = false
   for (let index = 0; index < lines.length; index++) {
     const code = stripComments(lines[index])
     if (!code) continue
     const line = index + 1
+    if (!movesZ && code.includes('Z') && wordsIn(code).some(word => word.letter === 'Z')) movesZ = true
     if (code.includes('#') || /\b(?:IF|WHILE|ENDWHILE|GOTO|CALL|RETURN)\b/.test(code)) {
       addUnique(blockers, `Line ${line} uses macro or conditional syntax, which cannot be reconstructed safely.`)
     }
@@ -145,6 +150,7 @@ function scanProgramWideSafety(lines: string[], blockers: string[]) {
       addUnique(blockers, `Line ${line} contains a rotary or auxiliary axis. This restart version supports XYZ programs only.`)
     }
   }
+  return movesZ
 }
 
 function applyPrefixLine(raw: string, state: MutableState, blockers: string[]) {
@@ -331,7 +337,7 @@ export function analyzeRestart(text: string, requestedLine: number): RestartAnal
 
   const blockers: string[] = []
   const warnings: string[] = []
-  scanProgramWideSafety(lines, blockers)
+  const movesZ = scanProgramWideSafety(lines, blockers)
 
   if (resumeIndex >= lines.length) {
     addUnique(blockers, 'There is no executable G-code at or after the requested line.')
@@ -344,7 +350,7 @@ export function analyzeRestart(text: string, requestedLine: number): RestartAnal
   }
 
   if (resumeIndex > 0) {
-    for (const axis of ['x', 'y', 'z'] as const) {
+    for (const axis of movesZ ? ['x', 'y', 'z'] as const : ['x', 'y'] as const) {
       if (!state.positionKnown[axis]) {
         addUnique(blockers, `The ${axis.toUpperCase()} position before line ${resumeIndex + 1} cannot be determined from the program.`)
       }
@@ -387,6 +393,9 @@ export function analyzeRestart(text: string, requestedLine: number): RestartAnal
   if (resumeIndex > 0 && state.spindle === 'M5') {
     warnings.push('The spindle is off at the restart point. Verify that the selected line starts it before any cutting move.')
   }
+  if (resumeIndex > 0 && !movesZ) {
+    warnings.push('The program never commands Z, so the restart does not move Z either. Check the focus or Z height before running.')
+  }
 
   const contextStart = Math.max(0, resumeIndex - 2)
   const contextEnd = Math.min(lines.length, resumeIndex + 3)
@@ -418,6 +427,7 @@ export function analyzeRestart(text: string, requestedLine: number): RestartAnal
       coolant: [...state.coolant],
       positionMm: { ...state.positionMm },
     },
+    movesZ,
     warnings,
     blockers,
   }
@@ -440,11 +450,13 @@ export function buildRestartProgram(text: string, analysis: RestartAnalysis, opt
       '',
     ].join('\n')
   }
-  if (![options.safeMachineZMm, options.clearanceMm, options.approachFeedMmPerMin].every(Number.isFinite)) {
-    throw new Error('Restart positioning values must be valid numbers.')
+  if (analysis.movesZ) {
+    if (![options.safeMachineZMm, options.clearanceMm, options.approachFeedMmPerMin].every(Number.isFinite)) {
+      throw new Error('Restart positioning values must be valid numbers.')
+    }
+    if (options.clearanceMm < 0) throw new Error('Approach clearance cannot be negative.')
+    if (options.approachFeedMmPerMin <= 0) throw new Error('Approach feed must be greater than zero.')
   }
-  if (options.clearanceMm < 0) throw new Error('Approach clearance cannot be negative.')
-  if (options.approachFeedMmPerMin <= 0) throw new Error('Approach feed must be greater than zero.')
   const sourceFeed = state.feedMmPerMin == null
     ? null
     : state.units === 'G20' ? state.feedMmPerMin / 25.4 : state.feedMmPerMin
@@ -461,25 +473,24 @@ export function buildRestartProgram(text: string, analysis: RestartAnalysis, opt
     state.tool != null ? `(VERIFY TOOL T${state.tool} IS LOADED)` : '(VERIFY THE CORRECT TOOL IS LOADED)',
     '',
     '(SAFE RESTART POSITIONING)',
+    ...(analysis.movesZ ? [] : ['(THE PROGRAM NEVER COMMANDS Z - Z IS NOT MOVED)']),
     'M5',
     'M9',
     'G21 G90 G40 G80 G49',
-    `G53 G0 Z${fmt(options.safeMachineZMm)}`,
+    ...(analysis.movesZ ? [`G53 G0 Z${fmt(options.safeMachineZMm)}`] : []),
     state.wcs,
   ]
 
   if (state.tool != null) output.push(`T${state.tool}`)
   if (state.toolLength.mode === 'G43') output.push(`G43 H${state.toolLength.h}`)
-  output.push(
-    `G0 X${fmt(p.x)} Y${fmt(p.y)}`,
-    `G0 Z${fmt(p.z + options.clearanceMm)}`,
-  )
+  output.push(`G0 X${fmt(p.x)} Y${fmt(p.y)}`)
+  if (analysis.movesZ) output.push(`G0 Z${fmt(p.z + options.clearanceMm)}`)
   if (state.spindle !== 'M5') {
     output.push(`${state.spindleSpeed != null ? `S${fmt(state.spindleSpeed, 2)} ` : ''}${state.spindle}`)
   }
   if (state.coolant.length) output.push(state.coolant.join(' '))
+  if (analysis.movesZ) output.push(`G94 G1 Z${fmt(p.z)} F${fmt(options.approachFeedMmPerMin, 2)}`)
   output.push(
-    `G94 G1 Z${fmt(p.z)} F${fmt(options.approachFeedMmPerMin, 2)}`,
     '',
     '(RESTORE PROGRAM MODES)',
     `${state.units} ${state.plane} ${state.arcDistance} ${state.feedMode}`,

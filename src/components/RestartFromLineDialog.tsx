@@ -113,7 +113,7 @@ export function RestartFromLineDialog({
   const safeZ = numericInput(safeZText)
   const clearance = numericInput(clearanceText)
   const approachFeed = numericInput(approachFeedText)
-  const positioningValid = analysis?.resumeLine === 1 || (Number.isFinite(safeZ)
+  const positioningValid = analysis?.resumeLine === 1 || analysis?.movesZ === false || (Number.isFinite(safeZ)
     && Number.isFinite(clearance) && clearance >= 0
     && Number.isFinite(approachFeed) && approachFeed > 0)
   const canPrepare = !!analysis && analysis.blockers.length === 0 && positioningValid && !preparing
@@ -314,7 +314,7 @@ export function RestartFromLineDialog({
                 <SummaryCell label="Tool" value={analysis.state.tool == null ? 'Verify' : `T${analysis.state.tool}`} />
                 <SummaryCell
                   label={`Start position (${linearUnitLabel(units)})`}
-                  value={`X${fmtLinear(analysis.state.positionMm.x, units)} Y${fmtLinear(analysis.state.positionMm.y, units)} Z${fmtLinear(analysis.state.positionMm.z, units)}`}
+                  value={`X${fmtLinear(analysis.state.positionMm.x, units)} Y${fmtLinear(analysis.state.positionMm.y, units)}${analysis.movesZ ? ` Z${fmtLinear(analysis.state.positionMm.z, units)}` : ''}`}
                   compact
                 />
               </div>
@@ -341,7 +341,7 @@ export function RestartFromLineDialog({
                 </div>
               )}
 
-              {analysis.blockers.length === 0 && analysis.resumeLine > 1 && (
+              {analysis.blockers.length === 0 && analysis.resumeLine > 1 && analysis.movesZ && (
                 <details className="rounded border border-border bg-elevated/40 group">
                   <summary className="cursor-pointer select-none px-3.5 py-2.5 text-sm font-semibold text-text-primary">
                     Safe positioning
