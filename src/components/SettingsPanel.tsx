@@ -1649,7 +1649,9 @@ export function SettingsPanel({
 
   async function saveSetting(p: string, t: string, v: string) {
     // Always update runtime configuration first
-    await sendCommand(`[ESP401]P=${p} T=${t} V=${v}`);
+    // FluidNC's V= parser stops at an unescaped space and treats backslash as an escape
+    const escaped = v.replace(/\\/g, "\\\\").replace(/ /g, "\\ ");
+    await sendCommand(`[ESP401]P=${p} T=${t} V=${escaped}`);
 
     const setting = settings.find((s) => s.P === p);
     const updatedSettings = updateControllerConfigSetting(
