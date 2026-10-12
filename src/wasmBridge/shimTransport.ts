@@ -60,9 +60,9 @@ export function isWasmBridgeActive(): boolean {
 }
 
 // The HTTP base src/App.tsx sets while the bridge is active, in place of
-// `http://${window.location.host}`: location.host is empty inside the
-// demo's blob: iframe, and setBase() strips a trailing slash, so the
-// normal base degenerates to "http:/" and a LocalFS file request becomes
+// window.location.origin: inside the demo's blob: iframe that is not the
+// device (location.host is empty), so a host-based base degenerates to
+// "http:/" and a LocalFS file request becomes
 // "http://config.yaml" -- indistinguishable from a real host named
 // config.yaml. A fixed, never-resolvable (.invalid, RFC 2606) host makes
 // every device request unambiguous for httpBridge.ts to recognize.
