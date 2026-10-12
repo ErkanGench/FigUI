@@ -248,7 +248,8 @@ export function connect(host: string): Promise<void> {
     const myGen = generation
 
     let ws: WebSocket
-    const url = new URL(host.includes('/') ? `ws://${host}` : `ws://${host}/`)
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'  // ws: from https is mixed content
+    const url = new URL(host.includes('/') ? `${scheme}://${host}` : `${scheme}://${host}/`)
     url.searchParams.set('independent_session', '1')
     try {
       ws = new WebSocket(url.toString(), 'arduino')
