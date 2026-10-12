@@ -285,7 +285,9 @@ function AppContent() {
     const p = (async () => {
       try {
         const httpHost = window.location.host
-        setBase(isWasmBridgeActive() ? WASM_BRIDGE_BASE : `http://${httpHost}`)
+        // The page's own origin, so an https page (e.g. the wasm demo) does
+        // not make http requests, which the browser blocks as mixed content
+        setBase(isWasmBridgeActive() ? WASM_BRIDGE_BASE : window.location.origin)
         const { wsHost } = await resolveWsHost(httpHost)
         await connect(wsHost)
         cachedHostFailures.current = 0
