@@ -6,12 +6,11 @@ let base = ''
 export const setBase = (url: string) => { base = url.replace(/\/$/, '') }
 export const getBase = () => base
 
-// FluidNC can serve several WebUIs at once, each from /ui/<name>/.  There,
-// FigUI keeps its own state files (macrocfg.json) and its updates in that
-// directory, so it does not overwrite another WebUI's.  Null when FigUI is
-// served from /, where everything stays on LocalFS as before.  (Commands
-// and the WebSocket need no change: FigUI's WebSocket already uses an
-// independent session, and commands are routed to it by PAGEID.)
+/**
+ * Detect FigUI's /ui/<name>/ directory for its state files and updates.
+ * Returns null outside that route, preserving shared LocalFS storage.
+ * Commands and the WebSocket still use the independent session and PAGEID.
+ */
 export const uiDir: string | null = (() => {
   const m = /^\/ui\/[^/]+\//.exec(window.location.pathname)
   return m ? m[0] : null
@@ -446,8 +445,7 @@ function asTarget(v: unknown): 'SD' | 'ESP' {
   return asString(v).toUpperCase() === 'SD' ? 'SD' : 'ESP'
 }
 
-// Under /ui/<name>/, use FigUI's own macros once they have been saved
-// there, and the shared LocalFS ones until then.
+/** Read FigUI's own macro configuration, falling back to shared LocalFS if the read fails. */
 async function readMacroCfg(): Promise<string> {
   if (uiDir) {
     try {
@@ -459,6 +457,7 @@ async function readMacroCfg(): Promise<string> {
   return fetchFileContent(MACRO_CFG, 'local')
 }
 
+/** Parse and normalize saved macros, returning an empty list if loading or parsing fails. */
 export async function loadMacroCfg(): Promise<Macro[]> {
   try {
     const text = await readMacroCfg()
@@ -479,6 +478,10 @@ export async function loadMacroCfg(): Promise<Macro[]> {
   }
 }
 
+/**
+ * Save macros with at least nine slots in FigUI's own directory, or shared
+ * LocalFS when served outside /ui/<name>/. Rejects if the write fails.
+ */
 export async function saveMacroCfg(data: Macro[]): Promise<void> {
   const slotCount = Math.max(9, data.length)
   const config = Array.from({ length: slotCount }, (_, i) => {

@@ -235,6 +235,7 @@ const TIPS: Tip[] = [
   },
 ]
 
+/** Display application details, usage tips, release notes, and self-update controls. */
 export function AboutModal({ onClose }: Props) {
   const theme = useMachineStore(s => s.theme)
   const espInfo = useMachineStore(s => s.espInfo)
@@ -311,6 +312,11 @@ export function AboutModal({ onClose }: Props) {
     }
   }
 
+  /**
+   * Download and install FigUI in its own UI directory, or the LocalFS root
+   * when served outside /ui/<name>/, reporting upload progress and errors.
+   * Clear the dismissed and pending update state after a successful upload.
+   */
   async function performUpdate() {
     downloadedBuffer.current = null
     try {
