@@ -6,6 +6,51 @@ let base = ''
 export const setBase = (url: string) => { base = url.replace(/\/$/, '') }
 export const getBase = () => base
 
+/**
+ * Detect FigUI's /ui/<name>/ directory for its state files and updates.
+ * Returns null outside that route, preserving shared LocalFS storage.
+ * Commands and the WebSocket still use the independent session and PAGEID.
+ */
+export const uiDir: string | null = (() => {
+  const m = /^\/ui\/[^/]+\//.exec(window.location.pathname)
+  return m ? m[0] : null
+})()
+
+/** Read a file from FigUI's own /ui/<name>/ directory */
+async function fetchUiFile(name: string): Promise<string> {
+  const res = await fetch(`${base}${uiDir}${name}`, { cache: 'no-store' })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.text()
+}
+
+/**
+ * Write a file into FigUI's own /ui/<name>/ directory.  FluidNC takes the
+ * request body as the file contents (no multipart form), writes it under a
+ * temporary name, and renames it when complete.  It answers 201 or 204, or
+ * 503 while the machine is moving.
+ */
+export function putUiFile(name: string, data: Blob, onProgress?: (pct: number) => void): Promise<void> {
+  return serializeFilesystem('local', () => new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    if (onProgress) {
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve()
+      else if (xhr.status === 503) reject(new Error('Cannot save while the machine is moving'))
+      else reject(new Error(`Upload ${xhr.status}`))
+    }
+    xhr.onerror = () => reject(new Error('Upload failed'))
+    xhr.onabort = () => reject(new Error('Upload cancelled'))
+    xhr.ontimeout = () => reject(new Error('Upload timed out'))
+    xhr.timeout = Math.max(120_000, Math.ceil(data.size / 65_536) * 1_000)
+    xhr.open('PUT', `${base}${uiDir}${name}`)
+    xhr.send(data)
+  }))
+}
+
 export class WebUIBlockedError extends Error {
   constructor() {
     super('Cannot load WebUI while GCode Program is Running')
@@ -400,9 +445,22 @@ function asTarget(v: unknown): 'SD' | 'ESP' {
   return asString(v).toUpperCase() === 'SD' ? 'SD' : 'ESP'
 }
 
+/** Read FigUI's own macro configuration, falling back to shared LocalFS if the read fails. */
+async function readMacroCfg(): Promise<string> {
+  if (uiDir) {
+    try {
+      return await fetchUiFile('macrocfg.json')
+    } catch {
+      // Not saved here yet
+    }
+  }
+  return fetchFileContent(MACRO_CFG, 'local')
+}
+
+/** Parse and normalize saved macros, returning an empty list if loading or parsing fails. */
 export async function loadMacroCfg(): Promise<Macro[]> {
   try {
-    const text = await fetchFileContent(MACRO_CFG, 'local')
+    const text = await readMacroCfg()
     const data = JSON.parse(text)
     if (!Array.isArray(data)) return []
     return data.map((entry: any) => ({
@@ -420,6 +478,10 @@ export async function loadMacroCfg(): Promise<Macro[]> {
   }
 }
 
+/**
+ * Save macros with at least nine slots in FigUI's own directory, or shared
+ * LocalFS when served outside /ui/<name>/. Rejects if the write fails.
+ */
 export async function saveMacroCfg(data: Macro[]): Promise<void> {
   const slotCount = Math.max(9, data.length)
   const config = Array.from({ length: slotCount }, (_, i) => {
@@ -445,5 +507,10 @@ export async function saveMacroCfg(data: Macro[]): Promise<void> {
       index: i,
     }
   })
-  await saveFileContent('/', 'macrocfg.json', JSON.stringify(config, null, 1), 'local')
+  const text = JSON.stringify(config, null, 1)
+  if (uiDir) {
+    await putUiFile('macrocfg.json', new Blob([text], { type: 'application/json' }))
+  } else {
+    await saveFileContent('/', 'macrocfg.json', text, 'local')
+  }
 }
