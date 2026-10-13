@@ -76,8 +76,8 @@ function get(path: string, params: Record<string, string>, timeoutMs?: number): 
   })
 }
 
-export const sendCommand = (cmd: string) =>
-  get('/command', { plain: cmd })
+export const sendCommand = (cmd: string, timeoutMs?: number) =>
+  get('/command', { plain: cmd }, timeoutMs)
 
 export const sendSilent = (cmd: string) =>
   get('/command_silent', { plain: cmd })
