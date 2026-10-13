@@ -20,6 +20,8 @@ export function parseStatusReport(raw: string, options: ParseStatusOptions = {})
 
   status.feed = 0
   status.spindle = 0
+  // FluidNC leaves Pn: out once no pin is active.
+  status.pinState = ''
 
   const linearScale = options.reportInches ? MM_PER_INCH : 1
 
@@ -200,6 +202,12 @@ export function parseControllerSettingLine(line: string): Partial<ControllerSett
   if (inchReport) {
     const flag = parseBooleanSetting(inchReport[1])
     return flag === undefined ? null : { reportInches: flag }
+  }
+
+  const laserMode = line.match(/^\$(?:32|Grbl\/LaserMode)=(\S+)/i)
+  if (laserMode) {
+    const flag = parseBooleanSetting(laserMode[1])
+    return flag === undefined ? null : { laserMode: flag }
   }
 
   const match = line.match(/^\$(11|23|30|31|100|101|102|110|111|112|120|121|122|130|131|132)=(-?\d+(?:\.\d+)?)(?:\s|$)/)

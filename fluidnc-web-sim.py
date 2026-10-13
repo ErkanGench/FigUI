@@ -100,7 +100,7 @@ def status_report():
              f"|FS:{m['feed']},{m['spindle']}"
              f"|Ov:{m['feed_ov']},{m['rapid_ov']},{m['spindle_ov']}>")
         if m['sd_file']:
-            s = s[:-1] + f"|SD:{m['sd_file']},{m['sd_pct']}>"
+            s = s[:-1] + f"|SD:{m['sd_pct']},{m['sd_file']}>"
     return s
 
 def handle_realtime(byte):
@@ -572,7 +572,7 @@ def handle_fs_action(fs_dir, request):
     elif action == 'rename':
         newname = request.args.get('newname', '')
         if newname:
-            try: os.rename(localpath, os.path.join(localdir, newname))
+            try: os.replace(localpath, os.path.join(localdir, newname))
             except: pass
 
     return make_files_list(fs_dir, raw_path, 'Ok')
@@ -584,7 +584,7 @@ def index():
 @app.route('/command')
 @app.route('/command_silent')
 def do_command():
-    plain = request.args.get('plain', '')
+    plain = request.args.get('plain') or request.args.get('cmd', '')
     if plain == '[ESP800]':
         return esp800resp
     if proxy:

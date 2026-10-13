@@ -56,7 +56,7 @@ function fileListResponse(dirPrefix: string, path: string): Response {
 }
 
 function handleCommand(params: URLSearchParams): Response {
-  const plain = params.get('plain') ?? ''
+  const plain = params.get('plain') ?? params.get('cmd') ?? ''
   if (plain === '[ESP800]') return ok(ESP800)
   if (plain === '[ESP400]') return ok(ESP400, 'application/json')
   return ok('ok')

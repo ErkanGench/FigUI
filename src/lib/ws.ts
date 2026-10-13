@@ -1,6 +1,7 @@
 import { parseControllerSettingLine, parseGcStateLine, parseStatusReport } from './parser'
 import { useMachineStore } from '../store'
 import { sendCommand } from './http'
+import type { MachineStatus } from '../types'
 
 let socket: WebSocket | null = null
 
@@ -20,16 +21,27 @@ interface SilentResponseMatcher {
   done: (line: string) => boolean
 }
 
+const isCommandEnd = (line: string) => line === 'ok' || line === 'error' || line.startsWith('error:')
+
 const ALARM_QUERY_SILENT_RESPONSE: SilentResponseMatcher = {
   starts: (line) => /^\d+:\s/.test(line) || /^Active alarm:\s*\d+\s*\([^)]+\)/.test(line),
   consume: (line) => /^\d+:\s/.test(line) || /^Active alarm:\s*\d+\s*\([^)]+\)/.test(line),
-  done: (line) => line === 'ok' || line === 'error',
+  done: isCommandEnd,
 }
 
 const GCODE_STATE_QUERY_SILENT_RESPONSE: SilentResponseMatcher = {
   starts: (line) => line.startsWith('[GC:') && line.endsWith(']'),
   consume: (line) => line.startsWith('[GC:') && line.endsWith(']'),
-  done: (line) => line === 'ok' || line === 'error',
+  done: isCommandEnd,
+}
+
+// $$ lists the numbered settings ($13 report_inches, $32 laser mode, ...).
+// A refused query answers with a bare error, which must end it too.
+const isNumberedSettingLine = (line: string) => /^\$\d+=/.test(line)
+const SETTINGS_QUERY_SILENT_RESPONSE: SilentResponseMatcher = {
+  starts: (line) => isNumberedSettingLine(line) || line.startsWith('error:'),
+  consume: isNumberedSettingLine,
+  done: isCommandEnd,
 }
 
 function loadStablePageId(): string {
@@ -86,8 +98,19 @@ const pendingAcknowledgments = new Map<string, { callback: () => void, timeoutId
 const pendingSilentResponses: SilentResponseMatcher[] = []
 let activeSilentResponse: SilentResponseMatcher | null = null
 let resetReadyTimer: ReturnType<typeof setTimeout> | null = null
+// Silent queries sent before the last reset that are still waiting for a reply.
+let silentResponsesBeforeReset = 0
+// Silent queries asked for during the reset cooldown, sent once it ends.
+const silentQueriesAfterReset: Array<{ cmd: string; matcher: SilentResponseMatcher }> = []
 
 const SOFT_RESET_READY_DELAY_MS = 1000
+
+function clearSilentResponses() {
+  pendingSilentResponses.length = 0
+  activeSilentResponse = null
+  silentResponsesBeforeReset = 0
+  silentQueriesAfterReset.length = 0
+}
 
 function beginSoftResetCooldown() {
   if (resetReadyTimer) clearTimeout(resetReadyTimer)
@@ -96,10 +119,21 @@ function beginSoftResetCooldown() {
   for (let index = commandQueue.length - 1; index >= 0; index--) {
     if (!commandQueue[index].isRealtime) commandQueue.splice(index, 1)
   }
+  // FluidNC drops commands it has not answered yet when it resets. Replies
+  // already on their way get until the cooldown ends; after that the queries
+  // are forgotten, or every later reply would be credited to the query
+  // before it and a local stream could never start.
+  silentResponsesBeforeReset = pendingSilentResponses.length
   useMachineStore.getState().setControllerResetPending(true)
   resetReadyTimer = setTimeout(() => {
     resetReadyTimer = null
+    if (silentResponsesBeforeReset > 0) {
+      pendingSilentResponses.splice(0, silentResponsesBeforeReset)
+      activeSilentResponse = null
+      silentResponsesBeforeReset = 0
+    }
     useMachineStore.getState().setControllerResetPending(false)
+    for (const query of silentQueriesAfterReset.splice(0)) sendSilentRaw(query.cmd, query.matcher)
   }, SOFT_RESET_READY_DELAY_MS)
 }
 
@@ -179,8 +213,20 @@ function processCommandQueue() {
   }
 }
 
+// Jog cancel only ever stops a jog, so it is the one command kept while the
+// socket is down: a jog that kept running through the drop still stops once
+// the connection returns.
+const JOG_CANCEL_BYTE = 0x85
+
 function queueCommand(command: QueuedCommand) {
+  if (socket?.readyState !== WebSocket.OPEN) {
+    // Anything else issued while disconnected must not run on its own after a
+    // reconnect (a typed G0, a cycle start on a held job, a jog).
+    if (!command.isRealtime || Number(command.command) !== JOG_CANCEL_BYTE) return false
+    if (commandQueue.some(queued => queued.isRealtime && queued.command === command.command)) return false
+  }
   commandQueue.push(command)
+  return true
 }
 
 type LineHandler = (line: string) => void
@@ -233,12 +279,26 @@ function announceActiveTab() {
 
 const LIVENESS_CHECK_MS = 2000
 const LIVENESS_TIMEOUT_MS = 12000
+const LIVENESS_LATE_CHECK_MS = 3 * LIVENESS_CHECK_MS
+const LIVENESS_RESUME_GRACE_MS = 6000
 const OPEN_TIMEOUT_MS = 6000
 export const STATUS_POLL_INTERVAL_MS = 500
 const STREAM_STATUS_POLL_INTERVAL_MS = 250
 const GC_STATE_POLL_INTERVAL_MS = 2000
+const GC_STATE_FALLBACK_POLL_MS = 30000
 // 0x3F = '?' — FluidNC's real-time status request byte.
 const STATUS_REPORT_BYTE = 0x3F
+
+// FluidNC auto-reports status to websocket clients every 200 ms while the
+// machine moves and pushes [GC:] whenever the modal state changes. Polling on
+// top of that only adds controller load, so both polls stand aside while
+// those reports arrive. Each '?' gets one reply, so a second report between
+// two polls means the controller is reporting on its own; in Idle and Hold,
+// or with auto-reporting off, polling carries on as before.
+let statusReportsSincePoll = 0
+let autoReportSeenAt = 0
+// Last [GC:] line, pushed or asked for; the fallback $G only runs without one.
+let lastGcStateAt = 0
 
 export function connect(host: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -334,6 +394,7 @@ export function connect(host: string): Promise<void> {
 }
 
 function handleDisconnect() {
+  flushStatusReport()
   stopLivenessWatchdog()
   stopStatusPoll()
   stopGcStatePoll()
@@ -341,8 +402,7 @@ function handleDisconnect() {
   // Drop pending acks — they'll never resolve now.
   pendingAcknowledgments.forEach(({ timeoutId }) => clearTimeout(timeoutId))
   pendingAcknowledgments.clear()
-  pendingSilentResponses.length = 0
-  activeSilentResponse = null
+  clearSilentResponses()
   settleExclusiveCommand('disconnected')
   // Drop queued commands — sending them on a future reconnect would be
   // surprising (e.g. queued jog moves shouldn't auto-resume).
@@ -362,6 +422,8 @@ function closeCurrentSocket() {
   stale.onmessage = null
   socket = null
   try { stale.close() } catch { /* noop */ }
+  // Replies to queries sent on the old socket can never arrive.
+  clearSilentResponses()
   // No need to call handleDisconnect() — generation bump prevents stale
   // events, and the caller (connect or disconnect) owns post-close cleanup.
 }
@@ -377,8 +439,15 @@ function startStatusPoll() {
   const interval = responseTrafficSuspensions > 0
     ? STREAM_STATUS_POLL_INTERVAL_MS
     : STATUS_POLL_INTERVAL_MS
+  statusReportsSincePoll = 0
   statusPollTimer = setInterval(() => {
     if (socket?.readyState !== WebSocket.OPEN) return
+    const autoReporting = statusReportsSincePoll >= 2
+    statusReportsSincePoll = 0
+    if (autoReporting && responseTrafficSuspensions === 0) {
+      autoReportSeenAt = Date.now()
+      return
+    }
     try {
       const buf = new Uint8Array(1)
       buf[0] = STATUS_REPORT_BYTE
@@ -398,8 +467,17 @@ function startGcStatePoll() {
   stopGcStatePoll()
   const tick = () => {
     if (socket?.readyState !== WebSocket.OPEN) return
-    sendSilentRaw('$G', GCODE_STATE_QUERY_SILENT_RESPONSE)
+    // A query sent during a reset could be dropped unanswered (see
+    // beginSoftResetCooldown).
+    if (useMachineStore.getState().controllerResetPending) return
+    const now = Date.now()
+    if (
+      now - autoReportSeenAt < GC_STATE_POLL_INTERVAL_MS
+      && now - lastGcStateAt < GC_STATE_FALLBACK_POLL_MS
+    ) return
+    if (sendSilentRaw('$G', GCODE_STATE_QUERY_SILENT_RESPONSE)) lastGcStateAt = now
   }
+  autoReportSeenAt = 0
   tick()
   gcStatePollTimer = setInterval(tick, GC_STATE_POLL_INTERVAL_MS)
 }
@@ -411,6 +489,8 @@ function stopGcStatePoll() {
 function startLivenessWatchdog() {
   if (backgroundTrafficSuspensions > 0) return
   stopLivenessWatchdog()
+  let checkedAt = Date.now()
+  let graceGiven = false
   livenessTimer = setInterval(() => {
     if (!socket) return
     const ws = socket
@@ -420,7 +500,21 @@ function startLivenessWatchdog() {
       return
     }
     if (ws.readyState !== WebSocket.OPEN) return
-    const silentFor = Date.now() - connectionHealth.lastResponseTime
+    const now = Date.now()
+    const late = now - checkedAt > LIVENESS_LATE_CHECK_MS
+    if (connectionHealth.lastResponseTime >= checkedAt) graceGiven = false
+    checkedAt = now
+    const silentFor = now - connectionHealth.lastResponseTime
+    // A late check means the page was paused (a frozen or throttled tab, a
+    // phone waking up, an open dialog), so this silence was not measured and
+    // the replies may still be queued behind this tick. Ask for a report and
+    // judge again shortly; a second late check with nothing heard is final.
+    if (silentFor > LIVENESS_TIMEOUT_MS && late && !graceGiven) {
+      graceGiven = true
+      connectionHealth.lastResponseTime = now - LIVENESS_TIMEOUT_MS + LIVENESS_RESUME_GRACE_MS
+      try { ws.send(Uint8Array.of(STATUS_REPORT_BYTE)) } catch { /* noop */ }
+      return
+    }
     if (silentFor > LIVENESS_TIMEOUT_MS) {
       // Connection is dead — terminate so the App-level reconnect kicks in.
       // Bump generation first so the impending onclose is ignored as stale,
@@ -454,6 +548,7 @@ function consumeSilentLine(line: string): boolean {
   if (isDone) {
     pendingSilentResponses.shift()
     activeSilentResponse = null
+    if (silentResponsesBeforeReset > 0) silentResponsesBeforeReset--
   }
 
   return shouldConsume || isDone
@@ -477,6 +572,37 @@ function parseProbeCapabilityLine(line: string): ProbeCapabilityReport | null {
 
 function isManualATCCapabilityLine(line: string) {
   return /^\[MSG:INFO:\s*ATC:\s*atc_manual\s*\]$/i.test(line)
+}
+
+// Reports that arrive in a burst (a tab Chrome froze and then resumed) are
+// merged and applied at most once per interval, so a backlog does not cost a
+// full render per report. State changes and local streams stay exact.
+const STATUS_APPLY_INTERVAL_MS = 100
+let pendingStatusReport: Partial<MachineStatus> | null = null
+let statusApplyTimer: ReturnType<typeof setTimeout> | null = null
+let lastStatusAppliedAt = 0
+
+function flushStatusReport() {
+  if (statusApplyTimer) { clearTimeout(statusApplyTimer); statusApplyTimer = null }
+  const report = pendingStatusReport
+  if (!report) return
+  pendingStatusReport = null
+  lastStatusAppliedAt = Date.now()
+  useMachineStore.getState().updateStatus(report)
+}
+
+function applyStatusReport(report: Partial<MachineStatus>) {
+  pendingStatusReport = pendingStatusReport ? { ...pendingStatusReport, ...report } : report
+  const sinceLastApply = Date.now() - lastStatusAppliedAt
+  if (
+    responseTrafficSuspensions > 0
+    || report.state !== useMachineStore.getState().status.state
+    || sinceLastApply >= STATUS_APPLY_INTERVAL_MS
+  ) {
+    flushStatusReport()
+  } else if (!statusApplyTimer) {
+    statusApplyTimer = setTimeout(flushStatusReport, STATUS_APPLY_INTERVAL_MS - sinceLastApply)
+  }
 }
 
 function handleLine(line: string) {
@@ -517,16 +643,21 @@ function handleLine(line: string) {
   const isSilentLine = consumeSilentLine(line)
 
   if (line.startsWith('<') && line.endsWith('>')) {
+    statusReportsSincePoll++
     const parsed = parseStatusReport(line, {
       reportInches: useMachineStore.getState().controllerSettings.reportInches,
     })
-    if (parsed) useMachineStore.getState().updateStatus(parsed)
+    if (parsed) applyStatusReport(parsed)
     lineHandlers.forEach(fn => fn(line))
     return
   }
 
+  // Keep status updates in arrival order behind a deferred report.
+  flushStatusReport()
+
   const gcState = parseGcStateLine(line)
   if (gcState) {
+    lastGcStateAt = Date.now()
     useMachineStore.getState().updateStatus(gcState)
     if (isSilentLine) return
     lineHandlers.forEach(fn => fn(line))
@@ -615,8 +746,7 @@ export function sendRaw(cmd: string) {
   // terminal, plugin, or UI command enter the queue here would make its `ok`
   // indistinguishable from a program-block acknowledgement.
   if (responseTrafficSuspensions > 0 || useMachineStore.getState().controllerResetPending) return false
-  queueCommand({ command: cmd, isRealtime: false, priority: 'normal', timestamp: Date.now() })
-  return socket?.readyState === WebSocket.OPEN
+  return queueCommand({ command: cmd, isRealtime: false, priority: 'normal', timestamp: Date.now() })
 }
 
 /** Send one acknowledged program block immediately while response traffic is suspended. */
@@ -667,14 +797,20 @@ export function isStreamTransportWritable(maxBufferedBytes = 1024) {
 
 export function sendSilentRaw(cmd: string, silentResponseMatcher: SilentResponseMatcher) {
   if (responseTrafficSuspensions > 0) return false
-  queueCommand({
+  // A query sent now would queue behind replies the reset may have dropped
+  // (or be dropped itself), so it waits for the cooldown to end.
+  if (useMachineStore.getState().controllerResetPending) {
+    if (socket?.readyState !== WebSocket.OPEN) return false
+    silentQueriesAfterReset.push({ cmd, matcher: silentResponseMatcher })
+    return true
+  }
+  return queueCommand({
     command: cmd,
     isRealtime: false,
     priority: 'normal',
     timestamp: Date.now(),
     silentResponseMatcher,
   })
-  return socket?.readyState === WebSocket.OPEN
 }
 
 export function sendSilentAlarmQuery() {
@@ -720,6 +856,7 @@ export function isResponseTrafficQuiescent(quietMs = 500) {
     && pendingAcknowledgments.size === 0
     && pendingSilentResponses.length === 0
     && activeSilentResponse === null
+    && silentQueriesAfterReset.length === 0
     && pendingExclusiveCommand === null
     && Date.now() - lastResponseProducingSendAt >= quietMs
 }
@@ -768,20 +905,25 @@ export async function sendStartupQueries() {
         useMachineStore.getState().updateControllerSettings(settings)
       }
     })
-  } catch { /* noop */ }
+  } catch {
+    // FluidNC refuses HTTP commands while the machine moves, so a page opened
+    // during a job asks over the websocket, where $$ is allowed in any state
+    // ($Report/Inches is not). Status reports are scaled by $13.
+    sendSilentRaw('$$', SETTINGS_QUERY_SILENT_RESPONSE)
+  }
 }
 
 export function sendRealtime(byte: number) {
   // Unlike other realtime inputs, Ctrl-X changes local safety state. Do not
   // queue it or show a reset cooldown unless it can actually be sent.
   if (byte === 0x18 && socket?.readyState !== WebSocket.OPEN) return false
-  queueCommand({
+  const queued = queueCommand({
     command: byte.toString(),
     isRealtime: true,
     priority: byte === 0x18 ? 'emergency' : 'normal',
     timestamp: Date.now(),
   })
-  return socket?.readyState === WebSocket.OPEN
+  return queued && socket?.readyState === WebSocket.OPEN
 }
 
 /** Best-effort immediate realtime byte, for stream ordering and page lifecycle safety. */
@@ -793,6 +935,22 @@ export function sendRealtimeNow(byte: number) {
       beginSoftResetCooldown()
       softResetHandlers.forEach(handler => handler())
     }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Best-effort immediate command line, for page lifecycle safety: the queue is
+ * cleared when the page closes the socket, before it would be processed.
+ */
+export function sendRawNow(cmd: string) {
+  if (socket?.readyState !== WebSocket.OPEN) return false
+  if (responseTrafficSuspensions > 0 || useMachineStore.getState().controllerResetPending) return false
+  try {
+    socket.send(cmd + '\n')
+    lastResponseProducingSendAt = Date.now()
     return true
   } catch {
     return false
@@ -868,6 +1026,7 @@ export function getLastDisconnectReason(): string | null {
 }
 
 export function disconnect() {
+  flushStatusReport()
   generation++
   backgroundTrafficSuspensions = 0
   responseTrafficSuspensions = 0
@@ -875,8 +1034,7 @@ export function disconnect() {
   stopStatusPoll()
   stopGcStatePoll()
   stopCommandProcessor()
-  pendingSilentResponses.length = 0
-  activeSilentResponse = null
+  clearSilentResponses()
   settleExclusiveCommand('disconnected')
   pendingAcknowledgments.forEach(({ timeoutId }) => clearTimeout(timeoutId))
   pendingAcknowledgments.clear()
