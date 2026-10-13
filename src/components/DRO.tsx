@@ -8,6 +8,7 @@ import { droFeedUnitLabel, formatAxisCoord, formatFeedRate } from '../lib/units'
 import { useControllerJobStarting } from '../lib/jobState'
 import { useManualAtcStore } from '../store/manualAtc'
 import { useIsPortrait } from '../lib/viewport'
+import { useConfirmTap } from '../hooks/useConfirmTap'
 
 const ALARM_MESSAGES: Record<number, string> = {
   1: 'Hard limit triggered',
@@ -69,9 +70,12 @@ function useMotionControlLock(jobActive: boolean) {
 
 export function DRO({
   isTablet = false,
+  isPhone = false,
   layout = 'default',
 }: {
   isTablet?: boolean
+  /** Phone width: touch-size buttons; per-axis Home is left out so the coordinates still fit (Home All stays). */
+  isPhone?: boolean
   /** Fit beside Jog in short-height landscape without internal scroll. */
   layout?: 'default' | 'topBand'
 }) {
@@ -99,8 +103,10 @@ export function DRO({
       ? 'w-12 h-12'
       : isTablet
         ? 'w-14 h-14'
-        : 'w-8 h-8'
-  const tabletIconSize = isTablet && isPortrait ? 22 : topBandLayout ? 14 : isTablet ? 16 : 11
+        : isPhone
+          ? 'w-11 h-11'
+          : 'w-8 h-8'
+  const tabletIconSize = isTablet && isPortrait ? 22 : topBandLayout ? 14 : isTablet ? 16 : isPhone ? 16 : 11
   const tabletHomeIconSize = isTablet && isPortrait ? 30 : topBandLayout ? 18 : isTablet ? 22 : 13
   const tabletCoordBothSize = topBandLayout
     ? 'text-[1.45rem]'
@@ -119,14 +125,21 @@ export function DRO({
       ? 'h-11 text-base'
       : isTablet
         ? 'h-14 text-lg'
-        : 'h-7 text-base'
+        : isPhone
+          ? 'h-11 text-base'
+          : 'h-7 text-base'
   const tabletStopBtnClass = isTablet && isPortrait
     ? 'h-20 text-xl'
     : topBandLayout
       ? 'h-11 text-sm'
       : isTablet
         ? 'h-14 text-lg'
-        : 'h-7 text-sm'
+        : isPhone
+          ? 'h-11 text-sm'
+          : 'h-7 text-sm'
+  const goToZeroLabelSize = isTablet ? 'text-lg' : isPhone ? 'text-sm' : 'text-[11px]'
+  const actionIconSize = isTablet && isPortrait ? 24 : topBandLayout ? 18 : isTablet ? 20 : isPhone ? 16 : 12
+  const showAxisHome = !isPhone
   const tabletFooterTextSize = topBandLayout
     ? 'text-sm'
     : isTablet
@@ -156,6 +169,16 @@ export function DRO({
   const isHomeAllPending = pendingAxisAction?.kind === 'home' && pendingAxisAction.axis === HOME_ALL_ACTION_AXIS
   const shouldHideMotionControls = isJobActive && pendingAxisAction === null
   const areAxisButtonsDisabled = pendingAxisAction !== null
+  // Zeroing overwrites the work offset with no way back, so it takes a second
+  // tap on the same button; a slip from go-to-zero or Home only arms it, and
+  // the buttons never move while it is armed.
+  const { armed: zeroArmed, tap: tapZero, disarm: disarmZero } = useConfirmTap()
+  const [zeroTarget, setZeroTarget] = useState<string | null>(null)
+  const armedZeroTarget = zeroArmed ? zeroTarget : null
+
+  useEffect(() => {
+    if (shouldHideMotionControls || areAxisButtonsDisabled) disarmZero()
+  }, [shouldHideMotionControls, areAxisButtonsDisabled, disarmZero])
 
   // Auto-query alarm details when entering alarm state without a name
   useEffect(() => {
@@ -211,6 +234,11 @@ export function DRO({
   }
   function zeroAxis(axis: string) { setWorkZero(`G10 L20 P0 ${axis}0`, axis === 'Z') }
   function zeroAll() { setWorkZero(`G10 L20 P0 ${visibleAxes.map(a => `${a}0`).join(' ')}`, visibleAxes.includes('Z')) }
+  function confirmZero(target: string, action: () => void) {
+    if (zeroTarget !== target) disarmZero()
+    setZeroTarget(target)
+    tapZero(action)
+  }
   function goToZero(axis: string) {
     const [feedKey, fallbackFeed] = jogFeedKeyForAxis(axis)
     const feed = loadPersistedJogFeed(feedKey, fallbackFeed)
@@ -314,7 +342,7 @@ export function DRO({
       </div>
 
       {/* Axis rows – compact */}
-      <div className={`px-3 shrink-0 ${topBandLayout ? 'space-y-0 py-0.5' : 'space-y-0.5 py-2'}`}>
+      <div className={`px-3 shrink-0 ${topBandLayout ? 'space-y-0 py-0.5' : isPhone ? 'space-y-1.5 py-2' : 'space-y-0.5 py-2'}`}>
         {positionMode === 'Both' && (
           <div className="flex items-center gap-2 pb-0.5">
             <span className="w-4 shrink-0" />
@@ -326,10 +354,10 @@ export function DRO({
             {!shouldHideMotionControls && (
               <div className={`shrink-0 invisible flex items-center justify-center gap-0.5 ${tabletBtnSize}`}>
                 <ArrowRightToLine size={tabletIconSize} />
-                <span className={`font-mono ${isTablet ? 'text-lg' : 'text-[11px]'}`}>0</span>
+                <span className={`font-mono ${goToZeroLabelSize}`}>0</span>
               </div>
             )}
-            {!shouldHideMotionControls && <div className={`shrink-0 invisible ${tabletBtnSize}`} />}
+            {!shouldHideMotionControls && showAxisHome && <div className={`shrink-0 invisible ${tabletBtnSize}`} />}
           </div>
         )}
         {visibleAxes.map(ax => (
@@ -365,16 +393,18 @@ export function DRO({
             )}
             {!shouldHideMotionControls && (
               <button
-                className={`shrink-0 flex items-center justify-center rounded-sm
-                           border border-border text-text-muted font-bold
-                           hover:text-accent hover:border-accent/50 hover:bg-accent/5
+                className={`shrink-0 flex items-center justify-center rounded-sm border font-bold
                            disabled:opacity-45 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:border-border disabled:hover:bg-transparent
-                           transition-all duration-100 ${tabletBtnSize} ${isTablet ? 'text-xl' : 'text-base'}`}
-                onClick={() => zeroAxis(ax)}
-                title={`Zero ${ax}`}
+                           transition-all duration-100 ${tabletBtnSize} ${
+                  armedZeroTarget === ax
+                    ? `border-warn text-warn bg-warn/15 ${isTablet ? 'text-lg' : 'text-sm'}`
+                    : `border-border text-text-muted hover:text-accent hover:border-accent/50 hover:bg-accent/5 ${isTablet ? 'text-xl' : 'text-base'}`
+                }`}
+                onClick={() => confirmZero(ax, () => zeroAxis(ax))}
+                title={armedZeroTarget === ax ? `Tap again to zero ${ax}` : `Zero ${ax}`}
                 disabled={areAxisButtonsDisabled}
               >
-                Z
+                {armedZeroTarget === ax ? 'OK?' : '⊙'}
               </button>
             )}
             {!shouldHideMotionControls && (
@@ -400,11 +430,11 @@ export function DRO({
                   disabled={areAxisButtonsDisabled}
                 >
                   <ArrowRightToLine size={tabletIconSize} />
-                  <span className={`font-mono ${isTablet ? 'text-lg' : 'text-[11px]'}`}>0</span>
+                  <span className={`font-mono ${goToZeroLabelSize}`}>0</span>
                 </button>
               )
             )}
-            {!shouldHideMotionControls && (
+            {!shouldHideMotionControls && showAxisHome && (
               pendingAxisAction?.axis === ax && pendingAxisAction.kind === 'home' ? (
                 <button
                   className={`shrink-0 flex items-center justify-center rounded-sm
@@ -420,7 +450,7 @@ export function DRO({
                   className={`shrink-0 flex items-center justify-center rounded-sm
                              border border-border text-text-muted
                              disabled:opacity-45 disabled:cursor-not-allowed disabled:hover:border-border disabled:hover:bg-transparent
-                             hover:border-current hover:bg-current/5
+                             hover:border-current hover:bg-[color-mix(in_srgb,currentColor_5%,transparent)]
                              transition-all duration-100 ${tabletBtnSize}`}
                   style={{ ['--tw-text-opacity' as string]: '1' } as React.CSSProperties}
                   onClick={() => homeAxis(ax)}
@@ -440,21 +470,22 @@ export function DRO({
         {!shouldHideMotionControls && !isHomeAllPending && (
           <button
             className={`btn btn-warn flex-1 font-bold ${tabletActionBtnClass}`}
-            onClick={zeroAll}
-            title="Set current position as work zero for all axes"
+            onClick={() => confirmZero('all', zeroAll)}
+            title={armedZeroTarget === 'all' ? 'Tap again to zero all axes' : 'Set current position as work zero for all axes'}
             disabled={areAxisButtonsDisabled}
           >
-            ⊙ Zero All
+            {armedZeroTarget === 'all' ? 'Zero all?' : '⊙ Zero All'}
           </button>
         )}
+        {/* Stays in place while Zero All is armed so the row never shifts under a second tap. */}
         {!shouldHideMotionControls && !isHomeAllPending && (
           <button
             className={`btn btn-ghost flex-1 font-bold flex items-center justify-center gap-1.5 ${tabletActionBtnClass}`}
             onClick={homeAll}
             title="Home all axes"
-            disabled={areAxisButtonsDisabled}
+            disabled={areAxisButtonsDisabled || armedZeroTarget === 'all'}
           >
-            <Home size={isTablet && isPortrait ? 24 : topBandLayout ? 18 : isTablet ? 20 : 12} />
+            <Home size={actionIconSize} />
             Home All
           </button>
         )}
@@ -464,7 +495,7 @@ export function DRO({
             onClick={cancelPendingAxisAction}
             title="Abort homing (soft reset controller)"
           >
-            <Square size={isTablet && isPortrait ? 24 : topBandLayout ? 18 : isTablet ? 20 : 12} className="fill-current" />
+            <Square size={actionIconSize} className="fill-current" />
             Abort Homing
           </button>
         )}
