@@ -9,6 +9,7 @@ import { parseESP800 } from './lib/parser'
 import { prefetchControllerConfigSettings } from './lib/controllerConfig'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from './lib/updateCheck'
 import { startWatchdog, stopWatchdog } from './lib/jogWatchdog'
+import { playJobSound, prepareJobSoundOnFirstGesture } from './lib/jobSound'
 import { Header } from './components/Header'
 import { DRO } from './components/DRO'
 import { TabletJogPad } from './components/JogPad'
@@ -172,6 +173,24 @@ function AppContent() {
     line: number | null
     mpos: Position
   } | null>(null)
+
+  useEffect(() => {
+    const stopPreparing = prepareJobSoundOnFirstGesture()
+    const enabled = () => useMachineStore.getState().jobSound
+    const stopJobSound = useGCodeStore.subscribe((state, previous) => {
+      if (!enabled()) return
+      if (state.interruptedJob && !previous.interruptedJob) playJobSound('warning')
+      else if (state.finishedJobElapsedMs != null && previous.finishedJobElapsedMs == null) playJobSound('finished')
+    })
+    const stopSenderSound = useGCodeSenderStore.subscribe((state, previous) => {
+      if (enabled() && state.phase === 'error' && previous.phase !== 'error') playJobSound('warning')
+    })
+    return () => {
+      stopPreparing()
+      stopJobSound()
+      stopSenderSound()
+    }
+  }, [])
 
   useEffect(() => {
     if (activeJobSource !== 'local') return

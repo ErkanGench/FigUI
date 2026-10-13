@@ -242,6 +242,8 @@ interface Store {
   controllerConfigLoadedAt: number | null
   theme: Theme
   units: Units
+  /** Play a sound when a tracked job finishes or is interrupted. */
+  jobSound: boolean
   layoutMode: LayoutMode
   positionMode: PositionMode
   sidebarTab: SidebarTab
@@ -269,6 +271,7 @@ interface Store {
   setTheme: (theme: Theme) => void
   toggleTheme: () => void
   setUnits: (units: Units) => void
+  setJobSound: (on: boolean) => void
   setLayoutMode: (mode: LayoutMode) => void
   setPositionMode: (m: PositionMode) => void
   setSidebarTab: (t: SidebarTab) => void
@@ -296,6 +299,7 @@ export const useMachineStore = create<Store>((set) => ({
   controllerConfigLoadedAt: null,
   theme: _initialTheme,
   units: localStorage.getItem('units') === 'in' ? 'in' : 'mm',
+  jobSound: localStorage.getItem('jobSound') !== 'off',
   layoutMode: ((): LayoutMode => {
     const v = localStorage.getItem('layoutMode')
     return v === 'tablet' || v === 'desktop' ? v : 'auto'
@@ -434,6 +438,12 @@ export const useMachineStore = create<Store>((set) => ({
     set(() => {
       localStorage.setItem('units', units)
       return { units }
+    }),
+
+  setJobSound: (jobSound) =>
+    set(() => {
+      localStorage.setItem('jobSound', jobSound ? 'on' : 'off')
+      return { jobSound }
     }),
 
   setLayoutMode: (layoutMode) =>

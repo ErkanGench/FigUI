@@ -32,6 +32,7 @@ import { useMachineStore } from "../store";
 import type { Theme } from "../store";
 import type { FluidNCSetting } from "../types";
 import { loadControllerConfigSettings } from "../lib/controllerConfig";
+import { playJobSound } from "../lib/jobSound";
 import { LimitsTab } from "./LimitsTab";
 
 type Setting = FluidNCSetting;
@@ -1566,6 +1567,8 @@ export function SettingsPanel({
   const espInfo = useMachineStore((s) => s.espInfo);
   const units = useMachineStore((s) => s.units);
   const setUnits = useMachineStore((s) => s.setUnits);
+  const jobSound = useMachineStore((s) => s.jobSound);
+  const setJobSound = useMachineStore((s) => s.setJobSound);
   const layoutMode = useMachineStore((s) => s.layoutMode);
   const setLayoutMode = useMachineStore((s) => s.setLayoutMode);
   const theme = useMachineStore((s) => s.theme);
@@ -2105,6 +2108,32 @@ export function SettingsPanel({
                         {unit}
                       </button>
                     )),
+                  },
+                  {
+                    label: "Job sound",
+                    control: [
+                      ...([false, true] as const).map((on) => (
+                        <button
+                          key={on ? "on" : "off"}
+                          onClick={() => setJobSound(on)}
+                          className={`px-3 py-1.5 text-sm rounded-sm transition-colors ${
+                            jobSound === on
+                              ? "bg-surface border border-border text-text-primary shadow-sm"
+                              : "text-text-muted hover:text-text-primary"
+                          }`}
+                        >
+                          {on ? "On" : "Off"}
+                        </button>
+                      )),
+                      <button
+                        key="test"
+                        onClick={() => playJobSound("finished")}
+                        title="Play the job finished sound"
+                        className="px-3 py-1.5 text-sm rounded-sm transition-colors text-text-muted hover:text-text-primary"
+                      >
+                        Test
+                      </button>,
+                    ],
                   },
                   {
                     label: "Layout",
