@@ -21,7 +21,7 @@ interface TerminalStore {
   setVerbose: (v: boolean) => void
   setAutoScroll: (v: boolean) => void
   pushHistory: (cmd: string) => void
-  appendLine: (text: string) => void
+  appendLine: (text: string, kind?: LineKind) => void
   clear: () => void
 }
 
@@ -46,25 +46,23 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
   pushHistory: (cmd) =>
     set(state => ({ history: [cmd, ...state.history.slice(0, MAX_HISTORY - 1)] })),
 
-  appendLine: (text) => {
-    const kind = classifyLine(text)
+  appendLine: (text, kindOverride) => {
+    const kind = kindOverride ?? classifyLine(text)
     if (!get().verbose && (kind === 'status' || kind === 'ok')) return
     if (kind === 'status') {
       const key = statusKey(text)
       if (key === lastStatusKey) return
       lastStatusKey = key
     }
-    // The Grbl welcome banner is the definitive signal that the controller
-    // just rebooted. Clear and start fresh, keeping the banner as line 1.
-    if (text.startsWith('Grbl ')) {
-      set({ lines: [{ id: lineId++, text, kind }] })
-      return
-    }
     set(state => {
-      const next = state.lines.length >= MAX_LINES
-        ? [...state.lines.slice(-(MAX_LINES - 1)), { id: lineId++, text, kind }]
-        : [...state.lines, { id: lineId++, text, kind }]
-      return { lines: next }
+      const added: LogLine[] = []
+      // The Grbl welcome banner means the controller just reset. Keep the lines
+      // before it, since they often say why, and mark the reset with the time.
+      if (text.startsWith('Grbl ') && state.lines.length > 0) {
+        added.push({ id: lineId++, text: `--- Controller reset ${new Date().toLocaleTimeString()} ---`, kind: 'normal' })
+      }
+      added.push({ id: lineId++, text, kind })
+      return { lines: [...state.lines, ...added].slice(-MAX_LINES) }
     })
   },
 

@@ -39,6 +39,8 @@ export function TabletAccordion({
   const isPortrait = useIsPortrait()
   const spindleMax = useMachineStore(s => s.controllerSettings.spindleMax)
   const hasSpindle = Boolean(spindleMax)
+  const laserMode = useMachineStore(s => s.controllerSettings.laserMode === true)
+  const spindleLabel = laserMode ? 'Laser & Overrides' : 'Spindle & Overrides'
   const reportedHasProbe = useMachineStore(s => s.controllerSettings.hasProbe)
   const reportedHasToolsetter = useMachineStore(s => s.controllerSettings.hasToolsetter)
   const hasProbingInput = Boolean(reportedHasProbe || reportedHasToolsetter)
@@ -52,8 +54,8 @@ export function TabletAccordion({
     [hasProbingInput, hasManualATC],
   )
   const fullTabs = useMemo(
-    () => buildFullTabletTabs(hasProbingInput, hasSpindle, hasManualATC),
-    [hasProbingInput, hasSpindle, hasManualATC],
+    () => buildFullTabletTabs(hasProbingInput, hasSpindle, hasManualATC, laserMode),
+    [hasProbingInput, hasSpindle, hasManualATC, laserMode],
   )
 
   useEffect(() => {
@@ -198,7 +200,7 @@ export function TabletAccordion({
               className="panel-header text-left font-bold cursor-pointer flex justify-between items-center text-xl py-4"
               onClick={() => setExpanded('controls')}
             >
-              <span className="uppercase tracking-wide">{hasSpindle ? 'Spindle & Overrides' : 'Overrides'}</span>
+              <span className="uppercase tracking-wide">{hasSpindle ? spindleLabel : 'Overrides'}</span>
               <ChevronRight size={22} />
             </button>
           )}
@@ -208,7 +210,7 @@ export function TabletAccordion({
                 className="panel-header flex justify-between items-center border-b border-border cursor-pointer hover:text-text-primary shrink-0 text-xl py-3"
                 onClick={() => setExpanded('visualizer')}
               >
-                <span className="uppercase tracking-wide">{hasSpindle ? 'Spindle & Overrides' : 'Overrides'}</span>
+                <span className="uppercase tracking-wide">{hasSpindle ? spindleLabel : 'Overrides'}</span>
                 <ChevronDown size={22} />
               </button>
               <div className="flex-1 overflow-y-auto flex flex-col gap-0 p-0">

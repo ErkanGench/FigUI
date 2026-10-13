@@ -80,7 +80,16 @@ export function Terminal({ onExpandToggle, expanded = false }: TerminalProps = {
     const cmd = input.trim()
     if (!cmd) return
     appendLine(`> ${cmd}`)
-    sendRaw(cmd)
+    if (!sendRaw(cmd)) {
+      // sendRaw drops the command rather than queueing it, so keep it in the
+      // input for another try.
+      const { connected, controllerResetPending } = useMachineStore.getState()
+      const reason = !connected ? 'not connected'
+        : controllerResetPending ? 'the controller is resetting, try again in a moment'
+        : 'a job is streaming from this page'
+      appendLine(`Not sent: ${reason}`, 'error')
+      return
+    }
     pushHistory(cmd)
     setInput('')
     setHistIdx(-1)

@@ -7,6 +7,7 @@ import { useControllerJobStarting } from '../lib/jobState'
 import { sendRealtime } from '../lib/ws'
 import { alarmClearActionTitle, clearMachineAlarm } from '../lib/alarm'
 import { runMacro, MACRO_BTN_CLASS } from '../lib/macros'
+import { useConfirmTap } from '../hooks/useConfirmTap'
 import { useState, useEffect, useMemo } from 'react'
 
 const HEADER_ICON_MAP: Record<string, LucideIcon> = {
@@ -36,10 +37,11 @@ export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Prop
   const loadedPath = useGCodeStore(s => s.loadedPath)
   const fileName = useGCodeStore(s => s.fileName)
   const runtime = useJobRuntimeEstimate(status, model, controllerSettings, loadedPath, fileName)
-  const showHeaderProgress = status.sdFilename && runtime.source === 'estimated' && runtime.progressPercent != null
+  const showHeaderProgress = status.sdFilename && runtime.source !== 'none' && runtime.progressPercent != null
   const headerProgressPercent = runtime.progressPercent ?? 0
   const pinnedMacros = useMemo(() => macros.filter(m => m.pinned), [macros])
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const resetConfirm = useConfirmTap()
 
   useEffect(() => {
     const handler = () => setIsFullscreen(!!document.fullscreenElement)
@@ -47,22 +49,28 @@ export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Prop
     return () => document.removeEventListener('fullscreenchange', handler)
   }, [])
 
+  // iPhone Safari has no element fullscreen; hide the button there.
+  const canFullscreen = document.fullscreenEnabled === true
+    && typeof document.documentElement.requestFullscreen === 'function'
+
   function toggleFullscreen() {
+    // Older browsers return no promise; a refused request must not throw.
     if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen()
+      document.documentElement.requestFullscreen?.()?.catch(() => {})
     } else {
-      document.exitFullscreen()
+      document.exitFullscreen?.()?.catch(() => {})
     }
   }
 
+  // Two taps instead of confirm(), which would stop the page while it is open.
   function handleSoftReset() {
-    if (confirm('Send soft reset (Ctrl+X)?')) sendRealtime(0x18)
+    resetConfirm.tap(() => sendRealtime(0x18))
   }
 
   return (
     <header className={`h-12 bg-surface border-b border-border flex items-center px-3 xl:px-4 gap-2 xl:gap-4 shrink-0 overflow-x-auto ${sticky ? 'sticky top-0 z-50' : ''}`}>
       <div className="flex items-center gap-2 shrink-0">
-        <img src={fluidncLogo} alt="FluidNC" className="h-8 w-auto shrink-0" style={theme !== 'light' ? { filter: 'invert(1) hue-rotate(180deg)' } : undefined} />
+        <img src={fluidncLogo} alt="FluidNC" className="h-6 sm:h-8 w-auto shrink-0" style={theme !== 'light' ? { filter: 'invert(1) hue-rotate(180deg)' } : undefined} />
       </div>
 
       <div className="h-5 w-px bg-border" />
@@ -141,11 +149,11 @@ export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Prop
         )}
 
         <button
-          className={`btn-ghost ${isTablet ? 'px-3 py-2' : 'px-2 py-1.5'} text-base`}
+          className={`btn-ghost ${isTablet ? 'px-3 py-2' : 'px-2 py-1.5'} text-base ${resetConfirm.armed ? 'text-danger' : ''}`}
           onClick={handleSoftReset}
-          title="Soft Reset"
+          title={resetConfirm.armed ? 'Tap again to send soft reset (Ctrl+X)' : 'Soft Reset'}
         >
-          RST
+          {resetConfirm.armed ? 'Reset?' : 'RST'}
         </button>
 
         <button
@@ -156,13 +164,15 @@ export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Prop
           {theme !== 'light' ? <Sun size={isTablet ? 18 : 14} /> : <Moon size={isTablet ? 18 : 14} />}
         </button>
 
-        <button
-          className={`hidden md:inline-flex btn-ghost ${isTablet ? 'px-3 py-2' : 'px-2 py-1.5'}`}
-          onClick={toggleFullscreen}
-          title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
-        >
-          {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
-        </button>
+        {canFullscreen && (
+          <button
+            className={`inline-flex btn-ghost ${isTablet ? 'px-3 py-2' : 'px-2 py-1.5'}`}
+            onClick={toggleFullscreen}
+            title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          >
+            {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
+          </button>
+        )}
 
         {!isTablet && (
           <button

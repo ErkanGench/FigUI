@@ -37,6 +37,7 @@ export function buildFullTabletTabs(
   hasProbingInput: boolean,
   hasSpindle: boolean,
   hasManualATC = false,
+  laserMode = false,
 ): TabletTabDef[] {
   return [
     { id: 'viewer', label: 'Viewer', Icon: Eye },
@@ -45,7 +46,7 @@ export function buildFullTabletTabs(
     ...(hasManualATC ? [{ id: 'tooling' as const, label: 'Tooling', Icon: Wrench }] : []),
     ...(hasProbingInput ? [{ id: 'probing' as const, label: 'Probing', Icon: Target }] : []),
     { id: 'terminal', label: 'Terminal', Icon: TerminalSquare },
-    ...(hasSpindle ? [{ id: 'spindle' as const, label: 'Spindle', Icon: Power }] : []),
+    ...(hasSpindle ? [{ id: 'spindle' as const, label: laserMode ? 'Laser' : 'Spindle', Icon: Power }] : []),
     { id: 'overrides', label: 'Overrides', Icon: Sliders },
     { id: 'plugins', label: 'Plugins', Icon: Puzzle },
   ]

@@ -3,7 +3,7 @@ import { useMachineStore } from './store'
 import { useGCodeStore } from './store/gcode'
 import { useGCodeSenderStore } from './store/gcodeSender'
 import { useTerminalStore } from './store/terminal'
-import { connect, isSocketOpen, onLine, sendStartupQueries } from './lib/ws'
+import { connect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from './lib/ws'
 import { setBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg } from './lib/http'
 import { parseESP800 } from './lib/parser'
 import { prefetchControllerConfigSettings } from './lib/controllerConfig'
@@ -12,7 +12,7 @@ import { startWatchdog, stopWatchdog } from './lib/jogWatchdog'
 import { playJobSound, prepareJobSoundOnFirstGesture } from './lib/jobSound'
 import { Header } from './components/Header'
 import { DRO } from './components/DRO'
-import { TabletJogPad } from './components/JogPad'
+import { OverridesPanel, SpindlePanel, TabletJogPad } from './components/JogPad'
 import { ProbeOrProgramPanel } from './components/ProgramExecutionPanel'
 
 import { GCodeViewer } from './components/GCodeViewer'
@@ -23,7 +23,7 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { AboutModal } from './components/AboutModal'
 import { JobControl } from './components/JobControl'
 import { PluginLauncher } from './components/PluginLauncher'
-import { WifiOff, RefreshCw, Crosshair, Monitor, FolderOpen, TerminalSquare, AlertTriangle } from 'lucide-react'
+import { WifiOff, RefreshCw, Crosshair, Monitor, FolderOpen, TerminalSquare, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 import type { Plugin, Position, SidebarTab, ActiveLayout } from './types'
 import { getEffectiveLayout } from './types'
 import { PluginFrame } from './components/PluginFrame'
@@ -70,9 +70,239 @@ function useActiveLayout(layoutMode: 'auto' | 'tablet' | 'desktop'): ActiveLayou
 export function App() {
   return (
     <ViewportProvider>
+      <ControllerJobTracker />
       <AppContent />
     </ViewportProvider>
   )
+}
+
+// Android Chrome reloads background tabs, which forgets the tracked job. Keep
+// it for this tab so a reloaded page still knows when the job started.
+const SAVED_CONTROLLER_JOB_KEY = 'fluidui_controller_job'
+
+interface SavedControllerJob {
+  startedAt: number
+  adopted: boolean
+  sdFilename: string
+}
+
+function loadSavedControllerJob(): SavedControllerJob | null {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(SAVED_CONTROLLER_JOB_KEY) ?? 'null')
+    return saved && typeof saved.startedAt === 'number' && typeof saved.sdFilename === 'string'
+      ? { startedAt: saved.startedAt, adopted: !!saved.adopted, sdFilename: saved.sdFilename }
+      : null
+  } catch {
+    return null
+  }
+}
+
+function saveControllerJob(job: SavedControllerJob | null) {
+  try {
+    if (job) sessionStorage.setItem(SAVED_CONTROLLER_JOB_KEY, JSON.stringify(job))
+    else sessionStorage.removeItem(SAVED_CONTROLLER_JOB_KEY)
+  } catch { /* storage unavailable */ }
+}
+
+// Kept across Control tab switches, which unmount the panel.
+let phoneSpindleOverridesOpen = false
+
+/** The tablet's Spindle and Overrides tabs, folded into the phone Control tab. */
+function PhoneSpindleOverrides() {
+  const hasSpindle = useMachineStore(s => Boolean(s.controllerSettings.spindleMax))
+  const laserMode = useMachineStore(s => s.controllerSettings.laserMode === true)
+  const [open, setOpen] = useState(phoneSpindleOverridesOpen)
+  const title = hasSpindle ? `${laserMode ? 'Laser' : 'Spindle'} & Overrides` : 'Overrides'
+
+  return (
+    <div className="panel flex flex-col">
+      <button
+        className={`panel-header text-left font-bold cursor-pointer flex justify-between items-center text-xl py-3 ${open ? 'border-b border-border' : ''}`}
+        onClick={() => {
+          phoneSpindleOverridesOpen = !open
+          setOpen(!open)
+        }}
+        aria-expanded={open}
+      >
+        <span className="uppercase tracking-wide">{title}</span>
+        {open ? <ChevronDown size={22} /> : <ChevronRight size={22} />}
+      </button>
+      {open && (
+        <div className="flex flex-col">
+          {hasSpindle && (
+            <>
+              <SpindlePanel className="border-none shadow-none p-0" isTablet />
+              <div className="h-px bg-border w-full my-1" />
+            </>
+          )}
+          <OverridesPanel className="border-none shadow-none p-0" isTablet />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Follows controller (SD) jobs through status reports. It is its own component
+// so that each status report re-renders only this, not the whole app.
+function ControllerJobTracker() {
+  const connected = useMachineStore(s => s.connected)
+  const machineState = useMachineStore(s => s.status.state)
+  const spindleSpeed = useMachineStore(s => s.status.spindle)
+  const statusReportCount = useMachineStore(s => s.statusReportCount)
+  const spindleSpinupMs = useMachineStore(s => s.controllerSettings.spindleSpinupMs ?? 0)
+  const activeJobSource = useGCodeStore(s => s.trackedJob?.source)
+  const activeJobStartedAt = useGCodeStore(s => s.trackedJob?.startedAt)
+  const activeJobAdopted = useGCodeStore(s => s.trackedJob?.adopted ?? false)
+  const startTrackedJob = useGCodeStore(s => s.startTrackedJob)
+  const finishTrackedJob = useGCodeStore(s => s.finishTrackedJob)
+  const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
+  const interruptTrackedJob = useGCodeStore(s => s.interruptTrackedJob)
+  const controllerJobWasRunningRef = useRef(false)
+  const controllerJobAwaitingRunAfterSpinupRef = useRef(false)
+  const controllerJobSpinupSeenRef = useRef(false)
+  const controllerTrackedJobStartedAtRef = useRef<number | null>(null)
+  const controllerJobConnectionLossRef = useRef<{
+    reportCount: number
+    sdPercent: number | null
+    line: number | null
+    mpos: Position
+  } | null>(null)
+  const reportCountAtConnectRef = useRef<number | null>(null)
+  const adoptionBlockedRef = useRef(false)
+  const resumedJobStartedAtRef = useRef<number | null>(null)
+  const savedJobStartedAtRef = useRef<number | null>(null)
+  const savedJobCheckedRef = useRef(false)
+
+  useEffect(() => {
+    reportCountAtConnectRef.current = connected ? useMachineStore.getState().statusReportCount : null
+  }, [connected])
+
+  // A reset ends the controller job, whichever button sent it. Stop following
+  // it so the Idle that comes next is not announced as a finished job, and do
+  // not take the job back from a report sent before the reset landed.
+  useEffect(() => onSoftReset(() => {
+    adoptionBlockedRef.current = true
+    cancelTrackedJob('controller')
+  }), [cancelTrackedJob])
+
+  useEffect(() => {
+    if (activeJobSource !== 'controller') {
+      if (controllerTrackedJobStartedAtRef.current != null) saveControllerJob(null)
+      controllerJobWasRunningRef.current = false
+      controllerJobAwaitingRunAfterSpinupRef.current = false
+      controllerJobSpinupSeenRef.current = false
+      controllerTrackedJobStartedAtRef.current = null
+      controllerJobConnectionLossRef.current = null
+
+      // Follow an SD job this page did not start: one started from another
+      // device, the terminal or a macro, or one that was running before this
+      // page loaded. Judge it only by reports that arrived after connecting.
+      const reportCountAtConnect = reportCountAtConnectRef.current
+      if (activeJobSource || !connected || reportCountAtConnect == null || statusReportCount <= reportCountAtConnect) return
+      const sdFilename = useMachineStore.getState().status.sdFilename
+      if (machineState !== 'Run' && machineState !== 'Hold') {
+        adoptionBlockedRef.current = false
+        if (!savedJobCheckedRef.current) {
+          // The job saved before a reload ended while the page was away.
+          savedJobCheckedRef.current = true
+          saveControllerJob(null)
+        }
+      } else if (sdFilename && !adoptionBlockedRef.current) {
+        savedJobCheckedRef.current = true
+        const saved = loadSavedControllerJob()
+        const resumed = saved?.sdFilename === sdFilename
+          ? { startedAt: saved.startedAt, adopted: saved.adopted }
+          : { startedAt: Date.now(), adopted: true }
+        resumedJobStartedAtRef.current = resumed.startedAt
+        startTrackedJob('controller', resumed)
+      }
+      return
+    }
+
+    if (controllerTrackedJobStartedAtRef.current !== activeJobStartedAt) {
+      controllerJobWasRunningRef.current = false
+      controllerJobAwaitingRunAfterSpinupRef.current = false
+      // A job taken over while it was running is already past its spin-up.
+      controllerJobSpinupSeenRef.current = activeJobStartedAt != null
+        && activeJobStartedAt === resumedJobStartedAtRef.current
+      controllerTrackedJobStartedAtRef.current = activeJobStartedAt ?? null
+      controllerJobConnectionLossRef.current = null
+    }
+
+    // The machine state is kept across a dropped connection. Remember where the
+    // job was, and judge it only by reports that arrive after reconnecting.
+    if (!connected) {
+      if (controllerJobWasRunningRef.current && !controllerJobConnectionLossRef.current) {
+        const { status, statusReportCount } = useMachineStore.getState()
+        controllerJobConnectionLossRef.current = {
+          reportCount: statusReportCount,
+          sdPercent: status.sdPercent ?? null,
+          line: useGCodeStore.getState().activeSourceLine,
+          mpos: status.mpos,
+        }
+      }
+      return
+    }
+    const loss = controllerJobConnectionLossRef.current
+    if (loss) {
+      if (statusReportCount === loss.reportCount) return
+      controllerJobConnectionLossRef.current = null
+      if (machineState !== 'Run' && machineState !== 'Hold') {
+        // A controller that restarts drops the connection and comes back idle,
+        // which used to read as a finished job. Without homing, it also comes
+        // back with its machine position at zero while the toolhead stayed put.
+        const mpos = useMachineStore.getState().status.mpos
+        interruptTrackedJob('controller', {
+          sdPercent: loss.sdPercent,
+          line: loss.line,
+          controllerRestarted: isZeroPosition(mpos) && !isZeroPosition(loss.mpos),
+        })
+        return
+      }
+    }
+
+    if (machineState === 'Run' || machineState === 'Hold') {
+      controllerJobWasRunningRef.current = true
+      controllerJobAwaitingRunAfterSpinupRef.current = false
+      const sdFilename = useMachineStore.getState().status.sdFilename
+      if (sdFilename && activeJobStartedAt != null && savedJobStartedAtRef.current !== activeJobStartedAt) {
+        savedJobStartedAtRef.current = activeJobStartedAt
+        saveControllerJob({ startedAt: activeJobStartedAt, adopted: activeJobAdopted, sdFilename })
+      }
+    } else if (machineState === 'Idle' && controllerJobWasRunningRef.current) {
+
+      const withinInitialSpinup = spindleSpinupMs > 0
+        && activeJobStartedAt != null
+        && Date.now() - activeJobStartedAt < spindleSpinupMs
+      const spindleIsStarting = spindleSpinupMs > 0 && spindleSpeed > 0
+      if (controllerJobAwaitingRunAfterSpinupRef.current) {
+        // Keep waiting. Repeated Idle reports are expected throughout the
+        // controller's delay and must never be treated as job completion.
+      } else if (!controllerJobSpinupSeenRef.current && (withinInitialSpinup || spindleIsStarting)) {
+        controllerJobAwaitingRunAfterSpinupRef.current = true
+        controllerJobSpinupSeenRef.current = true
+      } else {
+        finishTrackedJob('controller')
+      }
+    } else if (machineState === 'Alarm') {
+      cancelTrackedJob('controller')
+    }
+  }, [
+    activeJobSource,
+    activeJobStartedAt,
+    activeJobAdopted,
+    connected,
+    machineState,
+    statusReportCount,
+    spindleSpeed,
+    spindleSpinupMs,
+    startTrackedJob,
+    finishTrackedJob,
+    cancelTrackedJob,
+    interruptTrackedJob,
+  ])
+
+  return null
 }
 
 function AppContent() {
@@ -88,9 +318,6 @@ function AppContent() {
   const setStartupPending = useMachineStore(s => s.setStartupPending)
   const clearTerminal = useTerminalStore(s => s.clear)
   const machineState = useMachineStore(s => s.status.state)
-  const spindleSpeed = useMachineStore(s => s.status.spindle)
-  const statusReportCount = useMachineStore(s => s.statusReportCount)
-  const spindleSpinupMs = useMachineStore(s => s.controllerSettings.spindleSpinupMs ?? 0)
   const activeLayout = useActiveLayout(layoutMode)
   const { isCompactLandscape } = useViewportMetrics()
   const compactLandscapeScroll = isCompactLandscape && activeLayout === 'tablet'
@@ -101,10 +328,8 @@ function AppContent() {
   const senderFailureLine = useGCodeSenderStore(s => s.failureLine)
   const senderFailureLineSource = useGCodeSenderStore(s => s.failureLineSource)
   const activeJobSource = useGCodeStore(s => s.trackedJob?.source)
-  const activeJobStartedAt = useGCodeStore(s => s.trackedJob?.startedAt)
   const finishTrackedJob = useGCodeStore(s => s.finishTrackedJob)
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
-  const interruptTrackedJob = useGCodeStore(s => s.interruptTrackedJob)
   const [phase, setPhase]   = useState<Phase>('connecting')
   const [errMsg, setErrMsg] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -154,25 +379,29 @@ function AppContent() {
     else if (layout === 'jog') setJogPlugin(plugin)
   }, [activeLayout])
 
+  // The phone layout has no workspace or controls slot; those open as a modal.
+  const handlePhoneLaunchPanel = useCallback((plugin: Plugin) => {
+    const layout = getEffectiveLayout(plugin.manifest, 'mobile')
+    if (layout === 'full') setFullPlugin(plugin)
+    else if (layout === 'jog') {
+      setJogPlugin(plugin)
+      setMobilePanel('control')
+    } else return false
+    return true
+  }, [])
+
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const inFlightPromise = useRef<Promise<boolean> | null>(null)
   const backoffMs = useRef(0)
+  const stableConnectionTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const startupQueriesSent = useRef(false)
+  const startupQueriesDeferred = useRef(false)
   const cachedWsHost = useRef<string | null>(null)
   const cachedHostFailures = useRef(0)
   const [showReconnectOverlay, setShowReconnectOverlay] = useState(false)
   const restartSawDisconnect = useRef(false)
   const [startupErrors, setStartupErrors] = useState<string[]>([])
   const [startupErrorsOpen, setStartupErrorsOpen] = useState(false)
-  const controllerJobWasRunningRef = useRef(false)
-  const controllerJobAwaitingRunAfterSpinupRef = useRef(false)
-  const controllerJobSpinupSeenRef = useRef(false)
-  const controllerTrackedJobStartedAtRef = useRef<number | null>(null)
-  const controllerJobConnectionLossRef = useRef<{
-    reportCount: number
-    sdPercent: number | null
-    line: number | null
-    mpos: Position
-  } | null>(null)
 
   useEffect(() => {
     const stopPreparing = prepareJobSoundOnFirstGesture()
@@ -199,90 +428,6 @@ function AppContent() {
   }, [activeJobSource, senderPhase, finishTrackedJob, cancelTrackedJob])
 
   useEffect(() => {
-    if (activeJobSource !== 'controller') {
-      controllerJobWasRunningRef.current = false
-      controllerJobAwaitingRunAfterSpinupRef.current = false
-      controllerJobSpinupSeenRef.current = false
-      controllerTrackedJobStartedAtRef.current = null
-      controllerJobConnectionLossRef.current = null
-      return
-    }
-
-    if (controllerTrackedJobStartedAtRef.current !== activeJobStartedAt) {
-      controllerJobWasRunningRef.current = false
-      controllerJobAwaitingRunAfterSpinupRef.current = false
-      controllerJobSpinupSeenRef.current = false
-      controllerTrackedJobStartedAtRef.current = activeJobStartedAt ?? null
-      controllerJobConnectionLossRef.current = null
-    }
-
-    // The machine state is kept across a dropped connection. Remember where the
-    // job was, and judge it only by reports that arrive after reconnecting.
-    if (!connected) {
-      if (controllerJobWasRunningRef.current && !controllerJobConnectionLossRef.current) {
-        const { status, statusReportCount } = useMachineStore.getState()
-        controllerJobConnectionLossRef.current = {
-          reportCount: statusReportCount,
-          sdPercent: status.sdPercent ?? null,
-          line: useGCodeStore.getState().activeSourceLine,
-          mpos: status.mpos,
-        }
-      }
-      return
-    }
-    const loss = controllerJobConnectionLossRef.current
-    if (loss) {
-      if (statusReportCount === loss.reportCount) return
-      controllerJobConnectionLossRef.current = null
-      if (machineState !== 'Run' && machineState !== 'Hold') {
-        // A controller that restarts drops the connection and comes back idle,
-        // which used to read as a finished job. Without homing, it also comes
-        // back with its machine position at zero while the toolhead stayed put.
-        const mpos = useMachineStore.getState().status.mpos
-        interruptTrackedJob('controller', {
-          sdPercent: loss.sdPercent,
-          line: loss.line,
-          controllerRestarted: isZeroPosition(mpos) && !isZeroPosition(loss.mpos),
-        })
-        return
-      }
-    }
-
-    if (machineState === 'Run' || machineState === 'Hold') {
-      controllerJobWasRunningRef.current = true
-      controllerJobAwaitingRunAfterSpinupRef.current = false
-    } else if (machineState === 'Idle' && controllerJobWasRunningRef.current) {
-      
-      const withinInitialSpinup = spindleSpinupMs > 0
-        && activeJobStartedAt != null
-        && Date.now() - activeJobStartedAt < spindleSpinupMs
-      const spindleIsStarting = spindleSpinupMs > 0 && spindleSpeed > 0
-      if (controllerJobAwaitingRunAfterSpinupRef.current) {
-        // Keep waiting. Repeated Idle reports are expected throughout the
-        // controller's delay and must never be treated as job completion.
-      } else if (!controllerJobSpinupSeenRef.current && (withinInitialSpinup || spindleIsStarting)) {
-        controllerJobAwaitingRunAfterSpinupRef.current = true
-        controllerJobSpinupSeenRef.current = true
-      } else {
-        finishTrackedJob('controller')
-      }
-    } else if (machineState === 'Alarm') {
-      cancelTrackedJob('controller')
-    }
-  }, [
-    activeJobSource,
-    activeJobStartedAt,
-    connected,
-    machineState,
-    statusReportCount,
-    spindleSpeed,
-    spindleSpinupMs,
-    finishTrackedJob,
-    cancelTrackedJob,
-    interruptTrackedJob,
-  ])
-
-  useEffect(() => {
     fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`)
       .then(r => r.ok ? r.json() : null)
       .catch(() => null)
@@ -302,9 +447,17 @@ function AppContent() {
       return { wsHost: cachedWsHost.current, info: null }
     }
 
-    const raw  = cachedWsHost.current === null && cachedHostFailures.current > 0
-      ? await getDeviceInfoFast()
-      : await getDeviceInfo()
+    let raw: string
+    try {
+      raw = cachedHostFailures.current > 0
+        ? await getDeviceInfoFast()
+        : await getDeviceInfo()
+    } catch (e) {
+      // FluidNC can refuse [ESP800] while a job runs. Keep retrying the last
+      // host that worked rather than locking the page out until the job ends.
+      if (cachedWsHost.current) return { wsHost: cachedWsHost.current, info: null }
+      throw e
+    }
     const info = parseESP800(raw)
     const wsComm = info['webcommunication']?.trim() ?? ''
     const parts  = wsComm.split(':')
@@ -344,7 +497,6 @@ function AppContent() {
         return true
       } catch (e) {
         cachedHostFailures.current++
-        if (cachedHostFailures.current >= 3) cachedWsHost.current = null
         if (phase !== 'ready') {
           setErrMsg(e instanceof Error ? e.message : 'Connection failed')
         }
@@ -355,6 +507,18 @@ function AppContent() {
     })()
     inFlightPromise.current = p
     return p
+  }
+
+  function runStartupQueries() {
+    startupQueriesSent.current = true
+    startupQueriesDeferred.current = false
+    setStartupPending(true)
+    sendStartupQueries()
+      .finally(() => {
+        setStartupPending(false)
+        prefetchControllerConfigSettings()
+        window.setTimeout(() => prefetchInternalFiles(), 1000)
+      })
   }
 
   function scheduleReconnect() {
@@ -393,16 +557,30 @@ function AppContent() {
         clearTimeout(reconnectTimer.current)
         reconnectTimer.current = null
       }
-      backoffMs.current = 0
-      setStartupPending(true)
-      sendStartupQueries()
-        .finally(() => {
-          setStartupPending(false)
-          prefetchControllerConfigSettings()
-          window.setTimeout(() => prefetchInternalFiles(), 1000)
-        })
+      // Clear the backoff only once the connection has stayed up. A controller
+      // that accepts the socket and closes it again (low on memory) must not be
+      // reconnected, and sent the startup queries, every 300 ms.
+      if (stableConnectionTimer.current) clearTimeout(stableConnectionTimer.current)
+      stableConnectionTimer.current = setTimeout(() => {
+        stableConnectionTimer.current = null
+        backoffMs.current = 0
+      }, 10_000)
+      // What these queries report cannot change during a job, and FluidNC
+      // refuses them in motion or runs them on the task feeding the job. On a
+      // reconnect mid-job, send them once the job has ended.
+      if (startupQueriesSent.current && useGCodeStore.getState().trackedJob) {
+        startupQueriesDeferred.current = true
+      } else {
+        runStartupQueries()
+      }
     } else {
       setStartupPending(false)
+      if (stableConnectionTimer.current) {
+        // The connection dropped soon after it opened.
+        clearTimeout(stableConnectionTimer.current)
+        stableConnectionTimer.current = null
+        backoffMs.current = backoffMs.current === 0 ? 1000 : Math.min(backoffMs.current * 2, 30000)
+      }
       if (!reconnectTimer.current) {
         // Respect existing backoff so rapid connect/drop loops slow down.
         const delay = backoffMs.current > 0 ? Math.min(backoffMs.current, 30000) : 300
@@ -414,6 +592,21 @@ function AppContent() {
         }, delay)
       }
     }
+  }, [connected, phase])
+
+  useEffect(() => {
+    if (activeJobSource || !connected || phase !== 'ready' || !startupQueriesDeferred.current) return
+    runStartupQueries()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeJobSource, connected, phase])
+
+  // After the first connect failed, keep retrying with backoff, and leave the
+  // error screen as soon as any attempt (also one from kick()) gets through.
+  useEffect(() => {
+    if (phase !== 'error') return
+    if (connected) setPhase('ready')
+    else if (!reconnectTimer.current) scheduleReconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, phase])
 
   useEffect(() => {
@@ -638,12 +831,15 @@ function AppContent() {
 
   return (
     <div className={`flex flex-col min-h-[100svh] md:h-[100svh] md:overflow-hidden bg-[var(--bg)] relative ${
-      compactLandscapeScroll
+      // The phone layout scrolls the page in landscape too, as it does in portrait.
+      activeLayout === 'mobile'
+        ? ''
+        : compactLandscapeScroll
         ? 'landscape:h-auto landscape:min-h-[100svh] landscape:overflow-y-auto'
         : 'landscape:h-[100svh] landscape:overflow-hidden'
     }`}>
       {restarting ? (
-        <div className="fixed md:absolute inset-0 z-[120] bg-[var(--bg)]/80 backdrop-blur-sm
+        <div className="fixed md:absolute inset-0 z-[120] bg-[color-mix(in_srgb,var(--bg)_80%,transparent)] backdrop-blur-sm
                         flex flex-col items-center justify-center gap-3">
           <RefreshCw size={24} className="text-accent animate-spin" />
           <span className="text-text-primary text-base font-medium">Restarting controller…</span>
@@ -651,7 +847,7 @@ function AppContent() {
           {streamRecoveryNotice}
         </div>
       ) : showReconnectOverlay && (
-        <div className="fixed md:absolute inset-0 z-[120] bg-[var(--bg)]/80 backdrop-blur-sm
+        <div className="fixed md:absolute inset-0 z-[120] bg-[color-mix(in_srgb,var(--bg)_80%,transparent)] backdrop-blur-sm
                         flex flex-col items-center justify-center gap-3">
           <RefreshCw size={24} className="text-accent animate-spin" />
           <span className="text-text-muted text-base">Reconnecting…</span>
@@ -662,7 +858,7 @@ function AppContent() {
       <Header
         onSettingsClick={() => setSettingsOpen(true)}
         onAboutClick={() => setAboutOpen(true)}
-        sticky={compactLandscapeScroll}
+        sticky={compactLandscapeScroll || activeLayout === 'mobile'}
       />
 
       <ManualATCPrompt />
@@ -678,15 +874,16 @@ function AppContent() {
       {!fullPlugin && activeLayout === 'mobile' && <div className="flex flex-col">
         {mobilePanel === 'control' && (
           <div className="flex flex-col gap-3 p-3 pb-20">
-            <DRO />
+            <DRO isPhone />
             <JobControl />
             {jogPlugin ? (
               <div className="panel flex flex-col h-[60vh] overflow-hidden">
                 <PluginFrame plugin={jogPlugin} onClose={() => setJogPlugin(null)} inline />
               </div>
             ) : (
-              <TabletJogPad />
+              <TabletJogPad hideDuringJob />
             )}
+            <PhoneSpindleOverrides />
             <ProbeOrProgramPanel />
           </div>
         )}
@@ -702,7 +899,7 @@ function AppContent() {
               <div className="flex-1 min-h-0 overflow-hidden">
                 {sidebarTab === 'files'   && <FileManager isTablet />}
                 {sidebarTab === 'macros'  && <Macros />}
-                {sidebarTab === 'plugins' && <PluginLauncher />}
+                {sidebarTab === 'plugins' && <PluginLauncher onLaunchPanel={handlePhoneLaunchPanel} activeLayout={activeLayout} />}
               </div>
             </div>
           </div>
