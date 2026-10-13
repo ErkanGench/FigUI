@@ -35,6 +35,15 @@ export interface InterruptedJob {
   line: number | null
   /** The controller came back with its machine position reset to zero, as it does after a restart. */
   controllerRestarted: boolean
+  /** The job was already running when FigUI first saw it, so elapsedMs only counts from then. */
+  adopted?: boolean
+}
+
+/** A job this page follows. An adopted job was already running when the page first saw it, and startedAt is when it was seen. */
+export interface TrackedJob {
+  source: TrackedJobSource
+  startedAt: number
+  adopted?: boolean
 }
 
 interface GCodeStore {
@@ -76,8 +85,10 @@ interface GCodeStore {
   loadError: string | null
 
   // Job completion feedback
-  trackedJob: { source: TrackedJobSource; startedAt: number } | null
+  trackedJob: TrackedJob | null
   finishedJobElapsedMs: number | null
+  /** The finished job was adopted, so its real run time is unknown. */
+  finishedJobAdopted: boolean
   interruptedJob: InterruptedJob | null
 
   // Actions
@@ -89,7 +100,7 @@ interface GCodeStore {
     restartSource?: GCodeStore['restartSource'],
   ) => Promise<void>
   cancelAndStartJob: (path: string) => boolean
-  startTrackedJob: (source: TrackedJobSource) => void
+  startTrackedJob: (source: TrackedJobSource, resumed?: { startedAt: number; adopted: boolean }) => void
   finishTrackedJob: (source: TrackedJobSource) => void
   cancelTrackedJob: (source?: TrackedJobSource) => void
   interruptTrackedJob: (source: TrackedJobSource, details: Omit<InterruptedJob, 'elapsedMs'>) => void
@@ -116,7 +127,10 @@ const WORK_COORDINATE_SYSTEMS = new Set<WorkCoordinateSystem>([
 function isLoadBlockedByMachineState() {
   const machine = useMachineStore.getState()
   const state = machine.status.state
+  // A browser stream reports Idle whenever the planner drains (each M5/M4
+  // pair), so the machine state alone does not show it is running.
   return machine.connected && (state === 'Run' || state === 'Hold')
+    || useGCodeStore.getState().trackedJob?.source === 'local'
 }
 
 function abortInFlight() {
@@ -269,6 +283,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
   loadError: null,
   trackedJob: null,
   finishedJobElapsedMs: null,
+  finishedJobAdopted: false,
   interruptedJob: null,
 
   loadFile: async (path: string) => {
@@ -512,8 +527,10 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     return sendRaw(`$SD/Run=${path}`)
   },
 
-  startTrackedJob: source => set({
-    trackedJob: { source, startedAt: Date.now() },
+  startTrackedJob: (source, resumed) => set({
+    trackedJob: resumed
+      ? { source, startedAt: resumed.startedAt, adopted: resumed.adopted }
+      : { source, startedAt: Date.now() },
     finishedJobElapsedMs: null,
     interruptedJob: null,
   }),
@@ -524,6 +541,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     set({
       trackedJob: null,
       finishedJobElapsedMs: Math.max(0, Date.now() - trackedJob.startedAt),
+      finishedJobAdopted: !!trackedJob.adopted,
     })
   },
 
@@ -538,7 +556,11 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     if (!trackedJob || trackedJob.source !== source) return
     set({
       trackedJob: null,
-      interruptedJob: { ...details, elapsedMs: Math.max(0, Date.now() - trackedJob.startedAt) },
+      interruptedJob: {
+        ...details,
+        elapsedMs: Math.max(0, Date.now() - trackedJob.startedAt),
+        adopted: !!trackedJob.adopted,
+      },
     })
   },
 

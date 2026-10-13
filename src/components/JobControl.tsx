@@ -1,13 +1,16 @@
 import { Play, Pause, Square, RotateCcw, DoorOpen } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
+import { useGCodeSenderStore } from '../store/gcodeSender'
 import { formatRuntime, useJobRuntimeEstimate } from '../lib/jobRuntime'
 import { useControllerJobStarting } from '../lib/jobState'
 import { sendRealtime } from '../lib/ws'
 import { clearMachineAlarm } from '../lib/alarm'
+import { useConfirmTap } from '../hooks/useConfirmTap'
 
 export function JobControl() {
   const status = useMachineStore(s => s.status)
+  const connected = useMachineStore(s => s.connected)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerJobStarting = useControllerJobStarting()
   const controllerSettings = useMachineStore(s => s.controllerSettings)
@@ -18,22 +21,35 @@ export function JobControl() {
   const runtime = useJobRuntimeEstimate(status, model, controllerSettings, loadedPath, fileName)
   const progressPercent = runtime.progressPercent
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
+  const abortConfirm = useConfirmTap()
+  // A file streamed from the browser has no SD name; it needs the sender's
+  // own pause, resume and abort, as in the Viewer.
+  const senderPhase = useGCodeSenderStore(s => s.phase)
+  const pauseSender = useGCodeSenderStore(s => s.pause)
+  const resumeSender = useGCodeSenderStore(s => s.resume)
+  const abortSender = useGCodeSenderStore(s => s.abort)
+  const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
+  const senderPaused = senderPhase === 'paused'
 
-  const isRunning = state === 'Run' || controllerJobStarting || controllerResetPending
-  const isHold    = state === 'Hold'
+  const isRunning = (state === 'Run' && !senderPaused) || controllerJobStarting || controllerResetPending
+    || senderPhase === 'streaming' || senderPhase === 'draining'
+  const isHold    = state === 'Hold' || senderPaused
   const isAlarm   = state === 'Alarm'
   const isDoor    = state === 'Door'
   const hasSd     = Boolean(sdFilename)
 
-  function resume()     { sendRealtime(0x7E) }
-  function pause()      { sendRealtime(0x21) }
+  function resume()     { if (senderPaused) resumeSender(); else sendRealtime(0x7E) }
+  function pause()      { if (senderActive) pauseSender(); else sendRealtime(0x21) }
+  // Two taps instead of confirm(), which would stop the page while it is open.
   function softReset()  {
-    if (!confirm('Abort job and reset?')) return
-    if (sendRealtime(0x18)) cancelTrackedJob('controller')
+    abortConfirm.tap(() => {
+      if (senderActive) abortSender()
+      else if (sendRealtime(0x18)) cancelTrackedJob('controller')
+    })
   }
   function clearAlarm() { clearMachineAlarm(status.alarmCode) }
 
-  if (!hasSd && !isAlarm && !isHold && !isDoor && !controllerJobStarting && !controllerResetPending) return null
+  if (!hasSd && !senderActive && !isAlarm && !isHold && !isDoor && !controllerJobStarting && !controllerResetPending) return null
 
   return (
     <div className="panel">
@@ -59,6 +75,14 @@ export function JobControl() {
                 <span>Total {formatRuntime(runtime.totalSeconds)}</span>
               </div>
             )}
+            {runtime.source === 'sd' && progressPercent != null && (
+              <div className="flex justify-between text-xs font-mono text-text-muted tabular-nums">
+                <span>{progressPercent.toFixed(1)}%</span>
+                {runtime.remainingSeconds != null && (
+                  <span title="Estimated from SD file progress">Remain ~{formatRuntime(runtime.remainingSeconds)}</span>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -82,36 +106,36 @@ export function JobControl() {
         {/* Action buttons */}
         {isRunning ? (
           <div className="flex gap-2">
-            <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1" onClick={pause}>
+            <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={pause} disabled={!connected}>
               <Pause size={13} />
               Hold
             </button>
-            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1" onClick={softReset}>
+            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={softReset}>
               <Square size={13} />
-              Abort
+              {abortConfirm.armed ? 'Tap again to abort' : 'Abort'}
             </button>
           </div>
         ) : (
           <div className="flex gap-2">
             {(isHold || isDoor) ? (
-              <button className="btn btn-ok-solid gap-1.5 text-sm justify-center flex-1" onClick={resume}>
+              <button className="btn btn-ok-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={resume} disabled={!connected || (senderPaused && isDoor)}>
                 <Play size={13} />
                 Resume
               </button>
             ) : (
-              <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1" onClick={pause} disabled>
+              <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={pause} disabled>
                 <Pause size={13} />
                 Hold
               </button>
             )}
 
-            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1" onClick={softReset}>
+            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={softReset}>
               <Square size={13} />
-              Abort
+              {abortConfirm.armed ? 'Tap again to abort' : 'Abort'}
             </button>
 
             {(isAlarm || isDoor) && (
-              <button className="btn btn-ghost gap-1.5 text-sm justify-center flex-1" onClick={clearAlarm}>
+              <button className="btn btn-ghost gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={clearAlarm}>
                 <RotateCcw size={13} />
                 Unlock
               </button>

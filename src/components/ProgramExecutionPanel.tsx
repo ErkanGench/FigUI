@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { AlertTriangle, ChevronDown, FileCode2, Info, Navigation, Target, Wrench } from '../icons'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
@@ -80,7 +80,7 @@ function lineText(program: Program, index: number) {
   return program.text.slice(start, end)
 }
 
-function buildProgram(text: string): Program {
+export function buildProgram(text: string): Program {
   const normalized = text.replace(/\r\n?/g, '\n')
   const lineStarts = [0]
   for (let index = normalized.indexOf('\n'); index >= 0; index = normalized.indexOf('\n', index + 1)) {
@@ -120,14 +120,39 @@ function buildProgram(text: string): Program {
   return program
 }
 
+/**
+ * Calls onUserScroll when the user drags or wheels the listing, so following
+ * the executing line stops instead of snapping their scroll back. The follow
+ * effect's own scrollTop writes raise neither event.
+ */
+function useUserScroll(ref: RefObject<HTMLElement>, mounted: boolean, onUserScroll?: () => void) {
+  const callbackRef = useRef(onUserScroll)
+  callbackRef.current = onUserScroll
+  useEffect(() => {
+    const element = ref.current
+    if (!element || !mounted) return
+    const handle = () => callbackRef.current?.()
+    // Passive, so listening never delays the scroll itself.
+    element.addEventListener('touchmove', handle, { passive: true })
+    element.addEventListener('wheel', handle, { passive: true })
+    return () => {
+      element.removeEventListener('touchmove', handle)
+      element.removeEventListener('wheel', handle)
+    }
+  }, [ref, mounted])
+}
+
 /** Renders only the visible lines so multi-million-line programs stay responsive. */
-function VirtualProgramView({ program, physicalLine, isEstimated, follow }: {
+export function VirtualProgramView({ program, physicalLine, isEstimated, follow, onSelectLine, onUserScroll }: {
   program: Program
   physicalLine: number | null
   isEstimated: boolean
   follow: boolean
+  onSelectLine?: (line: number) => void
+  onUserScroll?: () => void
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  useUserScroll(scrollRef, true, onUserScroll)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(0)
   const contentHeight = program.totalLines * LINE_HEIGHT + PADDING_Y * 2
@@ -162,8 +187,9 @@ function VirtualProgramView({ program, physicalLine, isEstimated, follow }: {
     rows.push(
       <div
         key={index}
-        className={`absolute left-0 flex min-w-full ${highlighted ? (isEstimated ? 'bg-info/15' : 'bg-ok/15') : ''}`}
+        className={`absolute left-0 flex min-w-full ${onSelectLine ? 'cursor-pointer' : ''} ${highlighted ? (isEstimated ? 'bg-info/15' : 'bg-ok/15') : ''}`}
         style={{ top: scrollTop + PADDING_Y + index * LINE_HEIGHT - offset, height: LINE_HEIGHT, lineHeight: `${LINE_HEIGHT}px` }}
+        onClick={onSelectLine ? () => onSelectLine(index + 1) : undefined}
       >
         <span className={`sticky left-0 w-16 shrink-0 pr-3 text-right border-r select-none ${highlighted ? (isEstimated ? 'border-l-2 border-l-info border-r-border bg-info/15 text-info' : 'border-l-2 border-l-ok border-r-border bg-ok/15 text-ok') : 'border-border bg-elevated text-text-dim'}`} aria-hidden="true">
           {index + 1}
@@ -215,6 +241,8 @@ export function ProgramExecutionPanel({ isTablet, initiallyOpen = false, accordi
       : runningName.toLowerCase() === loadedName.toLowerCase())
   )
   const program = useMemo(() => buildProgram(sourceMatchesJob ? sourceText! : ''), [sourceMatchesJob, sourceText])
+  const stopFollowing = () => setFollow(false)
+  useUserScroll(programRef, contentOpen && sourceMatchesJob && !program.virtual, stopFollowing)
   const reportedN = status.plannerLineNumber
   const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
   const senderMode = senderPhase !== 'idle'
@@ -284,7 +312,7 @@ export function ProgramExecutionPanel({ isTablet, initiallyOpen = false, accordi
           <div className="relative">
             <button
               type="button"
-              className="flex h-7 w-7 items-center justify-center rounded text-text-dim transition-colors hover:bg-elevated hover:text-info"
+              className="flex h-7 w-7 [@media(pointer:coarse)]:h-10 [@media(pointer:coarse)]:w-10 items-center justify-center rounded text-text-dim transition-colors hover:bg-elevated hover:text-info"
               onClick={() => setShowTrackingInfo(value => !value)}
               aria-label={senderMode ? 'About local sender line tracking' : 'About program line tracking'}
               aria-expanded={showTrackingInfo}
@@ -292,7 +320,7 @@ export function ProgramExecutionPanel({ isTablet, initiallyOpen = false, accordi
               <Info size={14} />
             </button>
             {showTrackingInfo && (
-              <div role="note" className="absolute right-0 top-9 z-50 w-72 rounded border border-border bg-surface p-3 text-xs font-normal normal-case tracking-normal text-text-muted shadow-xl">
+              <div role="note" className="absolute right-0 top-full mt-2 z-50 w-72 rounded border border-border bg-surface p-3 text-xs font-normal normal-case tracking-normal text-text-muted shadow-xl">
                 <p className="font-semibold text-text-primary">
                   {senderMode ? 'Local job line tracking' : 'About line tracking'}
                 </p>
@@ -338,7 +366,7 @@ export function ProgramExecutionPanel({ isTablet, initiallyOpen = false, accordi
             <span className="text-xs font-mono text-text-muted">File line {physicalLine}</span>
           )}
           <button
-            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${follow ? 'text-info bg-info/10' : 'text-text-dim hover:text-text-primary bg-elevated'}`}
+            className={`flex items-center gap-1 rounded px-2 py-1 [@media(pointer:coarse)]:min-h-[40px] [@media(pointer:coarse)]:px-3 text-xs transition-colors ${follow ? 'text-info bg-info/10' : 'text-text-dim hover:text-text-primary bg-elevated'}`}
             onClick={() => setFollow(value => !value)}
             title={follow ? 'Disable automatic line following' : 'Follow the executing line'}
           >
@@ -350,7 +378,7 @@ export function ProgramExecutionPanel({ isTablet, initiallyOpen = false, accordi
       {contentOpen && (sourceMatchesJob ? (
         <div className="relative flex-1 min-h-0 overflow-hidden bg-surface font-mono text-[13px]">
           {program.virtual ? (
-            <VirtualProgramView program={program} physicalLine={physicalLine} isEstimated={isEstimated} follow={follow} />
+            <VirtualProgramView program={program} physicalLine={physicalLine} isEstimated={isEstimated} follow={follow} onUserScroll={stopFollowing} />
           ) : <>
             <div
               ref={highlightRef}
@@ -405,7 +433,7 @@ export function ProbeOrProgramPanel({ isTablet }: { isTablet?: boolean }) {
   const hasProbingInput = Boolean(reportedHasProbe || reportedHasToolsetter)
   const senderPhase = useGCodeSenderStore(s => s.phase)
   const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
-  const isProgramRunning = (status.state === 'Run' || status.state === 'Hold')
+  const isProgramRunning = (status.state === 'Run' || status.state === 'Hold' || status.state === 'Door')
     && (!!status.sdFilename || status.plannerLineNumber != null)
   if (isProgramRunning || senderActive) return <ProgramExecutionPanel isTablet={isTablet} />
   return <ProbeAndManualATCPanel

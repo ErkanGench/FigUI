@@ -5,7 +5,9 @@ import { saveFileContent } from '../lib/http'
 import { useGCodeStore } from '../store/gcode'
 import { useMachineStore } from '../store'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
+import { parseDecimalInput } from '../lib/numberInput'
 import type { Units } from '../types'
+import { buildProgram, VirtualProgramView } from './ProgramExecutionPanel'
 
 interface Props {
   sourceText: string
@@ -53,7 +55,7 @@ function safeZTextFromMm(mmValue: number | null, units: Units) {
 }
 
 function numericInput(value: string) {
-  return value.trim() === '' ? Number.NaN : Number(value)
+  return parseDecimalInput(value) ?? Number.NaN
 }
 
 export function RestartFromLineDialog({
@@ -71,24 +73,16 @@ export function RestartFromLineDialog({
   const lineHighlightRef = useRef<HTMLDivElement>(null)
   const loadFromText = useGCodeStore(s => s.loadFromText)
   const units = useMachineStore(s => s.units)
-  const program = useMemo(() => {
-    const text = sourceText.replace(/\r\n?/g, '\n')
-    const starts = [0]
-    for (let index = 0; index < text.length; index++) {
-      if (text[index] === '\n' && index < text.length - 1) starts.push(index + 1)
-    }
-    return {
-      text,
-      lineStarts: starts,
-      lineNumbers: starts.map((_, index) => String(index + 1)).join('\n'),
-    }
-  }, [sourceText])
-  const totalLines = program.lineStarts.length
+  const activeWcs = useMachineStore(s => s.status.gcodeModes?.wcs)
+  // Long programs use the virtual list; a textarea holding them is slow to lay out.
+  const program = useMemo(() => buildProgram(sourceText), [sourceText])
+  const totalLines = program.totalLines
   const initialSelectedLine = initialLine == null
     ? null
     : Math.max(1, Math.min(Math.trunc(initialLine), totalLines))
   const [lineText, setLineText] = useState(initialSelectedLine == null ? '' : String(initialSelectedLine))
   const [selectedLine, setSelectedLine] = useState<number | null>(initialSelectedLine)
+  const [centerSelection, setCenterSelection] = useState(true)
   const [analyzedLine, setAnalyzedLine] = useState<number | null>(initialSelectedLine)
   const [safeZText, setSafeZText] = useState(() => safeZTextFromMm(defaultSafeMachineZMm, units))
   const [clearanceText, setClearanceText] = useState(() => defaultClearanceText(units))
@@ -141,6 +135,7 @@ export function RestartFromLineDialog({
     const textarea = programRef.current
     setLineText(String(selected))
     setSelectedLine(selected)
+    setCenterSelection(center)
     setAnalyzedLine(selected)
     setError('')
     if (!textarea) return
@@ -207,7 +202,7 @@ export function RestartFromLineDialog({
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 p-3 sm:p-6" onClick={() => { if (!preparing) onClose() }}>
       <div
-        className="w-full max-w-5xl h-[92vh] max-h-[920px] overflow-hidden rounded-lg border border-border bg-surface shadow-2xl flex flex-col animate-in"
+        className="w-full max-w-5xl h-[92dvh] max-h-[920px] overflow-hidden rounded-lg border border-border bg-surface shadow-2xl flex flex-col animate-in"
         onClick={event => event.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-4 border-b border-border px-4 py-3.5 sm:px-5">
@@ -274,6 +269,26 @@ export function RestartFromLineDialog({
               <span className="text-xs text-text-muted">Click any line to select it</span>
             </div>
             <div className="relative h-[42vh] min-h-[260px] overflow-hidden rounded border border-border bg-surface font-mono text-[13px]">
+              {program.virtual ? (
+                <div
+                  className="absolute inset-0 outline-none"
+                  tabIndex={0}
+                  onKeyDown={event => {
+                    const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
+                    if (!step || selectedLine == null) return
+                    event.preventDefault()
+                    selectProgramLine(selectedLine + step, true)
+                  }}
+                >
+                  <VirtualProgramView
+                    program={program}
+                    physicalLine={selectedLine}
+                    isEstimated
+                    follow={centerSelection}
+                    onSelectLine={line => selectProgramLine(line)}
+                  />
+                </div>
+              ) : (<>
               <div
                 ref={lineHighlightRef}
                 className="absolute left-0 right-0 h-5 bg-accent/10 border-l-2 border-accent pointer-events-none z-0"
@@ -303,6 +318,7 @@ export function RestartFromLineDialog({
                   }
                 }}
               />
+              </>)}
             </div>
           </div>
 
@@ -310,7 +326,7 @@ export function RestartFromLineDialog({
             <>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 <SummaryCell label="Resume line" value={`L${analysis.resumeLine}`} accent />
-                <SummaryCell label="Work offset" value={analysis.state.wcs} />
+                <SummaryCell label="Work offset" value={analysis.state.wcs ?? `Active${activeWcs ? ` (${activeWcs})` : ''}`} />
                 <SummaryCell label="Tool" value={analysis.state.tool == null ? 'Verify' : `T${analysis.state.tool}`} />
                 <SummaryCell
                   label={`Start position (${linearUnitLabel(units)})`}
@@ -348,9 +364,9 @@ export function RestartFromLineDialog({
                     <span className="ml-2 font-normal text-text-muted">G53 retract and controlled Z re-entry</span>
                   </summary>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 px-3.5 pb-3.5 border-t border-border pt-3">
-                    <NumberField label="Machine safe Z" value={safeZText} onChange={setSafeZText} suffix={linearUnitLabel(units)} />
-                    <NumberField label="Approach clearance" value={clearanceText} onChange={setClearanceText} suffix={linearUnitLabel(units)} min="0" />
-                    <NumberField label="Approach feed" value={approachFeedText} onChange={setApproachFeedText} suffix={feedUnitLabel(units)} min="0.001" />
+                    <NumberField label="Machine safe Z" value={safeZText} onChange={setSafeZText} suffix={linearUnitLabel(units)} signed />
+                    <NumberField label="Approach clearance" value={clearanceText} onChange={setClearanceText} suffix={linearUnitLabel(units)} />
+                    <NumberField label="Approach feed" value={approachFeedText} onChange={setApproachFeedText} suffix={feedUnitLabel(units)} />
                   </div>
                   {!positioningValid && <p className="px-3.5 pb-3 text-sm text-danger">Enter valid safe-positioning values.</p>}
                 </details>
@@ -390,21 +406,21 @@ function SummaryCell({ label, value, accent, compact }: { label: string; value: 
   )
 }
 
-function NumberField({ label, value, onChange, suffix, min }: {
+function NumberField({ label, value, onChange, suffix, signed }: {
   label: string
   value: string
   onChange: (value: string) => void
   suffix: string
-  min?: string
+  // The iOS decimal keypad has no minus key.
+  signed?: boolean
 }) {
   return (
     <label className="text-xs text-text-muted">
       <span className="block mb-1">{label}</span>
       <span className="flex items-center rounded border border-border bg-surface focus-within:border-accent/60">
         <input
-          type="number"
-          step="any"
-          min={min}
+          type="text"
+          inputMode={signed ? undefined : "decimal"}
           value={value}
           onChange={event => onChange(event.target.value)}
           className="w-full min-w-0 bg-transparent px-2 py-1.5 font-mono text-sm text-text-primary outline-none"
