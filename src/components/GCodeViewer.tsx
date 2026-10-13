@@ -1,18 +1,34 @@
 import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench } from 'lucide-react'
 import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { onLine, sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
 import { buildJobTimingEstimate, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
 import { createRenderer, renderLines, setStaticLineData, type WebGLRenderer, type Camera, type Vector3 } from '../lib/webgl'
-import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, EMPTY_UINT8, getArcGeometry, normalizeAngle, type RenderLines } from '../lib/gcodeBuild'
+import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, EMPTY_UINT8, getArcGeometry, getArcPoint, type RenderLines } from '../lib/gcodeBuild'
+import {
+  buildCumulativeXYLengths,
+  buildLineStarts,
+  findLastSegmentAtOrBeforeSourceLine,
+  findSegmentAtTextOffset,
+  findToolpathProgress,
+  getTrackingZ,
+  isRunningLoadedFile,
+  segmentXYLength,
+  type ToolpathProgress,
+} from '../lib/toolpathTracking'
 import { RestartFromLineDialog } from './RestartFromLineDialog'
 import { useGCodeSenderStore } from '../store/gcodeSender'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
+import { programMovesZ } from '../lib/gcodeRestart'
+import { parseDecimalInput } from '../lib/numberInput'
+import { useConfirmTap } from '../hooks/useConfirmTap'
+import { releaseLaserPointerForJob } from '../lib/laser'
 
 const GCODE_EXTENSIONS_PREVIEW = '.g, .nc, .gcode, .ngc, .tap, or .cnc'
 
@@ -52,12 +68,6 @@ interface BedEnvelope {
   originY: number
   width: number
   height: number
-}
-
-interface ToolpathProgress {
-  segmentIndex: number
-  fraction: number
-  misses?: number
 }
 
 type SimulationPhase = 'idle' | 'playing' | 'paused' | 'completed'
@@ -116,17 +126,8 @@ interface ViewCubeData {
 }
 
 const TAU = Math.PI * 2
-const INITIAL_LOCK_TOLERANCE_MM = 0.25
-const FOLLOW_TOLERANCE_MM = 0.2
-const ENDPOINT_TOLERANCE_MM = 0.2
-const SEGMENT_LOOKAHEAD = 12
 const LOOKAHEAD_DISTANCE_FLOOR_MM = 1
 const LOOKAHEAD_FEED_MARGIN = 3
-const LOOKAHEAD_MAX_SEGMENTS = 4000
-/** Consecutive missed reports before the tracker searches the whole job again. */
-const PROGRESS_RELOCK_MISSES = 4
-/** Matches this close to the file-progress hint count as equally likely. */
-const PROGRESS_HINT_SLACK_SEGMENTS = 300
 const LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT = 100_000
 /** Above this many lines, 2D pan and zoom stretch the cached layer until the view settles. */
 const LARGE_2D_LAYER_LINE_LIMIT = 100_000
@@ -135,6 +136,8 @@ const STATIC_2D_SETTLE_MS = 150
 const STATIC_2D_LAYER_PAD_RATIO = 0.25
 const FOLLOW_EDGE_MARGIN_PX = 40
 const FOLLOW_EDGE_MARGIN_RATIO = 0.1
+/** A 2D drag longer than this while a job runs turns Follow off, so the view stays where it was dragged. */
+const FOLLOW_PAN_RELEASE_PX = 8
 const FOLLOW_MODE_KEY = 'gcode.followMode'
 const EMPTY_FLOAT32 = new Float32Array(0)
 const WHEEL_ZOOM_SENSITIVITY = 0.0012
@@ -158,11 +161,30 @@ const FRAMING_TRAVEL_Z_KEY = 'gcode.framingTravelZMm'
 const SIMULATION_SPEED_MIN = 25
 const SIMULATION_SPEED_MAX = 10000
 const SIMULATION_SPEED_STEP = 25
+/** Time beyond the spindle spin-up delay for the controller to report a started SD job. */
+const CONTROLLER_START_TIMEOUT_MS = 5000
+/** An error reply this soon after $SD/Run is taken as the controller refusing the file. */
+const CONTROLLER_START_ERROR_WINDOW_MS = 3000
 
 const ENTRY_MARKER_LINE = [0.13, 0.77, 0.37, 1.0] as const
 const ENTRY_MARKER_FILL = [0.13, 0.77, 0.37, 0.26] as const
 const EXIT_MARKER_LINE = [0.94, 0.27, 0.27, 1.0] as const
 const EXIT_MARKER_FILL = [0.94, 0.27, 0.27, 0.26] as const
+
+/**
+ * True on a touch device when the viewer sits in a page or panel that scrolls
+ * vertically (tablet portrait, compact landscape). A one-finger drag on the
+ * canvas there should scroll, or the viewer traps most of the screen.
+ */
+function isInScrollingPage(element: HTMLElement) {
+  if (!window.matchMedia?.('(any-pointer: coarse)').matches) return false
+  for (let node = element.parentElement; node; node = node.parentElement) {
+    const { overflowY } = getComputedStyle(node)
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 1) return true
+  }
+  const root = document.scrollingElement
+  return !!root && root.scrollHeight > root.clientHeight + 1
+}
 
 function getAxisEnvelopeOrigin(wco: number, maxTravel: number, homingDirInvert: number, bit: number) {
   return -wco - ((homingDirInvert & bit) ? 0 : maxTravel)
@@ -427,6 +449,20 @@ function drawSegment(
   const clampedFraction = clamp01(fraction)
   if (clampedFraction <= 0) return
 
+  if (seg.i !== undefined && (seg.arcPlane ?? 17) !== 17) {
+    // A G18/G19 arc is not a circle when seen from above.
+    const arc = getArcGeometry(seg)
+    const numSubs = Math.max(8, Math.min(64, Math.ceil(arc.sweep * arc.r * 4)))
+    ctx.beginPath()
+    ctx.moveTo(t.ox + seg.x0 * t.scale, t.oy - seg.y0 * t.scale)
+    for (let i = 1; i <= numSubs; i++) {
+      const point = getArcPoint(seg, arc, clampedFraction * i / numSubs)
+      ctx.lineTo(t.ox + point.x * t.scale, t.oy - point.y * t.scale)
+    }
+    ctx.stroke()
+    return
+  }
+
   if (seg.i !== undefined) {
     const arc = getArcGeometry(seg)
     const sx = t.ox + arc.cx * t.scale
@@ -513,60 +549,6 @@ function toolPathColorRgba(tool: number | null | undefined) {
   if (tool == null) return TOOL_PATH_COLOR_RGBA[0]
   const abs = Math.abs(tool)
   return TOOL_PATH_COLOR_RGBA[(abs > 0 ? abs - 1 : 0) % TOOL_PATH_COLOR_RGBA.length]
-}
-
-function measureProgressAlongSegment(seg: Segment, px: number, py: number, pz: number) {
-  if (seg.i === undefined) {
-    const dx = seg.x1 - seg.x0
-    const dy = seg.y1 - seg.y0
-    const lenSq = dx * dx + dy * dy
-    if (lenSq < 1e-9) {
-      const distSq = (px - seg.x0) ** 2 + (py - seg.y0) ** 2 + (pz - seg.z0) ** 2
-      return { fraction: 0, distanceSq: distSq }
-    }
-    const rawFraction = ((px - seg.x0) * dx + (py - seg.y0) * dy) / lenSq
-    const fraction = clamp01(rawFraction)
-    const projX = seg.x0 + dx * fraction
-    const projY = seg.y0 + dy * fraction
-    const projZ = seg.z0 + (seg.z1 - seg.z0) * fraction
-    const distanceSq = (px - projX) ** 2 + (py - projY) ** 2 + (pz - projZ) ** 2
-    return { fraction, distanceSq }
-  }
-
-  const arc = getArcGeometry(seg)
-  if (arc.r < 1e-9) {
-    const distSq = (px - seg.x0) ** 2 + (py - seg.y0) ** 2 + (pz - seg.z0) ** 2
-    return { fraction: 0, distanceSq: distSq }
-  }
-
-  const pointAngle = Math.atan2(py - arc.cy, px - arc.cx)
-  const delta = seg.cw
-    ? normalizeAngle(arc.startAngle - pointAngle)
-    : normalizeAngle(pointAngle - arc.startAngle)
-
-  if (arc.fullCircle || delta <= arc.sweep + 1e-6) {
-    const fraction = arc.fullCircle ? clamp01(delta / arc.sweep) : clamp01(delta / arc.sweep)
-    const projX = arc.cx + Math.cos(pointAngle) * arc.r
-    const projY = arc.cy + Math.sin(pointAngle) * arc.r
-    const projZ = seg.z0 + (seg.z1 - seg.z0) * fraction
-    const distanceSq = (px - projX) ** 2 + (py - projY) ** 2 + (pz - projZ) ** 2
-    return { fraction, distanceSq }
-  }
-
-  const startDistSq = (px - seg.x0) ** 2 + (py - seg.y0) ** 2 + (pz - seg.z0) ** 2
-  const endDistSq = (px - seg.x1) ** 2 + (py - seg.y1) ** 2 + (pz - seg.z1) ** 2
-  return startDistSq <= endDistSq
-    ? { fraction: 0, distanceSq: startDistSq }
-    : { fraction: 1, distanceSq: endDistSq }
-}
-
-function compareProgress(a: ToolpathProgress, b: ToolpathProgress) {
-  if (a.segmentIndex !== b.segmentIndex) return a.segmentIndex - b.segmentIndex
-  return a.fraction - b.fraction
-}
-
-function pointDistanceSq(ax: number, ay: number, az: number, bx: number, by: number, bz: number) {
-  return (ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2
 }
 
 function normalizeVector(x: number, y: number, z: number) {
@@ -843,83 +825,6 @@ function getWheelZoomScale(deltaY: number, deltaMode: number, pageSize: number) 
   return Math.exp(-deltaPixels * WHEEL_ZOOM_SENSITIVITY)
 }
 
-/** Reused result of measureProgressAt; read it before the next call. */
-const lineProgressMeasurement = { fraction: 0, distanceSq: 0 }
-
-/**
- * Same as measureProgressAlongSegment for one move of the table, without
- * building the move object for straight lines, so a whole large job can be
- * searched quickly.
- */
-function measureProgressAt(segments: SegmentTable, index: number, px: number, py: number, pz: number) {
-  if (segments.isArc(index)) return measureProgressAlongSegment(segments.get(index), px, py, pz)
-  const x0 = segments.px[index], y0 = segments.py[index], z0 = segments.pz[index]
-  const dx = segments.px[index + 1] - x0
-  const dy = segments.py[index + 1] - y0
-  const dz = segments.pz[index + 1] - z0
-  const lenSq = dx * dx + dy * dy
-  const fraction = lenSq < 1e-9 ? 0 : clamp01(((px - x0) * dx + (py - y0) * dy) / lenSq)
-  const ex = px - (x0 + dx * fraction)
-  const ey = py - (y0 + dy * fraction)
-  const ez = pz - (z0 + dz * fraction)
-  lineProgressMeasurement.fraction = fraction
-  lineProgressMeasurement.distanceSq = ex * ex + ey * ey + ez * ez
-  return lineProgressMeasurement
-}
-
-function findNearbyProgress(
-  segments: SegmentTable,
-  px: number,
-  py: number,
-  pz: number,
-  startIndex: number,
-  endIndex: number,
-  toleranceSq: number,
-  previous: ToolpathProgress | null,
-  preferLatest: boolean,
-  /** Segment the job is roughly at; matches far from it lose to nearer ones. */
-  hintIndex: number | null = null,
-): ToolpathProgress | null {
-  let best: (ToolpathProgress & { distanceSq: number }) | null = null
-  const hintDistance = (index: number) => hintIndex == null ? 0 : Math.max(0, Math.abs(index - hintIndex) - PROGRESS_HINT_SLACK_SEGMENTS)
-
-  for (let i = startIndex; i <= endIndex && i < segments.length; i++) {
-    const measurement = measureProgressAt(segments, i, px, py, pz)
-    if (measurement.distanceSq > toleranceSq) continue
-
-    const candidate: ToolpathProgress & { distanceSq: number } = {
-      segmentIndex: i,
-      fraction: measurement.fraction,
-      distanceSq: measurement.distanceSq,
-    }
-
-    if (previous && i === previous.segmentIndex && candidate.fraction < previous.fraction) {
-      candidate.fraction = previous.fraction
-    }
-
-    const hintGain = best ? hintDistance(best.segmentIndex) - hintDistance(i) : 0
-    if (hintGain < 0) continue
-
-    if (
-      !best
-      || hintGain > 0
-      || (preferLatest && (
-        compareProgress(candidate, best) > 0
-        || (compareProgress(candidate, best) === 0 && candidate.distanceSq < best.distanceSq)
-      ))
-      || (!preferLatest && (
-        candidate.distanceSq < best.distanceSq - 1e-9
-        || (Math.abs(candidate.distanceSq - best.distanceSq) <= 1e-9
-          && compareProgress(candidate, best) < 0)
-      ))
-    ) {
-      best = candidate
-    }
-  }
-
-  return best ? { segmentIndex: best.segmentIndex, fraction: best.fraction } : null
-}
-
 function buildCumulativeSegmentTimes(timing: JobTimingEstimate) {
   const cumulative = new Float64Array(timing.segmentSeconds.length + 1)
   for (let i = 0; i < timing.segmentSeconds.length; i++) {
@@ -970,15 +875,7 @@ function getSimulationProgressAt(
 
 function getSegmentPoint(seg: Segment, fraction: number) {
   const t = clamp01(fraction)
-  if (seg.i !== undefined) {
-    const arc = getArcGeometry(seg)
-    const angle = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * t
-    return {
-      x: arc.cx + Math.cos(angle) * arc.r,
-      y: arc.cy + Math.sin(angle) * arc.r,
-      z: seg.z0 + (seg.z1 - seg.z0) * t,
-    }
-  }
+  if (seg.i !== undefined) return getArcPoint(seg, getArcGeometry(seg), t)
   return {
     x: seg.x0 + (seg.x1 - seg.x0) * t,
     y: seg.y0 + (seg.y1 - seg.y0) * t,
@@ -986,150 +883,9 @@ function getSegmentPoint(seg: Segment, fraction: number) {
   }
 }
 
-function segmentXYLength(seg: Segment) {
-  if (seg.i !== undefined && (seg.arcPlane ?? 17) === 17) {
-    const arc = getArcGeometry(seg)
-    return Math.hypot(arc.sweep * arc.r, seg.z1 - seg.z0)
-  }
-  return Math.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0, seg.z1 - seg.z0)
-}
-
-function buildCumulativeXYLengths(segments: SegmentTable) {
-  const cumulative = new Float64Array(segments.length + 1)
-  for (let i = 0; i < segments.length; i++) {
-    const length = segments.isArc(i)
-      ? segmentXYLength(segments.get(i))
-      : Math.hypot(
-          segments.px[i + 1] - segments.px[i],
-          segments.py[i + 1] - segments.py[i],
-          segments.pz[i + 1] - segments.pz[i],
-        )
-    cumulative[i + 1] = cumulative[i] + length
-  }
-  return cumulative
-}
-
 function getLookaheadDistanceMm(feedMmPerMin: number) {
   const pollSeconds = STATUS_POLL_INTERVAL_MS / 1000
   return Math.max(LOOKAHEAD_DISTANCE_FLOOR_MM, (feedMmPerMin / 60) * pollSeconds * LOOKAHEAD_FEED_MARGIN)
-}
-
-function findToolpathProgress(
-  segments: SegmentTable,
-  cumulativeXYLengths: Float64Array,
-  px: number,
-  py: number,
-  pz: number,
-  previous: ToolpathProgress | null,
-  lookaheadDistanceMm: number,
-  maxSegmentIndex = segments.length - 1,
-  hintIndex: number | null = null,
-): ToolpathProgress | null {
-  const allowedEndIndex = Math.min(maxSegmentIndex, segments.length - 1)
-  if (segments.length === 0 || allowedEndIndex < 0) return null
-
-  const lockAnywhere = (hint: number | null) => findNearbyProgress(
-    segments,
-    px,
-    py,
-    pz,
-    0,
-    allowedEndIndex,
-    INITIAL_LOCK_TOLERANCE_MM ** 2,
-    null,
-    false,
-    hint,
-  )
-
-  if (!previous) return lockAnywhere(hintIndex)
-
-  // Lost for several reports (for example the preview was opened mid-job):
-  // search the whole job again rather than only just ahead of a stale position.
-  // Without a job position hint, prefer matches near where the tool was last
-  // seen, so a repeated pass does not fall back to an earlier one.
-  if ((previous.misses ?? 0) >= PROGRESS_RELOCK_MISSES) {
-    const relocked = lockAnywhere(hintIndex ?? previous.segmentIndex)
-    if (relocked) return { ...relocked, misses: 0 }
-  }
-
-  const startIndex = previous.segmentIndex
-  const maxEndIndex = Math.min(startIndex + LOOKAHEAD_MAX_SEGMENTS, allowedEndIndex)
-  const nearEndIndex = Math.min(startIndex + SEGMENT_LOOKAHEAD, allowedEndIndex)
-
-  const near = findNearbyProgress(
-    segments,
-    px,
-    py,
-    pz,
-    startIndex,
-    nearEndIndex,
-    FOLLOW_TOLERANCE_MM ** 2,
-    previous,
-    false,
-  )
-  if (near) return { ...near, misses: 0 }
-
-  const priorMisses = previous.misses ?? 0
-  const distanceLimit = cumulativeXYLengths[startIndex] + lookaheadDistanceMm * (priorMisses + 1)
-  let farEndIndex = nearEndIndex
-  while (farEndIndex < maxEndIndex && cumulativeXYLengths[farEndIndex + 1] < distanceLimit) farEndIndex++
-
-  if (farEndIndex > nearEndIndex) {
-    const far = findNearbyProgress(
-      segments,
-      px,
-      py,
-      pz,
-      nearEndIndex + 1,
-      farEndIndex,
-      FOLLOW_TOLERANCE_MM ** 2,
-      previous,
-      false,
-    )
-    if (far) return { ...far, misses: 0 }
-  }
-
-  const current = segments.get(startIndex)
-  if (pointDistanceSq(px, py, pz, current.x1, current.y1, current.z1) <= ENDPOINT_TOLERANCE_MM ** 2) {
-    return { segmentIndex: startIndex, fraction: 1, misses: 0 }
-  }
-
-  return { ...previous, misses: priorMisses + 1 }
-}
-
-/**
- * Z to compare the live position against. A program that never moves Z (a
- * laser focused by hand) says nothing about where the machine's Z is, so it
- * is tracked in XY only.
- */
-function getTrackingZ(model: GCodeModel, machineZ: number) {
-  return model.bounds.minZ === model.bounds.maxZ ? model.bounds.minZ : machineZ
-}
-
-/** Offset of every line in `text`. */
-function buildLineStarts(text: string) {
-  let count = 1
-  for (let index = text.indexOf('\n'); index >= 0; index = text.indexOf('\n', index + 1)) count++
-  const starts = new Uint32Array(count)
-  let line = 1
-  for (let index = text.indexOf('\n'); index >= 0; index = text.indexOf('\n', index + 1)) starts[line++] = index + 1
-  return starts
-}
-
-function findLastSegmentAtOrBeforeSourceLine(segments: SegmentTable, sourceLine: number) {
-  let low = 0
-  let high = segments.length - 1
-  let result = -1
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2)
-    if (segments.sourceLine(middle) <= sourceLine) {
-      result = middle
-      low = middle + 1
-    } else {
-      high = middle - 1
-    }
-  }
-  return result
 }
 
 function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number, t: Transform, units: Units) {
@@ -1393,6 +1149,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const hiddenToolsRef = useRef<Set<number>>(new Set())
   const transformRef = useRef<Transform>({ ox: 0, oy: 0, scale: 1 })
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
+  // Follow was turned off by panning during a job (not by the Follow button); the next job turns it back on.
+  const followReleasedByPanRef = useRef(false)
   const activePointersRef = useRef<Map<number, { x: number; y: number; dragMode: DragMode }>>(new Map())
   const lastPinchDistRef = useRef<number | null>(null)
   const animRef = useRef(0)
@@ -1437,6 +1195,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [dragMode, setDragMode] = useState<DragMode>('orbit')
   const [hoveredViewTarget, setHoveredViewTarget] = useState<string | null>(null)
   const rendererRef = useRef<WebGLRenderer | null>(null)
+  const webglContextLostRef = useRef(false)
   const cameraRef = useRef<Camera>({
     position: { x: 100, y: 100, z: 100 },
     target: { x: 0, y: 0, z: 0 },
@@ -1508,7 +1267,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   function initWebGLRenderer() {
     const canvas = webglCanvasRef.current
-    if (!canvas) return
+    if (!canvas || webglContextLostRef.current) return
 
     rendererRef.current = null
     const renderer = createRenderer(canvas)
@@ -1759,16 +1518,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         if (seg.i !== undefined) {
           const arc = getArcGeometry(seg)
           const numSubs = Math.max(8, Math.min(64, Math.ceil(arc.sweep * arc.r * 4)))
+          let from = getArcPoint(seg, arc, 0)
           for (let i = 0; i < numSubs; i++) {
-            const t1 = i / numSubs
-            const t2 = (i + 1) / numSubs
-            const angle1 = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * t1
-            const angle2 = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * t2
-            vertices.push(
-              arc.cx + Math.cos(angle1) * arc.r, arc.cy + Math.sin(angle1) * arc.r, seg.z0 + (seg.z1 - seg.z0) * t1,
-              arc.cx + Math.cos(angle2) * arc.r, arc.cy + Math.sin(angle2) * arc.r, seg.z0 + (seg.z1 - seg.z0) * t2,
-            )
+            const to = getArcPoint(seg, arc, (i + 1) / numSubs)
+            vertices.push(from.x, from.y, from.z, to.x, to.y, to.z)
             colors.push(...nonFeedColor, ...nonFeedColor)
+            from = to
           }
         } else {
           vertices.push(seg.x0, seg.y0, seg.z0, seg.x1, seg.y1, seg.z1)
@@ -1785,17 +1540,14 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       if (seg.i !== undefined) {
         const arc = getArcGeometry(seg)
         const numSubs = Math.max(8, Math.min(64, Math.ceil(arc.sweep * arc.r * 4)))
+        let from = getArcPoint(seg, arc, 0)
         for (let i = 0; i < numSubs; i++) {
-          const t1 = i / numSubs
           const t2 = (i + 1) / numSubs
-          const angle1 = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * t1
-          const angle2 = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * t2
-          vertices.push(
-            arc.cx + Math.cos(angle1) * arc.r, arc.cy + Math.sin(angle1) * arc.r, seg.z0 + (seg.z1 - seg.z0) * t1,
-            arc.cx + Math.cos(angle2) * arc.r, arc.cy + Math.sin(angle2) * arc.r, seg.z0 + (seg.z1 - seg.z0) * t2,
-          )
+          const to = getArcPoint(seg, arc, t2)
+          vertices.push(from.x, from.y, from.z, to.x, to.y, to.z)
           const subDone = isDone || (isCurrent && t2 <= frac)
           colors.push(...(subDone ? DONE_C : cutColor), ...(subDone ? DONE_C : cutColor))
+          from = to
         }
       } else {
         if (isDone) {
@@ -2000,7 +1752,20 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     return cached.path
   }
 
-  const status = useMachineStore(s => s.status)
+  // Only the fields the viewer uses: modal-state [GC:] reports, which arrive at
+  // every laser M4/M5 change during a job, must not re-render the whole viewer.
+  // Draw code reads the rest from getState().
+  const status = useMachineStore(useShallow(s => ({
+    state: s.status.state,
+    wpos: s.status.wpos,
+    wco: s.status.wco,
+    feed: s.status.feed,
+    feedOverride: s.status.feedOverride,
+    rapidOverride: s.status.rapidOverride,
+    spindleOverride: s.status.spindleOverride,
+    sdFilename: s.status.sdFilename,
+    sdPercent: s.status.sdPercent,
+  })))
   const connected = useMachineStore(s => s.connected)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerSettings = useMachineStore(s => s.controllerSettings)
@@ -2019,9 +1784,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const abortSender = useGCodeSenderStore(s => s.abort)
   const dismissSender = useGCodeSenderStore(s => s.dismiss)
   const trackedJobSource = useGCodeStore(s => s.trackedJob?.source)
+  const trackedJobStartedAt = useGCodeStore(s => s.trackedJob?.startedAt)
   const startTrackedJob = useGCodeStore(s => s.startTrackedJob)
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const finishedJobElapsedMs = useGCodeStore(s => s.finishedJobElapsedMs)
+  const finishedJobAdopted = useGCodeStore(s => s.finishedJobAdopted)
   const dismissFinishedJobNotice = useGCodeStore(s => s.dismissFinishedJobNotice)
   const interruptedJob = useGCodeStore(s => s.interruptedJob)
   const dismissInterruptedJobNotice = useGCodeStore(s => s.dismissInterruptedJobNotice)
@@ -2047,13 +1814,60 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const isJobRunning = senderPhase === 'streaming' || senderPhase === 'draining'
     || (status.state === 'Run' && senderPhase !== 'paused') || controllerJobStarting
   const isJobHeld = senderPhase === 'paused' || status.state === 'Hold'
+  const abortConfirm = useConfirmTap()
+  const disarmAbort = abortConfirm.disarm
+  useEffect(() => {
+    if (!isJobRunning && !isJobHeld) disarmAbort()
+  }, [isJobRunning, isJobHeld, disarmAbort])
+
+  // $SD/Run is only queued when Start is pressed. If the controller refuses the
+  // file (moved, renamed, card not mounted) it stays Idle and never reports the
+  // job, which would leave the job "Starting" forever with motion locked.
+  const [controllerStartError, setControllerStartError] = useState<string | null>(null)
+  const controllerJobSeenStartedAtRef = useRef<number | null>(null)
+  const spindleSpinupMs = controllerSettings.spindleSpinupMs ?? 0
+  useEffect(() => {
+    if (trackedJobSource === 'controller' && status.state !== 'Idle') {
+      controllerJobSeenStartedAtRef.current = trackedJobStartedAt ?? null
+    }
+  }, [trackedJobSource, trackedJobStartedAt, status.state])
+  useEffect(() => {
+    if (!controllerJobStarting || !connected || trackedJobStartedAt == null) return
+    if (controllerJobSeenStartedAtRef.current === trackedJobStartedAt) return
+    const startedAt = trackedJobStartedAt
+    const giveUp = (message: string) => {
+      if (useGCodeStore.getState().trackedJob?.startedAt !== startedAt) return
+      if (useMachineStore.getState().status.state !== 'Idle') return
+      cancelTrackedJob('controller')
+      setControllerStartError(message)
+    }
+    const stopLines = onLine(line => {
+      if (line.startsWith('error') && Date.now() - startedAt < CONTROLLER_START_ERROR_WINDOW_MS) {
+        giveUp(`The controller did not start the job (${line}).`)
+      }
+    })
+    const deadline = Math.max(startedAt + spindleSpinupMs + CONTROLLER_START_TIMEOUT_MS, Date.now() + 2000)
+    const timer = window.setTimeout(
+      () => giveUp('The controller did not report the job as started. Check that the file is still on the SD card.'),
+      deadline - Date.now(),
+    )
+    return () => {
+      stopLines()
+      window.clearTimeout(timer)
+    }
+  }, [controllerJobStarting, connected, trackedJobStartedAt, spindleSpinupMs, cancelTrackedJob])
+
   const isLargeProgressOverlayDisabled = !!model && isRunning && model.segments.length > LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
   const cancelAndStartJob = useGCodeStore(s => s.cancelAndStartJob)
   const cancelLoad = useGCodeStore(s => s.clear)
   const handleStartWithoutPreview = useCallback(() => {
     const path = pendingPath
     if (!path) return
-    if (cancelAndStartJob(path)) startTrackedJob('controller')
+    releaseLaserPointerForJob()
+    if (cancelAndStartJob(path)) {
+      setControllerStartError(null)
+      startTrackedJob('controller')
+    }
   }, [pendingPath, cancelAndStartJob, startTrackedJob])
 
   const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending
@@ -2070,7 +1884,20 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [framingClearanceInput, setFramingClearanceInput] = useState(() => formatInputValue(mmToDisplay(getStoredFiniteNumber(FRAMING_CLEARANCE_KEY, 5), units), units === 'in' ? 3 : 1))
   const [framingTravelZInput, setFramingTravelZInput] = useState(() => formatInputValue(mmToDisplay(getStoredFiniteNumber(FRAMING_TRAVEL_Z_KEY, 5), units), units === 'in' ? 3 : 1))
   const [framingError, setFramingError] = useState<string | null>(null)
+  const [framingMovesZ, setFramingMovesZ] = useState(true)
+  const framingMovesZCacheRef = useRef<{ text: string; movesZ: boolean } | null>(null)
   const [restartInitialLine, setRestartInitialLine] = useState<number | null>(null)
+  const [viewerInScrollingPage, setViewerInScrollingPage] = useState(false)
+  const [touchMovesView, setTouchMovesView] = useState(false)
+  // In a scrolling tablet page, one-finger touches scroll the page until the
+  // operator turns on Move; mouse, pen and wheel always act on the view.
+  const touchScrollsPage = !!isTablet && viewerInScrollingPage && !touchMovesView
+  // On a phone (touch is the main pointer) the toolbar and job buttons get
+  // finger-sized targets; tablet layouts already ask for them with isTablet.
+  const [coarsePointer] = useState(() => !!window.matchMedia?.('(pointer: coarse)').matches)
+  const phoneTargets = coarsePointer && !isTablet
+  const largeToolbar = isTablet || phoneTargets
+  const jobButtonSize = isTablet ? 'text-xl py-3' : phoneTargets ? 'text-base py-2.5' : 'text-sm'
   const isLocalFile = !!sourceText && !loadedPath
   const simulationProgressPercent = simulationTotalSeconds && simulationTotalSeconds > 0
     ? clamp01(simulationElapsedSeconds / simulationTotalSeconds) * 100
@@ -2136,6 +1963,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }, [model, storePaths2D, storeGeometry3D, storeRenderLines, is3D])
 
   useEffect(() => () => window.clearTimeout(static2DSettleTimerRef.current), [])
+
+  // A real job started elsewhere (another device, the console, a macro) takes
+  // over the view; the simulation's own Stop button is hidden while it runs.
+  useEffect(() => {
+    if (machineJobActive && simulationPhaseRef.current !== 'idle') stopSimulation()
+  }, [machineJobActive])
 
   function canvasLogicalSize() {
     const container = containerRef.current
@@ -2232,7 +2065,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       }
       const modelW = bMaxX - bMinX || 1
       const modelH = bMaxY - bMinY || 1
-      const pad = 40
+      // Shrink the margin on a very small viewer so the scale never goes to zero or negative.
+      const pad = Math.min(40, w / 4, h / 4)
       const scale = Math.min((w - pad * 2) / modelW, (h - pad * 2) / modelH)
       const cx = (bMinX + bMaxX) / 2
       const cy = (bMinY + bMaxY) / 2
@@ -2607,15 +2441,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       sourceLineStartsRef.current = cached
     }
     const offset = sourceText.length * Math.min(sdPercent, 100) / 100
-    const { starts } = cached
-    let low = 0
-    let high = starts.length - 1
-    while (low < high) {
-      const middle = (low + high + 1) >> 1
-      if (starts[middle] <= offset) low = middle
-      else high = middle - 1
-    }
-    return Math.max(0, findLastSegmentAtOrBeforeSourceLine(mdl.segments, low + 1))
+    return Math.max(0, findSegmentAtTextOffset(mdl.segments, cached.starts, offset))
   }
 
   function centerViewOn(wx: number, wy: number) {
@@ -2635,6 +2461,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     setFollowMode(mode)
     localStorage.setItem(FOLLOW_MODE_KEY, mode)
     setShowFollowMenu(false)
+    followReleasedByPanRef.current = false
     setAutoFollow(true)
     centerOnRunningTool()
   }
@@ -2669,14 +2496,18 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   useEffect(() => {
     if (simulationActive) {
-      prevIsRunningRef.current = isRunning
+      // A real job that ends the simulation is tracked from a fresh start.
+      prevIsRunningRef.current = false
       prevModelRef.current = model
       setSenderExecutionProgressPercent(null)
       scheduleRender()
       return
     }
 
-    if (isRunning && modelRef.current) {
+    // A job started elsewhere may run another file: do not track it on this one.
+    const runningOtherFile = !senderActive && !!status.sdFilename
+      && !isRunningLoadedFile(status.sdFilename, loadedPath, fileName)
+    if (isRunning && modelRef.current && !runningOtherFile) {
       // Tracking is cheap at any size; only drawing the completed path is
       // limited to smaller jobs. Program Execution follows this position.
       const freshStart = !prevIsRunningRef.current || model !== prevModelRef.current
@@ -2739,10 +2570,15 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         ? segmentAt(trackedModel.segments, trackedProgress.segmentIndex)?.sourceLine ?? null
         : null,
     )
+    if (isRunning && !prevIsRunningRef.current && followReleasedByPanRef.current) {
+      followReleasedByPanRef.current = false
+      setAutoFollow(true)
+    }
     prevIsRunningRef.current = isRunning
     prevModelRef.current = model
 
-    if (isRunning && autoFollow && showTool) {
+    // Leave the view alone while a 2D drag is in progress; the drag rebuilds the offset from where it started.
+    if (isRunning && autoFollow && showTool && !dragRef.current) {
       if (followMode === 'center') centerViewOn(status.wpos.x, status.wpos.y)
       else ensureToolVisible(status.wpos.x, status.wpos.y)
     }
@@ -2764,6 +2600,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     status.wco.x,
     status.wco.y,
     status.feed,
+    status.sdFilename,
+    loadedPath,
+    fileName,
     controllerSettings.maxTravelX,
     controllerSettings.maxTravelY,
     controllerSettings.homingDirInvert,
@@ -2829,6 +2668,29 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }, [])
 
   useEffect(() => {
+    const canvas = webglCanvasRef.current
+    if (!canvas) return
+    // The browser only restores a lost context when the loss is preventDefault()ed.
+    // The next 3D render then builds a new renderer and uploads the paths again.
+    const onContextLost = (e: Event) => {
+      e.preventDefault()
+      webglContextLostRef.current = true
+      rendererRef.current = null
+      uploadedPathGeometryRef.current = null
+    }
+    const onContextRestored = () => {
+      webglContextLostRef.current = false
+      scheduleRender()
+    }
+    canvas.addEventListener('webglcontextlost', onContextLost)
+    canvas.addEventListener('webglcontextrestored', onContextRestored)
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onContextLost)
+      canvas.removeEventListener('webglcontextrestored', onContextRestored)
+    }
+  }, [])
+
+  useEffect(() => {
     const container = containerRef.current
     if (!container) return
     function onWheel(e: WheelEvent) {
@@ -2855,7 +2717,21 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     return () => container.removeEventListener('wheel', onWheel)
   }, [is3D, projectionMode])
 
+  useEffect(() => {
+    const container = containerRef.current
+    if (!isTablet || !container || typeof ResizeObserver === 'undefined') return
+    const update = () => setViewerInScrollingPage(isInScrollingPage(container))
+    const observer = new ResizeObserver(update)
+    observer.observe(container)
+    window.addEventListener('resize', update)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', update)
+    }
+  }, [isTablet])
+
   function onPointerDown(e: React.PointerEvent) {
+    if (touchScrollsPage && e.pointerType === 'touch') return
     if (is3D) e.preventDefault()
     ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
     const pointerDragMode = is3D && (e.button === 1 || e.button === 2 || e.shiftKey) ? 'pan' : dragMode
@@ -2944,6 +2820,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         const t = transformRef.current
         t.ox = d.ox + (e.clientX - d.sx)
         t.oy = d.oy + (e.clientY - d.sy)
+        if (isRunning && autoFollow && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > FOLLOW_PAN_RELEASE_PX) {
+          followReleasedByPanRef.current = true
+          setAutoFollow(false)
+        }
         scheduleRender()
       }
     }
@@ -3050,12 +2930,22 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
 
   function openFramingDialog() {
-    if (model) {
-      const clearanceDisplay = Number.parseFloat(framingClearanceInput)
-      const travelZDisplay = Number.parseFloat(framingTravelZInput)
-      if (Number.isFinite(clearanceDisplay)) {
+    let movesZ = true
+    if (sourceText) {
+      let cached = framingMovesZCacheRef.current
+      if (cached?.text !== sourceText) {
+        cached = { text: sourceText, movesZ: programMovesZ(sourceText) }
+        framingMovesZCacheRef.current = cached
+      }
+      movesZ = cached.movesZ
+    }
+    setFramingMovesZ(movesZ)
+    if (model && movesZ) {
+      const clearanceDisplay = parseDecimalInput(framingClearanceInput)
+      const travelZDisplay = parseDecimalInput(framingTravelZInput)
+      if (clearanceDisplay != null) {
         const requiredTravelZMm = getFramingRequiredTravelZ(model, displayToMm(clearanceDisplay, units))
-        const currentTravelZMm = Number.isFinite(travelZDisplay) ? displayToMm(travelZDisplay, units) : -Infinity
+        const currentTravelZMm = travelZDisplay != null ? displayToMm(travelZDisplay, units) : -Infinity
         if (requiredTravelZMm != null && currentTravelZMm < requiredTravelZMm) {
           setFramingTravelZInput(formatCeilInputValue(mmToDisplay(requiredTravelZMm, units), units === 'in' ? 3 : 1))
         }
@@ -3067,25 +2957,25 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   function startFramingRoutine() {
     if (!model) return
-    const feedDisplay = Number.parseFloat(framingFeedInput)
-    const clearanceDisplay = Number.parseFloat(framingClearanceInput)
-    const travelZDisplay = Number.parseFloat(framingTravelZInput)
-    if (!Number.isFinite(feedDisplay) || feedDisplay <= 0) {
+    const feedDisplay = parseDecimalInput(framingFeedInput)
+    const clearanceDisplay = parseDecimalInput(framingClearanceInput)
+    const travelZDisplay = parseDecimalInput(framingTravelZInput)
+    if (feedDisplay == null || feedDisplay <= 0) {
       setFramingError('Enter a framing feed rate greater than zero.')
       return
     }
-    if (!Number.isFinite(clearanceDisplay)) {
+    if (framingMovesZ && clearanceDisplay == null) {
       setFramingError('Enter a valid clearance height.')
       return
     }
-    if (!Number.isFinite(travelZDisplay)) {
+    if (framingMovesZ && travelZDisplay == null) {
       setFramingError('Enter a valid safe travel height.')
       return
     }
 
     const feedMmPerMin = displayToMm(feedDisplay, units)
-    const clearanceMm = displayToMm(clearanceDisplay, units)
-    const travelZMm = displayToMm(travelZDisplay, units)
+    const clearanceMm = clearanceDisplay != null ? displayToMm(clearanceDisplay, units) : NaN
+    const travelZMm = travelZDisplay != null ? displayToMm(travelZDisplay, units) : NaN
     let result: string | null
     try {
       result = buildFramingGCode(model, {
@@ -3093,6 +2983,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         feedMmPerMin,
         clearanceMm,
         travelZMm,
+        movesZ: framingMovesZ,
         displayUnits: units,
       })
     } catch (error) {
@@ -3106,8 +2997,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
     localStorage.setItem(FRAMING_MODE_KEY, framingMode)
     localStorage.setItem(FRAMING_FEED_KEY, String(feedMmPerMin))
-    localStorage.setItem(FRAMING_CLEARANCE_KEY, String(clearanceMm))
-    localStorage.setItem(FRAMING_TRAVEL_Z_KEY, String(travelZMm))
+    if (framingMovesZ) {
+      localStorage.setItem(FRAMING_CLEARANCE_KEY, String(clearanceMm))
+      localStorage.setItem(FRAMING_TRAVEL_Z_KEY, String(travelZMm))
+    }
     const started = startSender(
       result,
       `${fileName ?? 'job'} ${framingMode === 'rectangle' ? 'rectangle' : 'contour'} frame`,
@@ -3195,10 +3088,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
             }}
           />
           {(() => {
-            const btnCls = isTablet
+            const btnCls = largeToolbar
               ? 'flex items-center gap-1.5 px-3 py-1.5 rounded text-base transition-colors'
               : 'flex items-center gap-1 px-1.5 py-0.5 rounded text-base transition-colors'
-            const iconSize = isTablet ? 16 : 11
+            const iconSize = largeToolbar ? 16 : 11
             return (<>
           <button
             className={`${btnCls} ${is3D ? 'text-ok bg-ok/10' : 'text-text-dim bg-elevated hover:text-text-primary'} ${is3DToggleDisabled ? 'opacity-50 cursor-not-allowed hover:text-text-dim hover:bg-elevated' : ''}`}
@@ -3255,9 +3148,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           {!is3D && (
             <div className="relative flex items-center">
               <button
-                className={`${btnCls} rounded-r-none ${isTablet ? 'pr-1' : 'pr-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
+                className={`${btnCls} rounded-r-none ${largeToolbar ? 'pr-1' : 'pr-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
                 onClick={() => {
                   const follow = !autoFollow
+                  followReleasedByPanRef.current = false
                   setAutoFollow(follow)
                   if (follow) centerOnRunningTool()
                 }}
@@ -3267,12 +3161,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 <span>Follow</span>
               </button>
               <button
-                className={`flex items-center self-stretch rounded rounded-l-none transition-colors ${isTablet ? 'px-1' : 'px-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
+                className={`flex items-center self-stretch rounded rounded-l-none transition-colors ${largeToolbar ? 'px-2.5' : 'px-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
                 onClick={() => setShowFollowMenu(open => !open)}
                 title="Choose how Follow moves the view"
                 aria-expanded={showFollowMenu}
               >
-                <ChevronDown size={isTablet ? 12 : 10} className={`transition-transform ${showFollowMenu ? 'rotate-180' : ''}`} />
+                <ChevronDown size={largeToolbar ? 14 : 10} className={`transition-transform ${showFollowMenu ? 'rotate-180' : ''}`} />
               </button>
               {showFollowMenu && (
                 <div className="absolute right-0 top-full z-30 mt-1 flex w-56 flex-col gap-1 rounded border border-border bg-surface p-1 shadow-lg">
@@ -3295,6 +3189,19 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               )}
             </div>
           )}
+          {isTablet && viewerInScrollingPage && (
+            <button
+              className={`${btnCls} ${touchMovesView ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
+              onClick={() => setTouchMovesView(v => !v)}
+              title={touchMovesView
+                ? 'Dragging on the preview moves the view. Tap to let it scroll the page again.'
+                : 'Dragging on the preview scrolls the page. Tap to move the view instead.'}
+              aria-pressed={touchMovesView}
+            >
+              <Hand size={iconSize} />
+              <span>Move</span>
+            </button>
+          )}
           <button
             className={`${btnCls} text-text-muted hover:text-text-primary hover:bg-elevated`}
             onClick={() => fitToView()}
@@ -3311,7 +3218,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       <div
         ref={containerRef}
         className="flex-1 min-h-0 relative cursor-grab active:cursor-grabbing"
-        style={{ touchAction: 'none' }}
+        style={{ touchAction: touchScrollsPage ? 'pan-y pinch-zoom' : 'none' }}
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={event => {
@@ -3540,7 +3447,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 </div>
                 <button
                   type="button"
-                  className={`h-8 rounded border px-2.5 text-sm font-semibold ${simulationPaused ? 'border-ok/40 bg-ok/10 text-ok' : 'border-warning/40 bg-warning/10 text-warning'} disabled:opacity-50`}
+                  className={`h-8 rounded border px-2.5 text-sm font-semibold ${simulationPaused ? 'border-ok/40 bg-ok/10 text-ok' : 'border-warn/40 bg-warn/10 text-warn'} disabled:opacity-50`}
                   onClick={simulationPaused ? resumeSimulation : pauseSimulation}
                   disabled={simulationPhase === 'completed'}
                   title={simulationPaused ? 'Resume preview simulation' : 'Pause preview simulation'}
@@ -3715,7 +3622,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       </div>
 
       {/* Permanent bottom strip */}
-      <div className="shrink-0 border-t border-border bg-surface px-4 pt-2.5 pb-3 flex flex-col gap-2">
+      <div className="min-h-0 border-t border-border bg-surface px-4 pt-2.5 pb-3 flex flex-col gap-2">
+        {/* When the strip outgrows a short panel (a phone), the notices scroll
+            so the Start/Pause/Abort row below them is never clipped. */}
+        <div className="min-h-0 overflow-y-auto overscroll-contain flex flex-col gap-2 empty:hidden">
         {/* Progress bar — only while a job is active */}
         {(isJobRunning || isJobHeld || simulationActive) && (
           <div className="flex flex-col gap-1.5">
@@ -3738,6 +3648,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 {senderActive && (
                   <span className="text-[11px] font-mono text-text-muted tabular-nums" title="Position-derived toolpath completion, bounded by the latest accepted line">
                     Motion {Math.round(displayedProgressPercent)}%
+                  </span>
+                )}
+                {!simulationActive && !senderActive && runtime.source === 'sd' && (
+                  <span className="text-[11px] font-mono text-text-muted tabular-nums" title="Estimated from SD file progress">
+                    SD {Math.round(displayedProgressPercent)}%
+                    {runtime.remainingSeconds != null && <>, Remain ~{formatRuntime(runtime.remainingSeconds)}</>}
                   </span>
                 )}
               </div>
@@ -3777,7 +3693,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="rounded border border-ok/40 bg-ok/10 px-3 py-2" role="status" aria-live="polite">
             <div className="flex items-center justify-between gap-3 text-sm">
               <span className="text-ok">
-                Job finished in <span className="font-mono font-semibold">{formatRuntime(finishedJobElapsedMs / 1000)}</span>
+                {/* An adopted job was already running when this page saw it, so its run time is unknown. */}
+                {finishedJobAdopted ? 'Job finished' : <>
+                  Job finished in <span className="font-mono font-semibold">{formatRuntime(finishedJobElapsedMs / 1000)}</span>
+                </>}
               </span>
               <button
                 className="text-text-dim hover:text-text-primary"
@@ -3799,8 +3718,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                   {interruptedJob.controllerRestarted ? 'Controller restarted during the job' : 'Job end not confirmed'}
                 </div>
                 <p className="mt-1 text-xs leading-relaxed text-text-primary">
-                  {interruptedJob.controllerRestarted ? 'The job stopped' : 'The connection was lost'} after{' '}
-                  <span className="font-mono">{formatRuntime(interruptedJob.elapsedMs / 1000)}</span>
+                  {interruptedJob.controllerRestarted ? 'The job stopped' : 'The connection was lost'}
+                  {!interruptedJob.adopted && <> after <span className="font-mono">{formatRuntime(interruptedJob.elapsedMs / 1000)}</span></>}
                   {interruptedJob.sdPercent != null && <> at <span className="font-mono">{Math.round(interruptedJob.sdPercent)}%</span></>}
                   {interruptedJob.line != null && <>, near line <span className="font-mono">{interruptedJob.line.toLocaleString()}</span></>}
                   {interruptedJob.controllerRestarted
@@ -3812,6 +3731,21 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 className="text-text-dim hover:text-text-primary"
                 onClick={dismissInterruptedJobNotice}
                 aria-label="Dismiss interrupted job message"
+                title="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+        {controllerStartError && !isJobRunning && !isJobHeld && (
+          <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2" role="alert">
+            <div className="flex items-center justify-between gap-3 text-sm">
+              <span className="text-danger">{controllerStartError}</span>
+              <button
+                className="text-text-dim hover:text-text-primary"
+                onClick={() => setControllerStartError(null)}
+                aria-label="Dismiss job start message"
                 title="Dismiss"
               >
                 <X size={14} />
@@ -3847,15 +3781,16 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               </button>
             )}
             {senderNotice && (
-              <div className="mt-2 text-[11px] text-warning">{senderNotice}</div>
+              <div className="mt-2 text-[11px] text-warn">{senderNotice}</div>
             )}
           </div>
         )}
         {senderPhase === 'streaming' && senderNotice && (
-          <div className="rounded border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] text-warning">
+          <div className="rounded border border-warn/30 bg-warn/5 px-3 py-2 text-[11px] text-warn">
             {senderNotice}
           </div>
         )}
+        </div>
 
         <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
         {!simulationActive && (controllerSettings.hasMist || controllerSettings.hasFlood) && <>
@@ -3885,10 +3820,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="hidden sm:block w-px bg-border self-stretch" />
         </>}
 
-        <div className={`flex gap-1.5 ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
+        <div className={`flex ${phoneTargets ? 'gap-3' : 'gap-1.5'} ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ghost justify-center shrink-0 ${isTablet ? 'px-3 py-3' : 'px-2'}`}
+              className={`btn btn-ghost justify-center shrink-0 ${isTablet ? 'px-3 py-3' : phoneTargets ? 'px-3 py-2.5' : 'px-2'}`}
               onClick={() => localFileInputRef.current?.click()}
               disabled={isRunning}
               title="Open a G-code file from this device"
@@ -3899,7 +3834,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && restartSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${isTablet ? 'text-xl py-3' : 'text-sm'}`}
+              className={`btn btn-ghost gap-1.5 justify-center ${jobButtonSize}`}
               onClick={() => restartSource.path
                 ? loadFile(restartSource.path)
                 : restartSource.sourceText && loadFromText(restartSource.sourceText, restartSource.fileName)}
@@ -3912,7 +3847,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && !restartSource && hasLoadedSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${isTablet ? 'text-xl py-3' : 'text-sm'}`}
+              className={`btn btn-ghost gap-1.5 justify-center ${jobButtonSize}`}
               onClick={() => { setRestartInitialLine(null); setShowRestartFromLine(true) }}
               disabled={isViewerStartBlocked}
               title={isLocalFile ? 'Prepare a safe local stream that resumes from a file line' : 'Prepare a reviewable SD-card program that restarts from a file line'}
@@ -3923,10 +3858,16 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ok-solid gap-2 justify-center font-bold ${isTablet ? 'text-xl py-3' : 'text-base'} flex-1`}
+              className={`btn btn-ok-solid gap-2 justify-center font-bold ${isTablet ? 'text-xl py-3' : phoneTargets ? 'text-base py-2.5' : 'text-base'} flex-1`}
               onClick={() => {
                 if (isLocalFile) startLocalSenderWithWarning()
-                else if (loadedPath && sendRaw(`$SD/Run=${loadedPath}`)) startTrackedJob('controller')
+                else if (loadedPath) {
+                  releaseLaserPointerForJob()
+                  if (sendRaw(`$SD/Run=${loadedPath}`)) {
+                    setControllerStartError(null)
+                    startTrackedJob('controller')
+                  }
+                }
               }}
               disabled={(!loadedPath && !isLocalFile) || !connected || status.state !== 'Idle' || isViewerStartBlocked}
               title={isViewerStartBlocked
@@ -3943,7 +3884,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobRunning && (
             <button
-              className={`btn btn-warn-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
+              className={`btn btn-warn-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
               onClick={() => senderActive ? pauseSender() : sendRealtime(0x21)}
               title={controllerJobStarting ? 'Request a feed hold while the job starts' : undefined}
             >
@@ -3953,7 +3894,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobHeld && (
             <button
-              className={`btn btn-ok-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
+              className={`btn btn-ok-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
               onClick={() => senderPhase === 'paused' ? resumeSender() : sendRealtime(0x7e)}
               disabled={senderPhase === 'paused' && status.state === 'Door'}
               title={senderPhase === 'paused' && status.state === 'Door' ? 'Close the safety door before resuming' : undefined}
@@ -3964,16 +3905,17 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {(isJobRunning || isJobHeld) && (
             <button
-              className={`btn btn-danger-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
-              onClick={() => {
+              className={`btn btn-danger-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
+              onClick={() => abortConfirm.tap(() => {
                 if (senderActive) abortSender()
                 else {
                   if (sendRealtime(0x18)) cancelTrackedJob('controller')
                 }
-              }}
+              })}
+              title={abortConfirm.armed ? undefined : 'Tap twice to abort the job with a controller reset'}
             >
               <Square size={isTablet ? 18 : 13} />
-              Abort
+              {abortConfirm.armed ? 'Tap again to abort' : 'Abort'}
             </button>
           )}
         </div>
@@ -4025,9 +3967,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         />
       )}
       {showFramingDialog && model && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 p-3 sm:p-6" onClick={() => setShowFramingDialog(false)}>
+        <div className="fixed inset-0 z-[70] flex justify-center overflow-y-auto overscroll-contain bg-black/65 p-3 sm:p-6" onClick={() => setShowFramingDialog(false)}>
           <form
-            className="w-full max-w-md rounded-lg border border-border bg-surface shadow-2xl animate-in"
+            className="my-auto w-full max-w-md rounded-lg border border-border bg-surface shadow-2xl animate-in"
             onSubmit={event => {
               event.preventDefault()
               startFramingRoutine()
@@ -4075,31 +4017,39 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 />
               </label>
 
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold uppercase text-text-muted">Clearance from top ({linearUnitLabel(units)})</span>
-                <input
-                  className="input-field font-mono"
-                  inputMode="decimal"
-                  value={framingClearanceInput}
-                  onChange={event => { setFramingClearanceInput(event.currentTarget.value); setFramingError(null) }}
-                  title="Signed vertical offset from the highest cutting move"
-                />
-              </label>
+              {framingMovesZ ? (
+                <>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold uppercase text-text-muted">Clearance from top ({linearUnitLabel(units)})</span>
+                    <input
+                      className="input-field font-mono"
+                      inputMode="decimal"
+                      value={framingClearanceInput}
+                      onChange={event => { setFramingClearanceInput(event.currentTarget.value); setFramingError(null) }}
+                      title="Signed vertical offset from the highest cutting move"
+                    />
+                  </label>
 
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold uppercase text-text-muted">Safe travel height ({linearUnitLabel(units)})</span>
-                <input
-                  className="input-field font-mono"
-                  inputMode="decimal"
-                  value={framingTravelZInput}
-                  onChange={event => { setFramingTravelZInput(event.currentTarget.value); setFramingError(null) }}
-                  title="Z height used for rapid positioning before and after framing"
-                />
-              </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold uppercase text-text-muted">Safe travel height ({linearUnitLabel(units)})</span>
+                    <input
+                      className="input-field font-mono"
+                      inputMode="decimal"
+                      value={framingTravelZInput}
+                      onChange={event => { setFramingTravelZInput(event.currentTarget.value); setFramingError(null) }}
+                      title="Z height used for rapid positioning before and after framing"
+                    />
+                  </label>
 
-              <div className="rounded border border-warning/35 bg-warning/10 px-3 py-2 text-sm leading-relaxed text-warning">
-                Check Z zero first. Safe travel height must clear clamps and stock.
-              </div>
+                  <div className="rounded border border-warn/35 bg-warn/10 px-3 py-2 text-sm leading-relaxed text-warn">
+                    Check Z zero first. Safe travel height must clear clamps and stock.
+                  </div>
+                </>
+              ) : (
+                <div className="rounded border border-info/30 bg-info/5 px-3 py-2 text-sm leading-relaxed text-text-primary">
+                  This program never commands Z, so the frame moves only X and Y and leaves Z where it is.
+                </div>
+              )}
 
               {framingError && (
                 <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
@@ -4130,9 +4080,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         </div>
       )}
       {showLocalSenderWarning && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 p-3 sm:p-6" onClick={() => setShowLocalSenderWarning(false)}>
+        <div className="fixed inset-0 z-[70] flex justify-center overflow-y-auto overscroll-contain bg-black/65 p-3 sm:p-6" onClick={() => setShowLocalSenderWarning(false)}>
           <div
-            className="w-full max-w-md rounded-lg border border-border bg-surface shadow-2xl animate-in"
+            className="my-auto w-full max-w-md rounded-lg border border-border bg-surface shadow-2xl animate-in"
             onClick={event => event.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4 border-b border-border px-4 py-3.5">
