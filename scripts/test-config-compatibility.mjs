@@ -16,6 +16,22 @@ async function loadModule(entryPoint) {
   return import(`data:text/javascript;base64,${source}`);
 }
 
+// ConfigStudio pulls in the app store, which reads localStorage and sets the
+// theme class on import.
+const startupStorage = new Map();
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key) => startupStorage.get(key) ?? null,
+    setItem: (key, value) => startupStorage.set(key, String(value)),
+    removeItem: (key) => startupStorage.delete(key),
+  },
+});
+Object.defineProperty(globalThis, "document", {
+  configurable: true,
+  value: { documentElement: { classList: { add() {}, remove() {} } } },
+});
+
 const validation = await loadModule("src/lib/configValidation.ts");
 const studio = await loadModule("src/components/ConfigStudio.tsx");
 
@@ -136,6 +152,35 @@ assert.equal(
 const patchedCrlf = studio.patchYamlValue(crlf, "axes.x.steps_per_mm", "81");
 assert.ok(patchedCrlf?.includes("    STEPS_PER_MM: 81\r\n"));
 assert.equal(/(^|[^\r])\n/.test(patchedCrlf ?? ""), false);
+
+// FluidNC v4.1 reads ` # ...` after a key or value as a comment.
+const commented = `name: "A # B"  # quoted hash stays\naxes: # my axes\n  x:\n    steps_per_mm: 80  # tuned\nmacros:\n  macro0: #fr\n`;
+assert.equal(
+  studio.patchYamlValue(commented, "axes.x.steps_per_mm", "81"),
+  commented.replace("steps_per_mm: 80  # tuned", "steps_per_mm: 81  # tuned"),
+);
+const commentedNodes = studio.nodesFromYaml(commented);
+assert.equal(
+  commentedNodes.find((node) => node.kind === "machine")?.fields.name,
+  "A # B",
+);
+assert.equal(
+  commentedNodes.find((node) => node.kind === "axis")?.fields.axis,
+  "x",
+);
+assert.equal(
+  studio.yamlEntries(commented).find((entry) => entry.path === "macros.macro0")
+    ?.value,
+  "#fr",
+);
+assert.deepEqual(validation.validateFluidConfig(commented, "FluidNC v4.1.1"), []);
+assert.deepEqual(
+  validation
+    .validateFluidConfig(commented, "FluidNC v4.0.1")
+    .filter((issue) => issue.message.startsWith("Inline comments"))
+    .map((issue) => issue.line),
+  [1, 2, 4],
+);
 
 const fluidSchema = await loadModule("src/lib/fluidSchema.ts");
 const configItems = {

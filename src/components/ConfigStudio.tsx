@@ -24,6 +24,7 @@ import {
   type FluidConfig,
 } from "../lib/fluidSchema";
 import { useMachineStore } from "../store";
+import { yamlCommentStart } from "../lib/configValidation";
 
 type NodeKind =
   | "machine"
@@ -1141,9 +1142,12 @@ function parseConfig(content: string): Record<string, any> {
     if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
     const match = raw.match(/^(\s*)([^:#]+):(?:\s*(.*))?$/);
     if (!match) continue;
+    const rest = raw.slice(raw.indexOf(":") + 1),
+      commentAt = yamlCommentStart(match[2], rest);
     const indent = match[1].length,
       key = match[2].trim(),
-      sourceToken = match[3] ?? "",
+      sourceToken =
+        commentAt >= 0 ? rest.slice(0, commentAt).trim() : (match[3] ?? ""),
       token = sourceToken.trim();
     while (stack.length > 1 && stack[stack.length - 1].indent >= indent)
       stack.pop();
@@ -1589,6 +1593,7 @@ function MachineHub({
       onPointerDown={(e) => {
         e.stopPropagation();
         onSelect();
+        if (!e.isPrimary) return;
         onDrag({
           id: node.id,
           dx: (e.clientX - e.currentTarget.getBoundingClientRect().left) / zoom,
@@ -1744,6 +1749,7 @@ function GraphNode({
       onPointerDown={(e) => {
         e.stopPropagation();
         onSelect();
+        if (!e.isPrimary) return;
         onDrag({
           id: node.id,
           dx: (e.clientX - e.currentTarget.getBoundingClientRect().left) / zoom,
@@ -2225,17 +2231,21 @@ export function ConfigStudio({
     setZoom(nextZoom);
   };
   const handleCanvasDown = (e: React.PointerEvent<HTMLElement>) => {
+    // Only the first finger drives the canvas; a second one would make it jump.
+    if (!e.isPrimary) return;
     if (pendingPlacement && e.target === e.currentTarget) {
       e.preventDefault();
       commitPlacement(screenToWorld(e));
       return;
     }
     if (e.target === e.currentTarget) {
+      drag.current = null;
       panning.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
       e.currentTarget.setPointerCapture(e.pointerId);
     }
   };
   const handleCanvasMove = (e: React.PointerEvent<HTMLElement>) => {
+    if (!e.isPrimary) return;
     if (pendingPlacement) {
       const position = screenToWorld(e);
       setPendingPlacement((current) =>
@@ -2263,7 +2273,8 @@ export function ConfigStudio({
       );
     }
   };
-  const handleCanvasUp = () => {
+  const handleCanvasUp = (e: React.PointerEvent<HTMLElement>) => {
+    if (!e.isPrimary) return;
     drag.current = null;
     panning.current = null;
   };
@@ -2271,10 +2282,15 @@ export function ConfigStudio({
     <div className="config-studio relative flex min-h-0 flex-1 overflow-hidden bg-[#11151d] studio-text">
       <section
         className="relative min-w-0 flex-1 overflow-hidden"
+        // Without touch-action the browser takes a touch drag for its own
+        // panning and cancels the pointer after a few pixels.
+        style={{ touchAction: "none" }}
         onWheel={handleWheel}
         onPointerDown={handleCanvasDown}
         onPointerMove={handleCanvasMove}
         onPointerUp={handleCanvasUp}
+        onPointerCancel={handleCanvasUp}
+        onLostPointerCapture={handleCanvasUp}
       >
         <div
           className="pointer-events-none absolute inset-0 opacity-40"
@@ -2532,6 +2548,7 @@ export function ConfigStudio({
                 onSelect={() => setSelected(n.id)}
                 onDrag={(value) => {
                   recordHistory();
+                  panning.current = null;
                   drag.current = value;
                 }}
                 onAdd={add}
@@ -2545,6 +2562,7 @@ export function ConfigStudio({
                 onSelect={() => setSelected(n.id)}
                 onDrag={(value) => {
                   recordHistory();
+                  panning.current = null;
                   drag.current = value;
                 }}
                 onAdd={addChild}
@@ -2728,11 +2746,19 @@ export function ConfigStudio({
                         </select>
                       ) : (
                         <input
-                          type={f.type === "number" ? "number" : "text"}
+                          type="text"
                           min={f.min}
                           max={f.max}
                           value={active.fields[f.key] ?? ""}
-                          onChange={(e) => update(f.key, e.target.value)}
+                          // Accept a decimal comma in number fields; the YAML needs a dot.
+                          onChange={(e) =>
+                            update(
+                              f.key,
+                              f.type === "number"
+                                ? e.target.value.replace(",", ".")
+                                : e.target.value,
+                            )
+                          }
                           className="w-full rounded-md border studio-border studio-input px-2.5 py-2 font-mono text-xs outline-none"
                         />
                       )}
@@ -3018,7 +3044,7 @@ export function patchYamlValue(
     const old = existing.value;
     const formatted = formatYamlScalar(value, old, path);
     lines[existing.line] =
-      `${" ".repeat(existing.indent)}${existing.key}: ${formatted}`;
+      `${" ".repeat(existing.indent)}${existing.key}: ${formatted}${existing.comment}`;
     return joinYamlLines(lines, source);
   }
   const parentPath = path.includes(".")
@@ -3235,7 +3261,7 @@ function mergeGraphYaml(baseSource: string, generatedSource: string) {
     );
     if (existing && entry.hasValue) {
       lines[existing.line] =
-        `${" ".repeat(existing.indent)}${entry.key}: ${entry.value}`;
+        `${" ".repeat(existing.indent)}${entry.key}: ${entry.value}${existing.comment}`;
       continue;
     }
     if (existing) continue;
@@ -3269,6 +3295,8 @@ export function yamlEntries(source: string) {
       key: string;
       value: string;
       hasValue: boolean;
+      /** Trailing comment with the whitespace before it, or "". */
+      comment: string;
       indent: number;
       line: number;
     }[] = [],
@@ -3277,13 +3305,25 @@ export function yamlEntries(source: string) {
     if (!raw.trim() || raw.trimStart().startsWith("#")) return;
     const match = raw.match(/^(\s*)([^:#]+):(?:\s*(.*))?$/);
     if (!match) return;
+    const rest = raw.slice(raw.indexOf(":") + 1),
+      commentAt = yamlCommentStart(match[2], rest),
+      valueText = commentAt >= 0 ? rest.slice(0, commentAt) : rest;
     const indent = match[1].length,
       key = match[2].trim(),
-      value = (match[3] ?? "").trim();
+      value = valueText.trim(),
+      comment = commentAt >= 0 ? rest.slice(valueText.trimEnd().length) : "";
     while (stack.length && stack[stack.length - 1].indent >= indent)
       stack.pop();
     const path = [...stack.map((item) => item.key), key].join(".");
-    result.push({ path, key, value, hasValue: value.length > 0, indent, line });
+    result.push({
+      path,
+      key,
+      value,
+      hasValue: value.length > 0,
+      comment,
+      indent,
+      line,
+    });
     if (!value) stack.push({ indent, key });
   });
   return result;

@@ -24,15 +24,19 @@ import type { LucideIcon } from "lucide-react";
 import {
   sendCommand,
   fetchFileContent,
-  saveFileContent,
+  replaceFileContent,
   uploadFirmware,
   getDeviceInfoFast,
 } from "../lib/http";
 import { useMachineStore } from "../store";
 import type { Theme } from "../store";
+import { useGCodeSenderStore } from "../store/gcodeSender";
+import { useTerminalStore } from "../store/terminal";
 import type { FluidNCSetting } from "../types";
 import { loadControllerConfigSettings } from "../lib/controllerConfig";
 import { playJobSound } from "../lib/jobSound";
+import { parseDecimalInput } from "../lib/numberInput";
+import { useConfirmTap } from "../hooks/useConfirmTap";
 import { LimitsTab } from "./LimitsTab";
 
 type Setting = FluidNCSetting;
@@ -441,8 +445,14 @@ interface SettingRowProps {
   onSave: (p: string, t: string, v: string) => Promise<void>;
 }
 
+// FluidNC reports enum items as type B too, with one option per member, and
+// those take a member value or name rather than true/false.
 function isBooleanTreeSetting(setting: Setting): boolean {
-  return setting.F === "tree" && setting.T === "B";
+  if (setting.F !== "tree" || setting.T !== "B") return false;
+  const options = (setting.O ?? []).map((o) => Object.entries(o)[0] ?? []);
+  return options.length === 2
+    && options.some(([label, value]) => /^false$/i.test(String(label)) && value === 0)
+    && options.some(([label, value]) => /^true$/i.test(String(label)) && value === 1);
 }
 
 function normalizeSettingValueForSave(setting: Setting, value: string): string {
@@ -458,9 +468,49 @@ function booleanSettingValueIsOn(value: string): boolean {
   return Number(value) !== 0;
 }
 
+function settingLimit(limit: string | undefined): number | null {
+  if (limit === undefined || limit.trim() === "") return null;
+  const n = Number(limit);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Normalises a typed number (comma or dot) for ESP401, or explains why it cannot be sent. */
+function numericSettingValue(
+  setting: Setting,
+  value: string,
+): { value: string } | { error: string } {
+  const n = parseDecimalInput(value);
+  if (n === null) return { error: "Not a number" };
+  if (setting.T === "I" && !Number.isInteger(n))
+    return { error: "Must be a whole number" };
+  const min = settingLimit(setting.M);
+  const max = settingLimit(setting.S);
+  // FluidNC reports a uint32 default maximum as -1, so the range is unknown.
+  if (min !== null && max !== null && min > max) return { value: String(n) };
+  if ((min !== null && n < min) || (max !== null && n > max)) {
+    return {
+      error:
+        min !== null && max !== null
+          ? `Must be between ${min} and ${max}`
+          : min !== null
+            ? `Must be at least ${min}`
+            : `Must be at most ${max}`,
+    };
+  }
+  return { value: String(n) };
+}
+
+function saveErrorText(e: unknown): string {
+  if (!(e instanceof Error)) return "Save failed";
+  // FluidNC answers 503 to web commands while the machine is moving.
+  if (e.message === "HTTP 503") return "Controller busy: try again when not moving";
+  return `Save failed: ${e.message}`;
+}
+
 function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
   const [value, setValue] = useState(setting.V);
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [saveError, setSaveError] = useState("");
 
   useEffect(() => {
     setValue(setting.V);
@@ -471,6 +521,8 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
   const label = displayLabel(setting);
   const opts = setting.O ?? [];
   const isNumeric = setting.T === "I" || setting.T === "F" || setting.T === "R";
+  const minLimit = settingLimit(setting.M);
+  const unsigned = minLimit !== null && minLimit >= 0;
   const isPassword = /(?:^|\/)password$/i.test(setting.P);
   const maskedPassword = isPassword && /^\*{4,}$/.test(value.trim());
 
@@ -483,12 +535,31 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
 
   async function save() {
     if (!changed || saveState === "saving") return;
+    // FluidNC treats an empty V= as a query: nothing would be set, but the
+    // empty value would be shown as saved and written to the config file.
+    if (value.trim() === "") {
+      setSaveError("Enter a value");
+      return;
+    }
+    let next = normalizeSettingValueForSave(setting, value);
+    if (isNumeric && !isPassword) {
+      const checked = numericSettingValue(setting, value);
+      if ("error" in checked) {
+        setSaveError(checked.error);
+        return;
+      }
+      next = checked.value;
+    }
+    setSaveError("");
     setSaveState("saving");
     try {
-      await onSave(setting.P, setting.T, normalizeSettingValueForSave(setting, value));
+      await onSave(setting.P, setting.T, next);
+      // Show the value as sent, so a typed comma does not leave the row "changed".
+      setValue(next);
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 2500);
-    } catch {
+    } catch (e) {
+      setSaveError(saveErrorText(e));
       setSaveState("error");
       setTimeout(() => setSaveState("idle"), 3000);
     }
@@ -513,7 +584,9 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
           setSaveState("saved");
           setTimeout(() => setSaveState("idle"), 1500);
         })
-        .catch(() => {
+        .catch((e) => {
+          setValue(setting.V);
+          setSaveError(saveErrorText(e));
           setSaveState("error");
           setTimeout(() => setSaveState("idle"), 2000);
         });
@@ -539,7 +612,7 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
             <span className="text-sm text-ok">saved</span>
           )}
           {saveState === "error" && (
-            <span className="text-sm text-danger">error</span>
+            <span className="text-sm text-danger">{saveError || "error"}</span>
           )}
           <button
             onClick={toggle}
@@ -579,11 +652,17 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
               {searchBreadcrumb(setting)}
             </div>
           )}
+          {saveError && (
+            <div className="text-sm text-danger mt-0.5">{saveError}</div>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <select
             value={selectValue}
-            onChange={(e) => setValue(e.target.value)}
+            onChange={(e) => {
+              setValue(e.target.value);
+              setSaveError("");
+            }}
             className="input-field py-1 text-sm w-36"
           >
             {opts.map((opt) => {
@@ -625,25 +704,26 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
       </div>
       <div className="flex items-center gap-2">
         <input
-          type={isPassword ? "password" : isNumeric ? "number" : "text"}
+          type={isPassword ? "password" : "text"}
+          // The iOS decimal keypad has no minus key.
+          inputMode={isNumeric && !isPassword && unsigned ? "decimal" : undefined}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setSaveError("");
+          }}
           onFocus={(e) => {
             if (maskedPassword) e.currentTarget.select();
           }}
           onKeyDown={handleKey}
-          step={isNumeric ? (setting.T === "R" ? "any" : "1") : undefined}
-          min={
-            isNumeric && setting.M !== undefined ? Number(setting.M) : undefined
-          }
-          max={
-            isNumeric && setting.S !== undefined ? Number(setting.S) : undefined
-          }
           className="input-field flex-1 py-1 text-sm font-mono"
           spellCheck={false}
         />
         <SaveBtn state={saveState} changed={changed} onClick={save} />
       </div>
+      {saveError && (
+        <div className="mt-1 text-sm text-danger">{saveError}</div>
+      )}
     </div>
   );
 }
@@ -672,11 +752,12 @@ function SectionHeader({
   );
 }
 
+/** Returns null when the key is not written in the file. */
 function updateYamlInPlace(
   yaml: string,
   path: string,
   newValue: string,
-): string {
+): string | null {
   const parts = path
     .replace(/^\/+/, "")
     .split("/")
@@ -725,29 +806,64 @@ function updateYamlInPlace(
     }
   }
 
-  return yaml;
+  return null;
 }
 
 interface PendingConfigChange {
   value: string;
 }
 
+interface ConfigFile {
+  fs: "local" | "sd";
+  dir: string;
+  name: string;
+}
+
+/** The file the controller loads its config from ($Config/Filename, default config.yaml). */
+function activeConfigFile(settings: Setting[]): ConfigFile {
+  const raw =
+    settings
+      .find((s) => s.P.replace(/^\/+/, "") === "Config/Filename")
+      ?.V.trim() || "config.yaml";
+  let path = raw.replace(/\\/g, "/").replace(/^\/+/, "");
+  let fs: ConfigFile["fs"] = "local";
+  if (/^sd\//i.test(path)) {
+    fs = "sd";
+    path = path.slice(3);
+  } else {
+    path = path.replace(/^localfs\//i, "");
+  }
+  const slash = path.lastIndexOf("/");
+  const name = path.slice(slash + 1);
+  if (!name) return { fs: "local", dir: "/", name: "config.yaml" };
+  return { fs, dir: `/${path.slice(0, slash + 1)}`, name };
+}
+
+/** Writes the changes into the config file; returns the setting paths it does not contain. */
 async function updateConfigYamlBatch(
   changes: Record<string, PendingConfigChange>,
-): Promise<void> {
+  file: ConfigFile,
+): Promise<string[]> {
   const entries = Object.entries(changes);
-  if (entries.length === 0) return;
+  if (entries.length === 0) return [];
 
   try {
-    const configContent = await fetchFileContent("/config.yaml", "local");
-    const updatedContent = entries.reduce(
-      (yaml, [settingPath, change]) =>
-        updateYamlInPlace(yaml, settingPath, change.value),
-      configContent,
+    const configContent = await fetchFileContent(
+      `${file.dir}${file.name}`,
+      file.fs,
     );
-    await saveFileContent("/", "config.yaml", updatedContent, "local");
+    const missing: string[] = [];
+    const updatedContent = entries.reduce((yaml, [settingPath, change]) => {
+      const updated = updateYamlInPlace(yaml, settingPath, change.value);
+      if (updated === null) missing.push(settingPath);
+      return updated ?? yaml;
+    }, configContent);
+    if (missing.length < entries.length) {
+      await replaceFileContent(file.dir, file.name, updatedContent, file.fs);
+    }
+    return missing;
   } catch (error) {
-    console.warn("Failed to update config.yaml:", error);
+    console.warn(`Failed to update ${file.name}:`, error);
     throw error;
   }
 }
@@ -868,8 +984,27 @@ function ProgressBar({
   );
 }
 
+/**
+ * FluidNC accepts a firmware upload while it moves and reboots when the image
+ * is written, which would end a running job.
+ */
+function machineBusyForFlash(machineState: string, senderPhase: string) {
+  return (
+    machineState === "Run" ||
+    machineState === "Hold" ||
+    machineState === "Jog" ||
+    machineState === "Home" ||
+    senderPhase === "streaming" ||
+    senderPhase === "paused" ||
+    senderPhase === "draining"
+  );
+}
+
 function FirmwareTab() {
   const espInfo = useMachineStore((s) => s.espInfo);
+  const machineState = useMachineStore((s) => s.status.state);
+  const senderPhase = useGCodeSenderStore((s) => s.phase);
+  const jobRunning = machineBusyForFlash(machineState, senderPhase);
 
   const [phase, setPhase] = useState<FirmwarePhase>("idle");
   const [progress, setProgress] = useState(0);
@@ -977,6 +1112,17 @@ function FirmwareTab() {
   }
 
   async function flashFile(file: File) {
+    // A job may have started while the release was downloading.
+    if (
+      machineBusyForFlash(
+        useMachineStore.getState().status.state,
+        useGCodeSenderStore.getState().phase,
+      )
+    ) {
+      setPhase("error");
+      setErrorMsg("A job is running. Flash the firmware after it has finished.");
+      return;
+    }
     setPhase("uploading");
     setProgress(0);
     setStatusMsg(`Uploading ${file.name}…`);
@@ -990,7 +1136,7 @@ function FirmwareTab() {
   }
 
   async function downloadAndFlash() {
-    if (!selectedTag) return;
+    if (!selectedTag || jobRunning) return;
     if (
       !confirm(
         `Download and flash FluidNC ${selectedTag} (${chip} / ${radio})?\n\nThe device will restart after flashing.`,
@@ -1026,6 +1172,11 @@ function FirmwareTab() {
 
   return (
     <div className="flex flex-col divide-y divide-border max-w-lg">
+      {jobRunning && !busy && (
+        <div className="px-5 py-3 text-sm text-warn">
+          A job is running. Flashing is available after it has finished.
+        </div>
+      )}
       {/* ── Online Update ── */}
       <div className="flex flex-col gap-4 p-5">
         <div className="flex items-center justify-between">
@@ -1156,7 +1307,8 @@ function FirmwareTab() {
             {!busy && (
               <button
                 onClick={downloadAndFlash}
-                disabled={!selectedTag}
+                disabled={!selectedTag || jobRunning}
+                title={jobRunning ? "Stop the running job first" : undefined}
                 className="flex items-center justify-center gap-2 px-4 py-2.5 rounded text-sm font-medium
                            bg-accent text-white hover:bg-accent/90 transition-colors
                            disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1259,9 +1411,10 @@ function FirmwareTab() {
         </label>
 
         <button
-          disabled={!file || busy}
+          disabled={!file || busy || jobRunning}
+          title={jobRunning ? "Stop the running job first" : undefined}
           onClick={() => {
-            if (!file) return;
+            if (!file || jobRunning) return;
             if (
               !confirm(
                 `Flash firmware from "${file.name}"? The device will restart.`,
@@ -1588,6 +1741,23 @@ export function SettingsPanel({
   const [subKey, setSubKey] = useState("");
   const [configSublistExpanded, setConfigSublistExpanded] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const restartTap = useConfirmTap();
+  const machineState = useMachineStore((s) => s.status.state);
+  const senderPhase = useGCodeSenderStore((s) => s.phase);
+  // FluidNC refuses web commands while moving; in Hold the restart goes
+  // through and the job is lost, so say so on the confirm tap.
+  const machineMoving =
+    machineState === "Run" || machineState === "Jog" || machineState === "Home";
+  const jobActive =
+    machineState === "Run" ||
+    machineState === "Hold" ||
+    senderPhase === "streaming" ||
+    senderPhase === "paused" ||
+    senderPhase === "draining";
+  const disarmRestart = restartTap.disarm;
+  useEffect(() => {
+    if (machineMoving) disarmRestart();
+  }, [machineMoving, disarmRestart]);
   const [pendingConfigChanges, setPendingConfigChanges] = useState<
     Record<string, PendingConfigChange>
   >({});
@@ -1650,7 +1820,10 @@ export function SettingsPanel({
 
   async function saveSetting(p: string, t: string, v: string) {
     // Always update runtime configuration first
-    await sendCommand(`[ESP401]P=${p} T=${t} V=${v}`);
+    const reply = await sendCommand(`[ESP401]P=${p} T=${t} V=${v}`);
+    // FluidNC answers HTTP 200 and puts a refusal in the text ("error:N").
+    const rejected = reply.match(/^\s*error\s*:.*$/im);
+    if (rejected) throw new Error(`controller refused it (${rejected[0].trim()})`);
 
     const setting = settings.find((s) => s.P === p);
     const updatedSettings = settings.map((s) =>
@@ -1676,19 +1849,28 @@ export function SettingsPanel({
       return true;
     }
 
+    const configFile = activeConfigFile(settings);
     const shouldSave = confirm(
-      `Machine config changed. Save ${pendingCount === 1 ? "this change" : "these changes"} to config.yaml?\n\n` +
-        "OK saves the config file. Cancel closes without updating config.yaml.",
+      `Machine config changed. Save ${pendingCount === 1 ? "this change" : "these changes"} to ${configFile.name}?\n\n` +
+        `OK saves the config file. Cancel closes without updating ${configFile.name}.`,
     );
 
     if (shouldSave) {
       setSavingConfigFile(true);
       try {
-        await updateConfigYamlBatch(pendingConfigChanges);
+        const missing = await updateConfigYamlBatch(
+          pendingConfigChanges,
+          configFile,
+        );
         setPendingConfigChanges({});
+        if (missing.length) {
+          alert(
+            `${configFile.name} does not contain ${missing.length === 1 ? "this setting" : "these settings"}, so ${missing.length === 1 ? "it was" : "they were"} not saved and will return to the default at the next restart:\n\n${missing.join("\n")}\n\nAdd ${missing.length === 1 ? "it" : "them"} to the file in Config Studio to keep the change.`,
+          );
+        }
       } catch (error) {
         alert(
-          `Runtime settings were sent, but config.yaml could not be updated.\n\n${
+          `Runtime settings were sent, but ${configFile.name} could not be updated.\n\n${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -1702,7 +1884,7 @@ export function SettingsPanel({
 
     onClose?.();
     return true;
-  }, [onClose, pendingConfigChanges, savingConfigFile]);
+  }, [onClose, pendingConfigChanges, savingConfigFile, settings]);
 
   useEffect(() => {
     onRequestCloseReady?.(() => {
@@ -1712,7 +1894,7 @@ export function SettingsPanel({
   }, [onRequestCloseReady, requestClose]);
 
   async function restart() {
-    if (!confirm("Restart the device now?")) return;
+    if (machineMoving) return;
     const closed = await requestClose();
     if (!closed) return;
     setRestarting(true);
@@ -1720,8 +1902,17 @@ export function SettingsPanel({
     // Expected: the controller tears down TCP mid-response, so fetch rejects.
     try {
       await sendCommand("[ESP444]RESTART");
-    } catch {
-      /* ignore — restart kills the connection */
+    } catch (e) {
+      // An HTTP status means the controller answered and did not restart
+      // (503 while moving), so drop the overlay that hides Hold/Stop.
+      if (e instanceof Error && /^HTTP \d+$/.test(e.message)) {
+        useMachineStore.getState().setRestarting(false);
+        useTerminalStore
+          .getState()
+          .appendLine(
+            `[MSG:WARN: Restart refused by the controller (${e.message}). Try again when the machine is not moving.]`,
+          );
+      }
     } finally {
       setRestarting(false);
     }
@@ -1837,15 +2028,29 @@ export function SettingsPanel({
             />
           </button>
           <button
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-sm font-medium
-                       text-text-muted hover:text-danger hover:bg-danger/10 border border-transparent
-                       hover:border-danger/30 transition-colors disabled:opacity-40"
-            onClick={restart}
-            disabled={restarting}
-            title="Restart device"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-sm font-medium
+                       hover:text-danger hover:bg-danger/10 border
+                       hover:border-danger/30 transition-colors disabled:opacity-40 ${
+                         restartTap.armed && !machineMoving
+                           ? "text-danger bg-danger/10 border-danger/30"
+                           : "text-text-muted border-transparent"
+                       }`}
+            onClick={() => restartTap.tap(restart)}
+            disabled={restarting || machineMoving}
+            title={
+              machineMoving
+                ? "Unavailable while the machine is moving"
+                : "Restart device"
+            }
           >
             <RotateCcw size={12} />
-            {restarting ? "Restarting…" : "Restart"}
+            {restarting
+              ? "Restarting…"
+              : restartTap.armed && !machineMoving
+                ? jobActive
+                  ? "Tap again: aborts job"
+                  : "Tap again to restart"
+                : "Restart"}
           </button>
           {onClose && (
             <button
@@ -2083,7 +2288,7 @@ export function SettingsPanel({
             </div>
           )}
 
-          <div className="flex-1 overflow-y-auto min-h-0">
+          <div className="flex-1 overflow-y-auto overscroll-contain min-h-0">
             {!isSearching && category === "firmware" && <FirmwareTab />}
             {!isSearching && category === "espnow" && <ESPNowPendantsTab />}
             {!isSearching && category === "limits" && (
@@ -2137,6 +2342,7 @@ export function SettingsPanel({
                   },
                   {
                     label: "Layout",
+                    hint: "Screens under 768 px wide always use the phone layout. On a phone, keep the browser's Desktop site option off.",
                     control: (["auto", "tablet", "desktop"] as const).map(
                       (mode) => (
                         <button
@@ -2174,13 +2380,16 @@ export function SettingsPanel({
                       </button>
                     )),
                   },
-                ].map(({ label, control }) => (
+                ].map(({ label, hint, control }) => (
                   <div
                     key={label}
-                    className="flex items-center justify-between px-5 py-3.5"
+                    className="flex items-center justify-between gap-3 px-5 py-3.5"
                   >
-                    <span className="text-base text-text-primary">{label}</span>
-                    <div className="flex items-center gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
+                    <div>
+                      <span className="block text-base text-text-primary">{label}</span>
+                      {hint && <span className="block mt-0.5 text-xs text-text-dim">{hint}</span>}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
                       {control}
                     </div>
                   </div>

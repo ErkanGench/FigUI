@@ -28,12 +28,13 @@ import {
   downloadFile,
   fetchFileContent,
   saveFileContent,
+  replaceFileContent,
 } from "../lib/http";
 import { CodeEditor, isEditable } from "./CodeEditor";
 import { useMachineStore } from "../store";
 import { useGCodeStore } from "../store/gcode";
 import type { FileEntry, FileListResult } from "../types";
-import { isGCodeFileName } from "../lib/gcodeFiles";
+import { isGCodeFileName, pathHoldsRunningFile } from "../lib/gcodeFiles";
 
 type Filesystem = "sd" | "local";
 type UploadTarget = { fs: Filesystem; path: string; name: string };
@@ -61,6 +62,8 @@ interface FileRowProps {
   path: string;
   fs: Filesystem;
   canLoadGcode: boolean;
+  /** The running job reads this file (or a file in this folder). */
+  inUseByJob: boolean;
   selectionMode: boolean;
   selected: boolean;
   selectionDisabled: boolean;
@@ -76,6 +79,7 @@ function FileRow({
   path,
   fs,
   canLoadGcode,
+  inUseByJob,
   selectionMode,
   selected,
   selectionDisabled,
@@ -91,36 +95,49 @@ function FileRow({
   const [newName, setNewName] = useState(entry.name);
   const [showMenu, setShowMenu] = useState(false);
   const renameRef = useRef<HTMLInputElement>(null);
+  const renameCommitted = useRef(false);
 
   const fullPath = path.endsWith("/") ? path : `${path}/`;
   const fullName = `${fullPath}${entry.name}`;
 
   function startRename() {
+    renameCommitted.current = false;
     setNewName(entry.name);
     setRenaming(true);
     setTimeout(() => renameRef.current?.select(), 0);
   }
 
   async function commitRename() {
+    // Enter, the confirm button and the input's blur can all fire for one
+    // rename; only the first may send it.
+    if (renameCommitted.current) return;
     const trimmed = newName.trim();
     if (!trimmed || trimmed === entry.name) {
       setRenaming(false);
       return;
     }
+    renameCommitted.current = true;
     try {
       await renameFile(fullPath, entry.name, trimmed, fs);
       onRefresh();
-    } catch {}
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Rename failed");
+    }
     setRenaming(false);
   }
 
   async function handleDelete() {
+    // The controller does not lock a file a job is reading; deleting it frees
+    // the clusters under the running job.
+    if (inUseByJob) return;
     if (!confirm(`Delete ${entry.name}?`)) return;
     setDeleting(true);
     try {
       if (entry.isDir) await deleteDir(fullPath, entry.name, fs);
       else await deleteFile(fullPath, entry.name, fs);
       onRefresh();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Delete failed");
     } finally {
       setDeleting(false);
     }
@@ -263,7 +280,7 @@ function FileRow({
               </span>
             )}
             <div className="hidden group-hover:flex items-center gap-1">
-              {!entry.isDir && isEditable(entry.name) && (
+              {!entry.isDir && isEditable(entry.name, entry.size) && (
                 <button
                   className="p-1.5 rounded text-info hover:bg-info/10 transition-colors"
                   onClick={() => onEdit(fullPath, entry.name)}
@@ -290,10 +307,10 @@ function FileRow({
                 <Pencil size={12} />
               </button>
               <button
-                className="p-1.5 rounded text-danger hover:bg-danger/10 transition-colors"
+                className="p-1.5 rounded text-danger hover:bg-danger/10 transition-colors disabled:opacity-50"
                 onClick={handleDelete}
-                disabled={deleting}
-                title="Delete"
+                disabled={deleting || inUseByJob}
+                title={inUseByJob ? "In use by the running job" : "Delete"}
               >
                 <Trash2 size={12} />
               </button>
@@ -359,7 +376,7 @@ function FileRow({
                   )}
                 </button>
               )}
-              {!entry.isDir && isEditable(entry.name) && (
+              {!entry.isDir && isEditable(entry.name, entry.size) && (
                 <button
                   className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-info hover:bg-info/10 transition-colors"
                   onClick={handleMenuEdit}
@@ -386,15 +403,24 @@ function FileRow({
                 <span>Rename</span>
               </button>
               <button
-                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-danger hover:bg-danger/10 transition-colors"
+                className={`flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left transition-colors ${
+                  inUseByJob
+                    ? "text-text-dim cursor-not-allowed"
+                    : "text-danger hover:bg-danger/10"
+                }`}
                 onClick={handleMenuDelete}
-                disabled={deleting}
+                disabled={deleting || inUseByJob}
               >
                 <Trash2 size={22} />
                 <span>Delete</span>
+                {inUseByJob && (
+                  <span className="text-base text-text-dim ml-auto">
+                    Job running
+                  </span>
+                )}
               </button>
             </div>
-            <div className="h-safe-bottom pb-4" />
+            <div className="h-[env(safe-area-inset-bottom)] pb-4" />
           </div>
         </div>
       )}
@@ -436,12 +462,14 @@ export function prefetchInternalFiles() {
 export function FileManager({ isTablet }: { isTablet?: boolean }) {
   const espInfo = useMachineStore((s) => s.espInfo);
   const machineState = useMachineStore((s) => s.status.state);
+  const runningFile = useMachineStore((s) => s.status.sdFilename);
   const loadGCodeFromText = useGCodeStore((s) => s.loadFromText);
   const beginSdUpload = useGCodeStore((s) => s.beginSdUpload);
   const completeSdUpload = useGCodeStore((s) => s.completeSdUpload);
   const failSdUpload = useGCodeStore((s) => s.failSdUpload);
+  const localJobActive = useGCodeStore((s) => s.trackedJob?.source === "local");
   const primarySd = espInfo?.primarySd ?? "/sd/";
-  const canLoadGcode = machineState !== "Run" && machineState !== "Hold";
+  const canLoadGcode = machineState !== "Run" && machineState !== "Hold" && !localJobActive;
 
   const [fs, setFs] = useState<Filesystem>(_fmLastFs);
   const [path, setPath] = useState(_fmCache.get(_fmLastFs)?.path ?? primarySd);
@@ -718,6 +746,19 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   async function handleUpload(files: FileList | null) {
     if (!files || !files.length || uploading) return;
+    const dir = path.endsWith("/") ? path : `${path}/`;
+    const busy = Array.from(files).find((file) =>
+      pathHoldsRunningFile(runningFile, fs, `${dir}${file.name}`),
+    );
+    if (busy) {
+      // Uploading truncates the target, and the controller does not lock the
+      // file the running job is reading.
+      setError(
+        `${busy.name} is the file the running job is reading. Wait for the job to finish before replacing it.`,
+      );
+      if (fileInput.current) fileInput.current.value = "";
+      return;
+    }
     setUploading(true);
     setUploadTotal(files.length);
     setUploadPct(0);
@@ -778,7 +819,12 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   async function handleCreateDir() {
     if (!newDirName.trim()) return;
-    await createDir(path, newDirName.trim(), fs);
+    try {
+      await createDir(path, newDirName.trim(), fs);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Could not create folder");
+      return;
+    }
     setNewDirName("");
     setShowNewDir(false);
     load(path, fs);
@@ -825,20 +871,43 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   async function handleSaveFile(content: string) {
     if (!editing) return;
     if (
+      pathHoldsRunningFile(
+        runningFile,
+        editing.fs,
+        `${editing.path}${editing.filename}`,
+      )
+    ) {
+      throw new Error(
+        `${editing.filename} is the file the running job is reading; wait for the job to finish before saving it`,
+      );
+    }
+    if (
       isYamlFile(editing.filename) &&
       content.includes("# Edited using Config Studio") &&
       !editing.content.includes("# Edited using Config Studio")
     ) {
       const extensionIndex = editing.filename.lastIndexOf(".");
       const backupName = `${editing.filename.slice(0, extensionIndex)}_backup${editing.filename.slice(extensionIndex)}`;
-      await saveFileContent(
-        editing.path,
-        backupName,
-        editing.content,
-        editing.fs,
-      );
+      try {
+        await saveFileContent(
+          editing.path,
+          backupName,
+          editing.content,
+          editing.fs,
+        );
+      } catch (e) {
+        // The main file is left untouched when its backup could not be written.
+        throw new Error(
+          `backup ${backupName} could not be written (${e instanceof Error ? e.message : String(e)}), ${editing.filename} was not changed`,
+        );
+      }
     }
-    await saveFileContent(editing.path, editing.filename, content, editing.fs);
+    await replaceFileContent(
+      editing.path,
+      editing.filename,
+      content,
+      editing.fs,
+    );
     setEditing((current) => (current ? { ...current, content } : current));
     load(path, fs);
   }
@@ -885,6 +954,16 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   async function handleDeleteSelected() {
     if (!selectedEntries.length) return;
+    const fullPath = path.endsWith("/") ? path : `${path}/`;
+    const busy = selectedEntries.find((entry) =>
+      pathHoldsRunningFile(runningFile, fs, `${fullPath}${entry.name}`),
+    );
+    if (busy) {
+      setError(
+        `${busy.name} is in use by the running job. Deselect it or wait for the job to finish.`,
+      );
+      return;
+    }
     const folderCount = selectedEntries.filter((entry) => entry.isDir).length;
     const itemLabel =
       selectedEntries.length === 1
@@ -898,7 +977,6 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
     setDeletingSelected(true);
     setError("");
     const failed: FileEntry[] = [];
-    const fullPath = path.endsWith("/") ? path : `${path}/`;
 
     for (const entry of selectedEntries) {
       try {
@@ -1277,6 +1355,11 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
               path={path}
               fs={fs}
               canLoadGcode={canLoadGcode}
+              inUseByJob={pathHoldsRunningFile(
+                runningFile,
+                fs,
+                `${path.endsWith("/") ? path : `${path}/`}${entry.name}`,
+              )}
               selectionMode={selectionMode}
               selected={selectedNames.has(entry.name)}
               selectionDisabled={deletingSelected}

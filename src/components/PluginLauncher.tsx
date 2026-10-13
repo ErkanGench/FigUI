@@ -41,11 +41,20 @@ function FsBadge({ fs }: { fs: 'sd' | 'local' }) {
   )
 }
 
-export function PluginLauncher({ isTablet, onLaunchPanel, activeLayout }: { isTablet?: boolean; onLaunchPanel?: (plugin: Plugin) => void; activeLayout?: ActiveLayout }) {
+export function PluginLauncher({ isTablet, onLaunchPanel, activeLayout }: {
+  isTablet?: boolean
+  /** Returns false when the layout has no slot for the plugin; it then opens as a modal. */
+  onLaunchPanel?: (plugin: Plugin) => boolean | void
+  activeLayout?: ActiveLayout
+}) {
   const [tab, setTab] = useState<Tab>('installed')
   const [plugins, setPlugins] = useState<Plugin[]>(pluginsCache ?? [])
   const [scanning, setScanning] = useState(pluginsCache === null)
   const [activePlugin, setActivePlugin] = useState<Plugin | null>(null)
+  const launchPlugin = (plugin: Plugin) => {
+    const inPanel = getEffectiveLayout(plugin.manifest, activeLayout ?? 'desktop') !== 'default' && onLaunchPanel
+    if (!inPanel || inPanel(plugin) === false) setActivePlugin(plugin)
+  }
   const [query, setQuery] = useState('')
 
   // Upload folder state
@@ -311,7 +320,7 @@ export function PluginLauncher({ isTablet, onLaunchPanel, activeLayout }: { isTa
                   <div key={`${plugin.id}:${plugin.fs}`} className="panel flex flex-col gap-2 p-3">
                     <div className="flex items-center gap-3">
                       <button
-                        onClick={() => getEffectiveLayout(plugin.manifest, activeLayout ?? 'desktop') !== 'default' && onLaunchPanel ? onLaunchPanel(plugin) : setActivePlugin(plugin)}
+                        onClick={() => launchPlugin(plugin)}
                         className="shrink-0 w-12 h-12 flex items-center justify-center overflow-hidden
                                    hover:opacity-80 transition-opacity"
                         title={`Launch ${plugin.manifest.name}`}
@@ -319,7 +328,7 @@ export function PluginLauncher({ isTablet, onLaunchPanel, activeLayout }: { isTa
                         <PluginIcon src={plugin.manifest.icon} />
                       </button>
                       <button
-                        onClick={() => getEffectiveLayout(plugin.manifest, activeLayout ?? 'desktop') !== 'default' && onLaunchPanel ? onLaunchPanel(plugin) : setActivePlugin(plugin)}
+                        onClick={() => launchPlugin(plugin)}
                         className="flex-1 min-w-0 text-left hover:opacity-80 transition-opacity"
                       >
                         <p className="font-medium text-text-primary text-base truncate">

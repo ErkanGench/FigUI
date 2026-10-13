@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { sendCommand } from "../lib/http";
 import { useMachineStore } from "../store";
+import { useTerminalStore } from "../store/terminal";
 import { ConfigStudio } from "./ConfigStudio";
 import {
   validateFluidConfigForSave,
@@ -307,6 +308,7 @@ export function CodeEditor({
   const jarRef = useRef<ReturnType<typeof CodeJar> | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [dirty, setDirty] = useState(false);
   const [savedOnce, setSavedOnce] = useState(false);
   const isYamlFile = YAML_EXT.has(
@@ -511,11 +513,15 @@ export function CodeEditor({
         }
       }
       setSaving(true);
+      setSaveError("");
       try {
         await onSave(currentContent.current);
         setDirty(false);
         if (isYamlFile) setSavedOnce(true);
         return true;
+      } catch (e) {
+        setSaveError(e instanceof Error ? e.message : String(e));
+        return false;
       } finally {
         setSaving(false);
       }
@@ -576,7 +582,18 @@ export function CodeEditor({
       return;
     useMachineStore.getState().setRestarting(true);
     dismiss();
-    sendCommand("[ESP444]RESTART").catch(() => {});
+    sendCommand("[ESP444]RESTART").catch((e) => {
+      // An HTTP status means the controller answered and did not restart
+      // (503 while moving), so drop the overlay that hides Hold/Stop.
+      if (e instanceof Error && /^HTTP \d+$/.test(e.message)) {
+        useMachineStore.getState().setRestarting(false);
+        useTerminalStore
+          .getState()
+          .appendLine(
+            `[MSG:WARN: Restart refused by the controller (${e.message}). Try again when the machine is not moving.]`,
+          );
+      }
+    });
   }, [dismiss]);
 
   /** Attempt to close — if dirty, show confirmation; otherwise close immediately */
@@ -707,7 +724,7 @@ export function CodeEditor({
       <div
         className={`bg-surface border border-border shadow-xl flex flex-col animate-in ${
           isYamlFile
-            ? "w-screen h-screen rounded-none"
+            ? "w-screen h-[100dvh] rounded-none"
             : "w-[90vw] h-[85vh] max-w-[1000px] rounded-sm"
         }`}
         onKeyDown={handleKeyDown}
@@ -792,6 +809,12 @@ export function CodeEditor({
             </button>
           </div>
         </div>
+
+        {saveError && (
+          <div className="px-3 py-1.5 bg-danger/10 border-b border-danger/30 text-sm text-danger shrink-0">
+            Save failed: {saveError}
+          </div>
+        )}
 
         {/* Search bar */}
         {showSearch && (
@@ -894,6 +917,11 @@ export function CodeEditor({
               Do you want to save your changes to{" "}
               <span className="font-mono">{filename}</span> before closing?
             </p>
+            {saveError && (
+              <p className="text-sm text-danger mb-4">
+                Save failed: {saveError}
+              </p>
+            )}
             <div className="flex justify-end gap-2">
               <button
                 className="btn btn-ghost text-sm py-1.5 px-3"
@@ -1008,7 +1036,11 @@ export const EDITABLE_EXT = new Set([
   ".conf",
 ]);
 
-export function isEditable(name: string): boolean {
+// The highlighter rebuilds the whole document after every edit and the gutter
+// renders one element per line, so a multi-megabyte job file freezes the tab.
+export const MAX_EDITABLE_BYTES = 512 * 1024;
+
+export function isEditable(name: string, size = 0): boolean {
   const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
-  return EDITABLE_EXT.has(ext);
+  return EDITABLE_EXT.has(ext) && size <= MAX_EDITABLE_BYTES;
 }
