@@ -3,7 +3,8 @@ import { RotateCcw, Play, Square, ArrowLeft, Crosshair } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
 import { loadPersistedJogFeed } from '../lib/jog'
-import { sendRaw, sendRealtime } from '../lib/ws'
+import { isLineInputHeldByJob, sendRaw, sendRealtime } from '../lib/ws'
+import { sendControlLine } from '../lib/macros'
 import { setLocalJogActive } from '../lib/jogWatchdog'
 import { startContinuousJog, stopContinuousJogs } from '../lib/continuousJog'
 import { useControllerJobStarting } from '../lib/jobState'
@@ -1143,7 +1144,7 @@ export function JogPad() {
                   setSpindleTarget(rpm)
                   setSelectedSpindlePreset(rpm)
                   if (spindleActive) {
-                    if (sendRaw(`M3 S${rpm}`)) sendRealtime(0x99)
+                    if (sendControlLine(`M3 S${rpm}`, 'Spindle')) sendRealtime(0x99)
                   }
                 }}
                 className={`btn py-2 text-lg font-medium justify-center ${
@@ -1163,7 +1164,7 @@ export function JogPad() {
           {spindleActive ? (
             <button
               onClick={() => {
-                if (sendRaw('M5')) setSpindleOverrideState('off')
+                if (sendControlLine('M5', 'Spindle stop')) setSpindleOverrideState('off')
               }}
               className="btn w-full justify-center bg-danger/20 hover:bg-danger/30 text-danger border-danger/50"
             >
@@ -1173,7 +1174,7 @@ export function JogPad() {
           ) : (
             <button
               onClick={() => {
-                if (sendRaw(`M3 S${spindleTarget}`)) setSpindleOverrideState('on')
+                if (sendControlLine(`M3 S${spindleTarget}`, 'Spindle')) setSpindleOverrideState('on')
               }}
               className="btn w-full gap-1.5 justify-center bg-ok/20 hover:bg-ok/30 text-ok border-ok/50"
             >
@@ -1261,7 +1262,11 @@ function LaserPanel({ className, isTablet, embedded }: { className?: string; isT
       {laserOn ? (
         <button
           onClick={() => {
-            if (laserPointerEndsAt() ? stopLaserPointer() : sendRaw('M5')) setOffSent(true)
+            // An SD job started here would run M5 only after it ends; in laser
+            // mode a feed hold switches the laser off at once.
+            if (laserPointerEndsAt()) { if (stopLaserPointer()) setOffSent(true) }
+            else if (isLineInputHeldByJob()) sendRealtime(0x21)
+            else if (sendRaw('M5')) setOffSent(true)
           }}
           className={`btn w-full justify-center bg-danger/20 hover:bg-danger/30 text-danger border-danger/50 ${isTablet ? 'h-12 text-lg' : ''}`}
         >
@@ -1415,7 +1420,7 @@ function SpindleRpmPanel({ className, isTablet }: { className?: string; isTablet
                   setSpindleTarget(rpm)
                   setSelectedSpindlePreset(rpm)
                   if (spindleActive) {
-                    if (sendRaw(`M3 S${rpm}`)) sendRealtime(0x99)
+                    if (sendControlLine(`M3 S${rpm}`, 'Spindle')) sendRealtime(0x99)
                   }
                 }}
                 className={`btn font-medium justify-center ${isTablet ? 'text-lg py-2' : 'text-base py-2'} ${
@@ -1435,7 +1440,7 @@ function SpindleRpmPanel({ className, isTablet }: { className?: string; isTablet
           {spindleActive ? (
             <button
               onClick={() => {
-                if (sendRaw('M5')) setSpindleOverrideState('off')
+                if (sendControlLine('M5', 'Spindle stop')) setSpindleOverrideState('off')
               }}
               className={`btn w-full justify-center bg-danger/20 hover:bg-danger/30 text-danger border-danger/50 ${isTablet ? 'h-12 text-lg' : ''}`}
             >
@@ -1445,7 +1450,7 @@ function SpindleRpmPanel({ className, isTablet }: { className?: string; isTablet
           ) : (
             <button
               onClick={() => {
-                if (sendRaw(`M3 S${spindleTarget}`)) setSpindleOverrideState('on')
+                if (sendControlLine(`M3 S${spindleTarget}`, 'Spindle')) setSpindleOverrideState('on')
               }}
               className={`btn w-full gap-1.5 justify-center bg-ok/20 hover:bg-ok/30 text-ok border-ok/50 ${isTablet ? 'h-12 text-lg' : ''}`}
             >

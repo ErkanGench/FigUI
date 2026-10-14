@@ -4,7 +4,8 @@ import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, Clo
 import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { onLine, sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { onLine, releaseUnseenJobInputHold, sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { sendControlLine } from '../lib/macros'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
 import { buildJobTimingEstimate, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
@@ -1835,11 +1836,13 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     if (!controllerJobStarting || !connected || trackedJobStartedAt == null) return
     if (controllerJobSeenStartedAtRef.current === trackedJobStartedAt) return
     const startedAt = trackedJobStartedAt
-    const giveUp = (message: string) => {
+    const giveUp = (message: string, timedOut = false) => {
       if (useGCodeStore.getState().trackedJob?.startedAt !== startedAt) return
       if (useMachineStore.getState().status.state !== 'Idle') return
       cancelTrackedJob('controller')
       setControllerStartError(message)
+      // An error may answer an earlier line, with the job's reply still to come.
+      if (timedOut) releaseUnseenJobInputHold()
     }
     const stopLines = onLine(line => {
       if (line.startsWith('error') && Date.now() - startedAt < CONTROLLER_START_ERROR_WINDOW_MS) {
@@ -1848,7 +1851,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     })
     const deadline = Math.max(startedAt + spindleSpinupMs + CONTROLLER_START_TIMEOUT_MS, Date.now() + 2000)
     const timer = window.setTimeout(
-      () => giveUp('The controller did not report the job as started. Check that the file is still on the SD card.'),
+      () => giveUp('The controller did not report the job as started. Check that the file is still on the SD card.', true),
       deadline - Date.now(),
     )
     return () => {
@@ -3810,7 +3813,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               Flood
             </button>}
             <button
-              onClick={() => { if (sendRaw('M9')) setCoolantState('off') }}
+              onClick={() => { if (sendControlLine('M9', 'Coolant off')) setCoolantState('off') }}
               className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
             >
               <PowerOff size={isTablet ? 18 : 13} />

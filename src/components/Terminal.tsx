@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Trash2, ChevronsDown, Clipboard, ClipboardCheck, Loader2, PanelBottom, PanelRight } from 'lucide-react'
-import { sendRaw } from '../lib/ws'
+import { isLineInputHeldByJob, LINE_INPUT_HELD_BY_JOB, sendRaw, sendRealtime } from '../lib/ws'
 import { useTerminalStore, type LineKind } from '../store/terminal'
 import { useMachineStore } from '../store'
 
@@ -80,12 +80,16 @@ export function Terminal({ onExpandToggle, expanded = false }: TerminalProps = {
     const cmd = input.trim()
     if (!cmd) return
     appendLine(`> ${cmd}`)
-    if (!sendRaw(cmd)) {
+    // Status, hold and resume are realtime bytes: they act at once, also
+    // while an SD job holds the controller's line input.
+    const realtime = cmd === '?' || cmd === '!' || cmd === '~'
+    if (!(realtime ? sendRealtime(cmd.charCodeAt(0)) : sendRaw(cmd))) {
       // sendRaw drops the command rather than queueing it, so keep it in the
       // input for another try.
       const { connected, controllerResetPending } = useMachineStore.getState()
       const reason = !connected ? 'not connected'
         : controllerResetPending ? 'the controller is resetting, try again in a moment'
+        : isLineInputHeldByJob() ? LINE_INPUT_HELD_BY_JOB
         : 'a job is streaming from this page'
       appendLine(`Not sent: ${reason}`, 'error')
       return
