@@ -754,7 +754,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
       // Uploading truncates the target, and the controller does not lock the
       // file the running job is reading.
       setError(
-        `${busy.name} is the file the running job is reading. Wait for the job to finish before replacing it.`,
+        `${busy.name} is in use by the running job. Replace it after the job.`,
       );
       if (fileInput.current) fileInput.current.value = "";
       return;
@@ -878,7 +878,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
       )
     ) {
       throw new Error(
-        `${editing.filename} is the file the running job is reading; wait for the job to finish before saving it`,
+        `${editing.filename} is in use by the running job; save it after the job`,
       );
     }
     if (

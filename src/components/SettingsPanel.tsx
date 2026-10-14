@@ -1865,7 +1865,7 @@ export function SettingsPanel({
         setPendingConfigChanges({});
         if (missing.length) {
           alert(
-            `${configFile.name} does not contain ${missing.length === 1 ? "this setting" : "these settings"}, so ${missing.length === 1 ? "it was" : "they were"} not saved and will return to the default at the next restart:\n\n${missing.join("\n")}\n\nAdd ${missing.length === 1 ? "it" : "them"} to the file in Config Studio to keep the change.`,
+            `Not in ${configFile.name}, so not saved (back to default after a restart):\n\n${missing.join("\n")}\n\nAdd to the file in Config Studio to keep.`,
           );
         }
       } catch (error) {
@@ -2342,7 +2342,7 @@ export function SettingsPanel({
                   },
                   {
                     label: "Layout",
-                    hint: "Screens under 768 px wide always use the phone layout. On a phone, keep the browser's Desktop site option off.",
+                    hint: "Under 768 px wide the phone layout is always used. On a phone, keep Desktop site off.",
                     control: (["auto", "tablet", "desktop"] as const).map(
                       (mode) => (
                         <button

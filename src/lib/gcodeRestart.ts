@@ -462,7 +462,7 @@ export function analyzeRestart(text: string, requestedLine: number): RestartAnal
     warnings.push('The spindle is off at the restart point. Verify that the selected line starts it before any cutting move.')
   }
   if (resumeIndex > 0 && !movesZ) {
-    warnings.push('The program never commands Z, so the restart does not move Z either. Check the focus or Z height before running.')
+    warnings.push('The program never moves Z, so neither does the restart. Check the focus or Z height first.')
   }
 
   const contextStart = Math.max(0, resumeIndex - 2)

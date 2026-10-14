@@ -1,5 +1,4 @@
 import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react'
-import { useShallow } from 'zustand/react/shallow'
 import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench } from 'lucide-react'
 import { MOVE_FEED, MOVE_RAPID, NO_TOOL, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
@@ -175,6 +174,21 @@ const ENTRY_MARKER_LINE = [0.13, 0.77, 0.37, 1.0] as const
 const ENTRY_MARKER_FILL = [0.13, 0.77, 0.37, 0.26] as const
 const EXIT_MARKER_LINE = [0.94, 0.27, 0.27, 1.0] as const
 const EXIT_MARKER_FILL = [0.94, 0.27, 0.27, 0.26] as const
+
+/**
+ * zustand's useShallow for a selector that returns a flat object of the same
+ * keys, without the Map, Set and iterable handling this one does not need.
+ */
+function useShallow<S, T extends object>(selector: (state: S) => T) {
+  const prev = useRef<T>()
+  return (state: S) => {
+    const next = selector(state)
+    const last = prev.current as Record<string, unknown> | undefined
+    return last && Object.entries(next).every(([key, value]) => Object.is(last[key], value))
+      ? prev.current!
+      : (prev.current = next)
+  }
+}
 
 /**
  * True on a touch device when the viewer sits in a page or panel that scrolls
@@ -3333,8 +3347,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               className={`${btnCls} ${touchMovesView ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
               onClick={() => setTouchMovesView(v => !v)}
               title={touchMovesView
-                ? 'Dragging on the preview moves the view. Tap to let it scroll the page again.'
-                : 'One finger on the preview scrolls the page; two fingers zoom and move the view. Tap to move the view with one finger.'}
+                ? 'One finger moves the view. Tap to let it scroll the page.'
+                : 'One finger scrolls the page, two fingers zoom. Tap to move the view with one finger.'}
               aria-pressed={touchMovesView}
             >
               <Hand size={iconSize} />
@@ -4226,7 +4240,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 </>
               ) : (
                 <div className="rounded border border-info/30 bg-info/5 px-3 py-2 text-sm leading-relaxed text-text-primary">
-                  This program never commands Z, so the frame moves only X and Y and leaves Z where it is.
+                  This program never moves Z, so the frame moves X and Y only.
                 </div>
               )}
 
