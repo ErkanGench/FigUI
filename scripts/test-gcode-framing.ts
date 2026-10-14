@@ -40,16 +40,16 @@ const options = { mode: 'rectangle' as const, feedMmPerMin: 1000, clearanceMm: 5
   assert.equal(parseDecimalInput('abc'), null)
 }
 
-// The user's own laser file, when present on this machine.
-const userFile = 'C:/Projeler/Pcb/Paneller/MKF1/gcode/Maske-Lazer.nc'
-if (existsSync(userFile)) {
+// Optionally a real Z-less laser file: FIGUI_FRAMING_SAMPLE=<path to .nc>.
+const userFile = process.env.FIGUI_FRAMING_SAMPLE
+if (userFile && existsSync(userFile)) {
   const text = readFileSync(userFile, 'utf8')
   const started = performance.now()
   assert.equal(programMovesZ(text), false)
   const ms = performance.now() - started
   const frame = buildFramingGCode(parseGCode(text), { ...options, movesZ: false })
   assert.ok(frame && !/^[^(]*Z/m.test(frame), frame ?? '')
-  console.log(`Maske-Lazer.nc: Z scan ${ms.toFixed(1)} ms, frame has ${frame.split('\n').length} lines`)
+  console.log(`${userFile}: Z scan ${ms.toFixed(1)} ms, frame has ${frame.split('\n').length} lines`)
 }
 
 console.log('G-code framing tests passed')

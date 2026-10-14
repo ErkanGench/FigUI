@@ -102,6 +102,7 @@ function FileRow({
   const fullName = `${fullPath}${entry.name}`;
 
   function startRename() {
+    if (inUseByJob) return;
     renameCommitted.current = false;
     setNewName(entry.name);
     setRenaming(true);
@@ -112,6 +113,12 @@ function FileRow({
     // Enter, the confirm button and the input's blur can all fire for one
     // rename; only the first may send it.
     if (renameCommitted.current) return;
+    // FatFs must not rename an open file, and the job would no longer match
+    // the path it reports; the job may have started while the name was typed.
+    if (inUseByJob) {
+      setRenaming(false);
+      return;
+    }
     const trimmed = newName.trim();
     if (!trimmed || trimmed === entry.name) {
       setRenaming(false);
@@ -307,9 +314,10 @@ function FileRow({
                 </button>
               )}
               <button
-                className="p-1.5 rounded text-text-muted hover:text-text-primary hover:bg-elevated transition-colors"
+                className="p-1.5 rounded text-text-muted hover:text-text-primary hover:bg-elevated transition-colors disabled:opacity-50"
                 onClick={startRename}
-                title="Rename"
+                disabled={inUseByJob}
+                title={inUseByJob ? "In use by the running job" : "Rename"}
               >
                 <Pencil size={12} />
               </button>
@@ -403,11 +411,21 @@ function FileRow({
                 </button>
               )}
               <button
-                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-text-primary hover:bg-elevated transition-colors"
+                className={`flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left transition-colors ${
+                  inUseByJob
+                    ? "text-text-dim cursor-not-allowed"
+                    : "text-text-primary hover:bg-elevated"
+                }`}
                 onClick={handleMenuRename}
+                disabled={inUseByJob}
               >
                 <Pencil size={22} />
                 <span>Rename</span>
+                {inUseByJob && (
+                  <span className="text-base text-text-dim ml-auto">
+                    Job running
+                  </span>
+                )}
               </button>
               <button
                 className={`flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left transition-colors ${

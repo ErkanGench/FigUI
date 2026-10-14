@@ -172,6 +172,11 @@ function scanProgram(text: string): ProgramScan {
   return lastScan
 }
 
+/** Releases the cached scan (the program text, its lines and checkpoints) once the dialog closes. */
+export function clearRestartScanCache() {
+  lastScan = null
+}
+
 function prefixStateBefore(scan: ProgramScan, resumeIndex: number) {
   const { checkpoints } = scan
   const start = Math.min(checkpoints.length - 1, Math.floor(resumeIndex / CHECKPOINT_LINES))

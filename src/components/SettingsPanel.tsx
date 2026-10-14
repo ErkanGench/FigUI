@@ -35,6 +35,7 @@ import { useGCodeSenderStore } from "../store/gcodeSender";
 import { useTerminalStore } from "../store/terminal";
 import type { FluidNCSetting } from "../types";
 import { playJobSound } from "../lib/jobSound";
+import { yamlCommentStart } from "../lib/configValidation";
 import { parseDecimalInput } from "../lib/numberInput";
 import { useConfirmTap } from "../hooks/useConfirmTap";
 import {
@@ -799,10 +800,11 @@ function updateYamlInPlace(
       if (matchDepth === parts.length - 1) {
         const lineIndent = line.slice(0, line.length - line.trimStart().length);
         const originalKey = trimmed.slice(0, colonIdx).trim();
-        // Preserve any trailing inline comment (e.g. "# tuned 2024-01-15")
+        // Preserve a trailing inline comment (e.g. "# tuned 2024-01-15") by
+        // the validator's rule: never inside quotes, never in a macro line.
         const afterColon = trimmed.slice(colonIdx + 1);
-        const commentMatch = afterColon.match(/\s+(#.*)$/);
-        const inlineComment = commentMatch ? `  ${commentMatch[1]}` : "";
+        const commentAt = yamlCommentStart(originalKey, afterColon);
+        const inlineComment = commentAt >= 0 ? `  ${afterColon.slice(commentAt)}` : "";
         lines[i] = `${lineIndent}${originalKey}: ${newValue}${inlineComment}`;
         return lines.join("\n");
       }

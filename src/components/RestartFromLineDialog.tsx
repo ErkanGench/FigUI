@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, FileCode2, ShieldCheck, X } from 'lucide-react'
-import { analyzeRestart, buildRestartProgram, makeRestartFilename } from '../lib/gcodeRestart'
+import { analyzeRestart, buildRestartProgram, clearRestartScanCache, makeRestartFilename } from '../lib/gcodeRestart'
 import { saveFileContent } from '../lib/http'
 import { controllerFilesystem } from '../lib/controllerFiles'
 import { useGCodeStore } from '../store/gcode'
@@ -93,6 +93,9 @@ export function RestartFromLineDialog({
     // The dialog is remounted for each restart review.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // A large program's scan stays in memory only while the dialog is open.
+  useEffect(() => clearRestartScanCache, [])
 
   const requestedLine = Number(lineText)
   const lineIsValid = Number.isInteger(requestedLine) && requestedLine >= 1 && requestedLine <= totalLines

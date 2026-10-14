@@ -1319,7 +1319,7 @@ function LaserPanel({ className, isTablet, embedded }: { className?: string; isT
             // mode a feed hold switches the laser off at once.
             if (laserPointerEndsAt()) { if (stopLaserPointer()) setOffSent(true) }
             else if (isLineInputHeldByJob()) sendRealtime(0x21)
-            else if (sendRaw('M5')) setOffSent(true)
+            else if (sendControlLine('M5', 'Laser off')) setOffSent(true)
           }}
           className={`btn w-full justify-center bg-danger/20 hover:bg-danger/30 text-danger border-danger/50 ${isTablet ? 'h-12 text-lg' : ''}`}
         >

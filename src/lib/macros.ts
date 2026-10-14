@@ -7,10 +7,13 @@ function reportMacro(macro: Macro, problem: string) {
   useTerminalStore.getState().appendLine(`[MSG:WARN: Macro "${macro.label || 'Unnamed'}" not run: ${problem}]`)
 }
 
-/** Sends a control's line; notes in the terminal when an SD job started here holds it back. */
+/** Sends a line from a control button; a refused line is reported in the terminal. */
 export function sendControlLine(cmd: string, label: string) {
   if (sendRaw(cmd)) return true
-  if (isLineInputHeldByJob()) useTerminalStore.getState().appendLine(`[MSG:WARN: ${label} not sent: ${LINE_INPUT_HELD_BY_JOB}]`)
+  const reason = isLineInputHeldByJob()
+    ? LINE_INPUT_HELD_BY_JOB
+    : 'the controller is not ready (disconnected, or a reset is in progress)'
+  useTerminalStore.getState().appendLine(`[MSG:WARN: ${label} not sent: ${reason}]`)
   return false
 }
 
