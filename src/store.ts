@@ -248,6 +248,8 @@ interface Store {
   positionMode: PositionMode
   sidebarTab: SidebarTab
   jogStep: JogStep
+  /** Fine jog: the 0.1 mm step becomes 0.01 mm. Shared by every jog pad, not kept across a reload. */
+  fineJog: boolean
   axes: number
   macros: Macro[]
   watchdog: WatchdogState
@@ -276,6 +278,7 @@ interface Store {
   setPositionMode: (m: PositionMode) => void
   setSidebarTab: (t: SidebarTab) => void
   setJogStep: (s: JogStep) => void
+  setFineJog: (on: boolean) => void
   setAxes: (n: number) => void
   setMacros: (macros: Macro[]) => void
   setWatchdogState: (state: Partial<WatchdogState>) => void
@@ -307,6 +310,7 @@ export const useMachineStore = create<Store>((set) => ({
   positionMode: 'WPos',
   sidebarTab: 'files',
   jogStep: 1,
+  fineJog: false,
   axes: 3,
   macros: [],
   watchdog: DEFAULT_WATCHDOG_STATE,
@@ -455,6 +459,7 @@ export const useMachineStore = create<Store>((set) => ({
   setPositionMode: (positionMode) => set({ positionMode }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   setJogStep: (jogStep) => set({ jogStep }),
+  setFineJog: (fineJog) => set({ fineJog }),
   setAxes: (axes) => set({ axes }),
 
   setMacros: (macros) => set({ macros }),
