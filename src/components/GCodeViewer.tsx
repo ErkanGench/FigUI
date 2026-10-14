@@ -1,7 +1,7 @@
 import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench } from 'lucide-react'
-import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
+import { MOVE_FEED, MOVE_RAPID, NO_TOOL, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
 import { onLine, releaseUnseenJobInputHold, sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
@@ -10,7 +10,7 @@ import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
 import { buildJobTimingEstimate, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
 import { createRenderer, renderLines, setStaticLineData, type WebGLRenderer, type Camera, type Vector3 } from '../lib/webgl'
-import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, EMPTY_UINT8, getArcGeometry, getArcPoint, type RenderLines } from '../lib/gcodeBuild'
+import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, completedPlungeCount, EMPTY_UINT8, findPlungePoints, getArcGeometry, getArcPoint, type PlungePoints, type RenderLines } from '../lib/gcodeBuild'
 import {
   buildCumulativeXYLengths,
   buildLineStarts,
@@ -130,6 +130,7 @@ const TAU = Math.PI * 2
 const LOOKAHEAD_DISTANCE_FLOOR_MM = 1
 const LOOKAHEAD_FEED_MARGIN = 3
 const LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT = 100_000
+const PLUNGE_MARKER_RADIUS_PX = 3
 /** Above this many lines, 2D pan and zoom stretch the cached layer until the view settles. */
 const LARGE_2D_LAYER_LINE_LIMIT = 100_000
 const STATIC_2D_SETTLE_MS = 150
@@ -228,6 +229,7 @@ interface Static2DPaths {
   rapidPath: Path2D
   traversePath: Path2D
   cutPath: Path2D
+  plunges: PlungePoints
   toolPaths?: Array<{
     tool: number | null
     rapidPath: Path2D
@@ -531,13 +533,58 @@ function strokeStatic2DPaths(
         strokeModelPath(ctx, toolPaths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
       }
     }
-    return
+  } else {
+    strokeModelPath(ctx, paths.cutPath, t, CUT_COLOR_FG, 1)
+    if (showRapids) {
+      strokeModelPath(ctx, paths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
+      strokeModelPath(ctx, paths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
+    }
   }
-  strokeModelPath(ctx, paths.cutPath, t, CUT_COLOR_FG, 1)
-  if (showRapids) {
-    strokeModelPath(ctx, paths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
-    strokeModelPath(ctx, paths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
+  drawPlungeMarkers(ctx, paths.plunges, 0, paths.plunges.count, t, hiddenTools, null)
+}
+
+/**
+ * Rings at drilled holes, a constant size on screen. `doneColor` fills the
+ * holes that are finished instead of drawing each tool's ring colour.
+ */
+function drawPlungeMarkers(
+  ctx: CanvasRenderingContext2D,
+  plunges: PlungePoints,
+  from: number,
+  to: number,
+  t: Transform,
+  hiddenTools: Set<number>,
+  doneColor: string | null,
+) {
+  if (to <= from) return
+  const byColor = new Map<string, Path2D>()
+  for (let index = from; index < to; index++) {
+    const tool = plunges.tools[index]
+    if (tool !== NO_TOOL && hiddenTools.has(tool)) continue
+    const color = doneColor ?? (tool === NO_TOOL ? CUT_COLOR_FG : toolPathColor(tool))
+    let path = byColor.get(color)
+    if (!path) {
+      path = new Path2D()
+      byColor.set(color, path)
+    }
+    const sx = t.ox + plunges.xy[2 * index] * t.scale
+    const sy = t.oy - plunges.xy[2 * index + 1] * t.scale
+    path.moveTo(sx + PLUNGE_MARKER_RADIUS_PX, sy)
+    path.arc(sx, sy, PLUNGE_MARKER_RADIUS_PX, 0, Math.PI * 2)
   }
+  ctx.save()
+  ctx.setLineDash([])
+  ctx.lineWidth = 1.25
+  for (const [color, path] of byColor) {
+    if (doneColor) {
+      ctx.fillStyle = color
+      ctx.fill(path)
+    } else {
+      ctx.strokeStyle = color
+      ctx.stroke(path)
+    }
+  }
+  ctx.restore()
 }
 
 function toolPathColor(tool: number | null | undefined) {
@@ -1674,7 +1721,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     // The store builds these paths in time slices. Building them here blocks
     // the page, so skip it for large jobs (for example while the next file loads).
     if (mdl.segments.length > LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT) return null
-    const paths = { model: mdl, ...buildStatic2DPaths(buildRenderLines(mdl.segments)) }
+    const paths = { model: mdl, plunges: findPlungePoints(mdl.segments), ...buildStatic2DPaths(buildRenderLines(mdl.segments)) }
     static2DPathsRef.current = paths
     return paths
   }
@@ -1934,7 +1981,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     const modelChanged = model !== previousModel
     modelRef.current = model
     static2DPathsRef.current = (storePaths2D && model)
-      ? { model, rapidPath: storePaths2D.rapidPath, traversePath: storePaths2D.traversePath, cutPath: storePaths2D.cutPath, toolPaths: storePaths2D.toolPaths }
+      ? { model, plunges: findPlungePoints(model.segments), rapidPath: storePaths2D.rapidPath, traversePath: storePaths2D.traversePath, cutPath: storePaths2D.cutPath, toolPaths: storePaths2D.toolPaths }
       : null
     staticPathGeometryRef.current = (storeGeometry3D && model)
       ? {
@@ -2416,6 +2463,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           ctx.setLineDash([])
           drawSegment(ctx, currentSegment, t, progress.fraction)
         }
+      }
+      if (progress !== null && staticPaths?.plunges.count) {
+        // A hole is finished once execution has passed its last plunge.
+        const reached = progress.segmentIndex + (progress.fraction >= 1 ? 1 : 0)
+        const done = completedPlungeCount(staticPaths.plunges, reached)
+        drawPlungeMarkers(ctx, staticPaths.plunges, 0, done, t, hiddenToolsRef.current, CUT_DONE)
       }
       ctx.setLineDash([])
 
