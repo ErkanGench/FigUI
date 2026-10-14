@@ -1201,6 +1201,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const followReleasedByPanRef = useRef(false)
   const activePointersRef = useRef<Map<number, { x: number; y: number; dragMode: DragMode }>>(new Map())
   const lastPinchDistRef = useRef<number | null>(null)
+  const touchPinchRef = useRef<{ dist: number; centerX: number; centerY: number; panned: number } | null>(null)
+  const touchPinchHandlerRef = useRef<(e: TouchEvent) => void>(() => {})
   const animRef = useRef(0)
   const renderRef = useRef<() => void>(() => {})
   const needsFitRef = useRef(true)
@@ -1939,8 +1941,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [restartInitialLine, setRestartInitialLine] = useState<number | null>(null)
   const [viewerInScrollingPage, setViewerInScrollingPage] = useState(false)
   const [touchMovesView, setTouchMovesView] = useState(false)
-  // In a scrolling tablet page, one-finger touches scroll the page until the
-  // operator turns on Move; mouse, pen and wheel always act on the view.
+  // In a scrolling tablet page, one-finger touches scroll the page (both ways,
+  // for a zoomed-in page) until the operator turns on Move; two fingers zoom
+  // and move the view. Mouse, pen and wheel always act on the view.
   const touchScrollsPage = !!isTablet && viewerInScrollingPage && !touchMovesView
   // On a phone (touch is the main pointer) the toolbar and job buttons get
   // finger-sized targets; tablet layouts already ask for them with isTablet.
@@ -2820,23 +2823,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       const centerX = (p1.x + p2.x) / 2
       const centerY = (p1.y + p2.y) / 2
       if (lastPinchDistRef.current !== null) {
-        const factor = dist / lastPinchDistRef.current
-
-        if (is3D) {
-          const smoothFactor = 1 + (factor - 1) * 0.5
-          const anchor = getScreenAnchor(centerX, centerY)
-          setOrbitState(prev => zoomOrbitTowardAnchor(prev, 1 / smoothFactor, anchor))
-        } else {
-          const t = transformRef.current
-          const rect = containerRef.current!.getBoundingClientRect()
-          const mx = centerX - rect.left
-          const my = centerY - rect.top
-          t.ox = mx - (mx - t.ox) * factor
-          t.oy = my - (my - t.oy) * factor
-          t.scale *= factor
-        }
-
-        scheduleRender()
+        applyPinch(dist / lastPinchDistRef.current, centerX, centerY)
       }
       lastPinchDistRef.current = dist
     } else if (pointers.length === 1) {
@@ -2884,6 +2871,68 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       }
     }
   }
+
+  /**
+   * Zoom by `factor` about a screen point between two fingers. In 2D the
+   * fingers' movement (`panX`, `panY`) also moves the view.
+   */
+  function applyPinch(factor: number, centerX: number, centerY: number, panX = 0, panY = 0) {
+    if (is3D) {
+      const smoothFactor = 1 + (factor - 1) * 0.5
+      const anchor = getScreenAnchor(centerX, centerY)
+      setOrbitState(prev => zoomOrbitTowardAnchor(prev, 1 / smoothFactor, anchor))
+    } else {
+      const t = transformRef.current
+      const rect = containerRef.current!.getBoundingClientRect()
+      const mx = centerX - rect.left
+      const my = centerY - rect.top
+      t.ox = mx - (mx - t.ox) * factor + panX
+      t.oy = my - (my - t.oy) * factor + panY
+      t.scale *= factor
+    }
+    scheduleRender()
+  }
+
+  // While one finger scrolls the page, two fingers still zoom and move the
+  // view. Touch events, not pointer events: the browser keeps one-finger
+  // scrolling, and a cancelled two-finger move neither scrolls nor zooms the page.
+  touchPinchHandlerRef.current = (e: TouchEvent) => {
+    if (e.type !== 'touchmove' || e.touches.length !== 2) {
+      touchPinchRef.current = null
+      return
+    }
+    // A move the browser already scrolls with cannot be cancelled; leave it be.
+    if (!e.cancelable) return
+    e.preventDefault()
+    const [a, b] = [e.touches[0], e.touches[1]]
+    const dist = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY)
+    const centerX = (a.clientX + b.clientX) / 2
+    const centerY = (a.clientY + b.clientY) / 2
+    const last = touchPinchRef.current
+    touchPinchRef.current = { dist, centerX, centerY, panned: last?.panned ?? 0 }
+    if (!last || last.dist <= 0 || dist <= 0) return
+    const panX = is3D ? 0 : centerX - last.centerX
+    const panY = is3D ? 0 : centerY - last.centerY
+    touchPinchRef.current.panned += Math.hypot(panX, panY)
+    if (isRunning && autoFollow && touchPinchRef.current.panned > FOLLOW_PAN_RELEASE_PX) {
+      followReleasedByPanRef.current = true
+      setAutoFollow(false)
+    }
+    applyPinch(dist / last.dist, last.centerX, last.centerY, panX, panY)
+  }
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container || !touchScrollsPage) return
+    const onTouch = (e: TouchEvent) => touchPinchHandlerRef.current(e)
+    const types = ['touchstart', 'touchmove', 'touchend', 'touchcancel'] as const
+    // Only touchmove cancels; passive listeners for the rest keep scrolling smooth.
+    for (const type of types) container.addEventListener(type, onTouch, { passive: type !== 'touchmove' })
+    return () => {
+      for (const type of types) container.removeEventListener(type, onTouch)
+      touchPinchRef.current = null
+    }
+  }, [touchScrollsPage])
 
   function onPointerUp(e: React.PointerEvent) {
     activePointersRef.current.delete(e.pointerId)
@@ -3251,7 +3300,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               onClick={() => setTouchMovesView(v => !v)}
               title={touchMovesView
                 ? 'Dragging on the preview moves the view. Tap to let it scroll the page again.'
-                : 'Dragging on the preview scrolls the page. Tap to move the view instead.'}
+                : 'One finger on the preview scrolls the page; two fingers zoom and move the view. Tap to move the view with one finger.'}
               aria-pressed={touchMovesView}
             >
               <Hand size={iconSize} />
@@ -3274,7 +3323,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       <div
         ref={containerRef}
         className="flex-1 min-h-0 relative cursor-grab active:cursor-grabbing"
-        style={{ touchAction: touchScrollsPage ? 'pan-y pinch-zoom' : 'none' }}
+        style={{ touchAction: touchScrollsPage ? 'pan-x pan-y' : 'none' }}
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={event => {
