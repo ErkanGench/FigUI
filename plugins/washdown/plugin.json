@@ -1,0 +1,13 @@
+{
+    "name": "Washdown",
+    "description": "A FigUI plugin for switching a washdown pump through a FluidNC digital output and displaying its state from a separate digital feedback input.",
+    "version": "1.1.1",
+    "entry": "index.html",
+    "layout": "default",
+    "icon": "icon.png",
+    "config": {
+        "outputIndex": 0,
+        "inputIndex": 0,
+        "feedbackLabel": "Replace with your label"
+    }
+}

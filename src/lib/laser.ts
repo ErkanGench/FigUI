@@ -112,8 +112,9 @@ function stopPointerOnHide(e: Event) {
   if (e.type !== 'pagehide' && document.visibilityState === 'visible') return
   if (pointerEndsAt || offPending) stopLaserPointer(true)
 }
-window.addEventListener('pagehide', stopPointerOnHide)
-document.addEventListener('visibilitychange', stopPointerOnHide)
+// Optional calls: tests and other non-browser hosts have no page to hide.
+globalThis.window?.addEventListener?.('pagehide', stopPointerOnHide)
+globalThis.document?.addEventListener?.('visibilitychange', stopPointerOnHide)
 
 /** Panels showing the pointer; the last one to go switches it off. */
 export function retainLaserPointer(): () => void {

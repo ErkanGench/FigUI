@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import { RotateCcw, Play, Square, ArrowLeft, Crosshair } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { loadPersistedJogFeed } from '../lib/jog'
+import { buildLimitedFeedPresets, getJogFeedMax, loadPersistedJogFeed } from '../lib/jog'
 import { isLineInputHeldByJob, sendRaw, sendRealtime } from '../lib/ws'
 import { sendControlLine } from '../lib/macros'
 import { setLocalJogActive } from '../lib/jogWatchdog'
@@ -156,16 +156,6 @@ function snapToNearestPreset(value: number, presets: readonly number[]) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
-}
-
-function buildLimitedFeedPresets(presets: readonly number[], max?: number): number[] {
-  if (max == null || !Number.isFinite(max) || max <= 0) return [...presets]
-
-  const normalizedMax = Math.round(max * 1000) / 1000
-  const limited = presets.filter(preset => preset <= normalizedMax)
-  const next = limited.length > 0 ? [...limited] : [normalizedMax]
-  if (!next.some(preset => Math.abs(preset - normalizedMax) < 0.001)) next.push(normalizedMax)
-  return next
 }
 
 function buildSpindlePresets(min: number, max?: number): number[] {
@@ -515,13 +505,15 @@ function JogRose({ xyFeed, continuous, disabled, isJogging, activeKeys, units, f
 const ZONE_FILL = ['var(--jog-r0)', 'var(--jog-r1)', 'var(--jog-r2)']
 const ABC_STEPS = [10, 1, 0.1]  as const
 
-function AxisZone({ id, y, displayStep, commandStep, sign, axis, feed, fillIdx, color, disabled, hover, onHover }: {
+function AxisZone({ id, y, displayStep, commandStep, sign, axis, feed, fillIdx, color, disabled, hover, onHover, horizontal }: {
   id: string; y: number; displayStep: number; commandStep: number; sign: 1 | -1; axis: string; feed: number
   fillIdx: number; color: string; disabled: boolean
   hover: string | null; onHover: (id: string | null) => void
+  horizontal?: boolean
 }) {
   const { start, stop } = useHoldJog(axis, sign, feed, commandStep, false, disabled)
   const isHovered = hover === id
+  const labelX = horizontal ? 13 : 22
   return (
     <g className="cursor-pointer"
       onPointerEnter={() => onHover(id)}
@@ -529,10 +521,11 @@ function AxisZone({ id, y, displayStep, commandStep, sign, axis, feed, fillIdx, 
       onPointerDown={e => { alwaysCapturePointer(e); onHover(id); start() }}
       onPointerUp={() => { onHover(null); stop() }}
       onPointerCancel={() => { onHover(null); stop() }}>
-      <rect x="2" y={y} width="40" height="26" rx="2"
+      <rect x="2" y={y} width={horizontal ? 22 : 40} height="26" rx="2"
         fill={isHovered ? color : ZONE_FILL[fillIdx]}
         stroke="var(--surface)" strokeWidth="1.5" />
-      <text x="22" y={y + 16} textAnchor="middle"
+      <text x={labelX} y={y + 16} textAnchor="middle"
+        transform={horizontal ? `rotate(-90 ${labelX} ${y + 13})` : undefined}
         fill={isHovered ? '#fff' : 'var(--jog-label)'}
         fontSize="12" fontWeight="700" fontFamily="ui-monospace, monospace"
         pointerEvents="none">
@@ -542,16 +535,17 @@ function AxisZone({ id, y, displayStep, commandStep, sign, axis, feed, fillIdx, 
   )
 }
 
-function AxisCont({ id, y, h, sign, axis, feed, color, disabled, hover, onHover, activeKeys }: {
+function AxisCont({ id, y, h, sign, axis, feed, color, disabled, hover, onHover, activeKeys, horizontal }: {
   id: string; y: number; h: number; sign: 1 | -1; axis: string; feed: number
   color: string; disabled: boolean; hover: string | null; onHover: (id: string | null) => void
   activeKeys?: Set<string>
+  horizontal?: boolean
 }) {
   const { start, stop } = useHoldJog(axis, sign, feed, 0, true, disabled)
   const isKeyActive = activeKeys?.has(`${axis}${sign > 0 ? '+' : '-'}`) ?? false
   const isHovered = hover === id || isKeyActive
   return (
-    <rect x="2" y={y} width="40" height={h} rx="3"
+    <rect x="2" y={y} width={horizontal ? 22 : 40} height={h} rx="3"
       fill={isHovered ? color : 'var(--jog-r1)'}
       stroke="var(--surface)" strokeWidth="1.5"
       className="cursor-pointer"
@@ -564,48 +558,56 @@ function AxisCont({ id, y, h, sign, axis, feed, color, disabled, hover, onHover,
   )
 }
 
-function AxisBar({ axis, color, steps, feed, continuous, disabled, activeKeys, units }: {
+function AxisBar({ axis, color, steps, feed, continuous, disabled, activeKeys, units, horizontal = false }: {
   axis: string; color: string; steps: readonly number[]; feed: number
   continuous: boolean; disabled: boolean; activeKeys?: Set<string>; units: Units
+  horizontal?: boolean
 }) {
   const [hover, setHover] = useState<string | null>(null)
+  const barWidth = horizontal ? 22 : 40
+  const labelX = horizontal ? 13 : 22
   return (
-    <svg viewBox="0 0 44 220"
+    <svg viewBox={horizontal ? '0 0 220 26' : '0 0 44 220'}
       style={{ touchAction: 'none' }}
       {...noContextMenu}
-      className={`w-[50px] h-full max-h-[260px] select-none shrink-0
+      className={`${horizontal ? 'w-full h-auto' : 'w-[50px] h-full max-h-[260px]'} select-none shrink-0
                   ${disabled ? 'opacity-40 pointer-events-none' : ''}`}>
 
-      <rect x="2" y="0" width="40" height="24" rx="3" fill={color} opacity="0.15" />
-      <text x="22" y="16" textAnchor="middle" fill={color} fontSize="12" fontWeight="700" pointerEvents="none">+{axis}</text>
+      {/* Rotate the bar so negative jogs are on the left; keep labels upright. */}
+      <g transform={horizontal ? 'translate(220 0) rotate(90)' : undefined}>
+        <rect x="2" y="0" width={barWidth} height="24" rx="3" fill={color} opacity="0.15" />
+        <text x={labelX} y="16" textAnchor="middle" fill={color} fontSize="12" fontWeight="700" pointerEvents="none"
+          transform={horizontal ? `rotate(-90 ${labelX} 12)` : undefined}>+{axis}</text>
 
-      {continuous ? (
-        <>
-          <AxisCont id={`${axis}+c`} y={26} h={82} sign={1} axis={axis} feed={feed} color={color}
-            disabled={disabled} hover={hover} onHover={setHover} activeKeys={activeKeys} />
-          <AxisCont id={`${axis}-c`} y={116} h={82} sign={-1} axis={axis} feed={feed} color={color}
-            disabled={disabled} hover={hover} onHover={setHover} activeKeys={activeKeys} />
-        </>
-      ) : (
-        <>
-          {steps.map((step, i) => (
-            <AxisZone key={`+${step}`} id={`${axis}+${step}`} y={26 + i * 28}
-              displayStep={step} commandStep={axisStepToCommand(step, axis, units)} sign={1}
-              axis={axis} feed={feed} fillIdx={steps.length - 1 - i} color={color}
-              disabled={disabled} hover={hover} onHover={setHover} />
-          ))}
-          <rect x="2" y="110" width="40" height="4" rx="1" fill="var(--border)" />
-          {[...steps].reverse().map((step, i) => (
-            <AxisZone key={`-${step}`} id={`${axis}-${step}`} y={116 + i * 28}
-              displayStep={step} commandStep={axisStepToCommand(step, axis, units)} sign={-1}
-              axis={axis} feed={feed} fillIdx={i} color={color}
-              disabled={disabled} hover={hover} onHover={setHover} />
-          ))}
-        </>
-      )}
+        {continuous ? (
+          <>
+            <AxisCont id={`${axis}+c`} y={26} h={82} sign={1} axis={axis} feed={feed} color={color}
+              disabled={disabled} hover={hover} onHover={setHover} activeKeys={activeKeys} horizontal={horizontal} />
+            <AxisCont id={`${axis}-c`} y={116} h={82} sign={-1} axis={axis} feed={feed} color={color}
+              disabled={disabled} hover={hover} onHover={setHover} activeKeys={activeKeys} horizontal={horizontal} />
+          </>
+        ) : (
+          <>
+            {steps.map((step, i) => (
+              <AxisZone key={`+${step}`} id={`${axis}+${step}`} y={26 + i * 28}
+                displayStep={step} commandStep={axisStepToCommand(step, axis, units)} sign={1}
+                axis={axis} feed={feed} fillIdx={steps.length - 1 - i} color={color}
+                disabled={disabled} hover={hover} onHover={setHover} horizontal={horizontal} />
+            ))}
+            <rect x="2" y="110" width={barWidth} height="4" rx="1" fill="var(--border)" />
+            {[...steps].reverse().map((step, i) => (
+              <AxisZone key={`-${step}`} id={`${axis}-${step}`} y={116 + i * 28}
+                displayStep={step} commandStep={axisStepToCommand(step, axis, units)} sign={-1}
+                axis={axis} feed={feed} fillIdx={i} color={color}
+                disabled={disabled} hover={hover} onHover={setHover} horizontal={horizontal} />
+            ))}
+          </>
+        )}
 
-      <rect x="2" y="200" width="40" height="20" rx="3" fill={color} opacity="0.15" />
-      <text x="22" y="214" textAnchor="middle" fill={color} fontSize="12" fontWeight="700" pointerEvents="none">−{axis}</text>
+        <rect x="2" y="200" width={barWidth} height="20" rx="3" fill={color} opacity="0.15" />
+        <text x={labelX} y="214" textAnchor="middle" fill={color} fontSize="12" fontWeight="700" pointerEvents="none"
+          transform={horizontal ? `rotate(-90 ${labelX} 210)` : undefined}>−{axis}</text>
+      </g>
     </svg>
   )
 }
@@ -950,16 +952,16 @@ export function JogPad() {
   const jogPanelRef = useRef<HTMLDivElement>(null)
   const { keyboardJog, setKeyboardJog, activeKeys } = useKeyboardJog(continuous, canJog, xyFeed, zFeed, jogPanelRef)
   const zSteps = withFineStep(linearBarSteps(units), units, fineJog)
-  const xyFeedMax = controllerSettings.maxRateX != null && controllerSettings.maxRateY != null
-    ? Math.min(controllerSettings.maxRateX, controllerSettings.maxRateY)
-    : controllerSettings.maxRateX ?? controllerSettings.maxRateY
-  const zFeedMax = controllerSettings.maxRateZ
+  const xyFeedMax = getJogFeedMax(controllerSettings, 'xy')
+  const zFeedMax = getJogFeedMax(controllerSettings, 'z')
+  const abcFeedMax = getJogFeedMax(controllerSettings, 'abc', axes)
   const spindleMin = controllerSettings.spindleMin ?? 0
   const spindleMax = controllerSettings.spindleMax
   const laserMode = controllerSettings.laserMode
   const linearFeedPresetValues = linearFeedPresets(units)
   const xyFeedPresetValues = buildLimitedFeedPresets(linearFeedPresetValues, xyFeedMax)
   const zFeedPresetValues = buildLimitedFeedPresets(linearFeedPresetValues, zFeedMax)
+  const abcFeedPresetValues = buildLimitedFeedPresets(MM_FEED_PRESETS, abcFeedMax)
   const spindlePresetValues = buildSpindlePresets(spindleMin, spindleMax)
   const controllerSpindleActive = status.spindleRunning ?? status.spindle > 0
   const spindleActive = spindleOverrideState === 'off'
@@ -999,6 +1001,11 @@ export function JogPad() {
   }, [zFeedMax])
 
   useEffect(() => {
+    if (abcFeedMax == null) return
+    setAbcFeed(prev => Math.min(prev, abcFeedMax))
+  }, [abcFeedMax])
+
+  useEffect(() => {
     if (spindleMax == null || !Number.isFinite(spindleMax) || spindleMax < spindleMin) return
     setSpindleTarget(prev => {
       if (prev === 24000 && spindleMax !== 24000) return spindleMax
@@ -1033,6 +1040,9 @@ export function JogPad() {
     <>
       {compact
         ? <TabletJogPad onSwitchStyle={() => {
+            setXyFeed(loadPersistedJogFeed('jog.xyFeed', 1000))
+            setZFeed(loadPersistedJogFeed('jog.zFeed', 200))
+            setAbcFeed(loadPersistedJogFeed('jog.abcFeed', 500))
             setCompact(false)
             localStorage.setItem('jog.desktopStyle', 'rose')
           }} />
@@ -1085,13 +1095,18 @@ export function JogPad() {
                     activeKeys={activeKeys} units={units} fine={fineJog} />
                   <AxisBar axis="Z" color="var(--info)" steps={zSteps} feed={zFeed}
                     continuous={continuous} disabled={!canJog} activeKeys={activeKeys} units={units} />
-                  {(['A', 'B', 'C'] as const).slice(0, axes - 3).map((ax, i) => (
-                    <AxisBar key={ax} axis={ax}
-                      color={(['var(--accent)', 'var(--purple)', 'var(--teal)'] as const)[i]}
-                      steps={ABC_STEPS} feed={abcFeed}
-                      continuous={continuous} disabled={!canJog} units="mm" />
-                  ))}
                 </div>
+
+                {axes > 3 && (
+                  <div className="flex flex-col gap-2">
+                    {(['A', 'B', 'C'] as const).slice(0, axes - 3).map((ax, i) => (
+                      <AxisBar key={ax} axis={ax} horizontal
+                        color={(['var(--accent)', 'var(--purple)', 'var(--teal)'] as const)[i]}
+                        steps={ABC_STEPS} feed={abcFeed}
+                        continuous={continuous} disabled={!canJog} units="mm" />
+                    ))}
+                  </div>
+                )}
 
                 <div className="flex gap-2 items-center">
                   <FeedButton label="XY" value={xyFeed} presets={xyFeedPresetValues} onChange={setXyFeed}
@@ -1100,11 +1115,18 @@ export function JogPad() {
                   <FeedButton label="Z" value={zFeed} presets={zFeedPresetValues} onChange={setZFeed}
                     formatValue={linearFeedFormatter} toDisplayValue={value => mmToDisplay(value, units)}
                     fromDisplayValue={value => displayToMm(value, units)} max={zFeedMax} />
-                  {axes > 3 && <FeedButton label="ABC" value={abcFeed} presets={MM_FEED_PRESETS} onChange={setAbcFeed} formatValue={rotaryFeedFormatter} />}
                   <span className="text-base text-text-dim shrink-0">
-                    {axes > 3 ? `XYZ ${feedUnitLabel(units)}` : feedUnitLabel(units)}
+                    {feedUnitLabel(units)}
                   </span>
                 </div>
+
+                {axes > 3 && (
+                  <div className="flex gap-2 items-center">
+                    <FeedButton label="ABC" value={abcFeed} presets={abcFeedPresetValues} onChange={setAbcFeed}
+                      formatValue={rotaryFeedFormatter} max={abcFeedMax} />
+                    <span className="text-base text-text-dim shrink-0">mm/min</span>
+                  </div>
+                )}
 
                 <div className="text-center text-base text-text-dim leading-tight">
                   {continuous
@@ -1514,11 +1536,27 @@ export function OverridesPanel({ className, isTablet }: { className?: string; is
   )
 }
 
-// Step choice of TabletJogPad, kept as a position in the step list: a units
-// change then maps 1 mm to 0.01 in like the rose rings, not to 1 in. It
-// outlives a remount (the phone Control tab unmounts on tab switch) but not a
-// reload. Continuous is not kept, so a remounted pad always starts in step mode.
-let tabletStepIdx = 1
+// Step choice of TabletJogPad. It outlives a remount (the phone Control tab
+// unmounts on tab switch) but not a reload. Continuous is not kept, so a
+// remounted pad always starts in step mode.
+let tabletStepSize = 1
+
+function CompactRotaryJogControls({ axis, color, feed, step, continuous, disabled }: {
+  axis: string; color: string; feed: number; step: number; continuous: boolean; disabled: boolean
+}) {
+  const negative = useHoldJog(axis, -1, feed, step, continuous, disabled)
+  const positive = useHoldJog(axis, 1, feed, step, continuous, disabled)
+  return (
+    <>
+      <button {...tabletJogPointerHandlers(negative.start, negative.stop, continuous)}
+        className={continuous ? 'jog-cluster-btn' : 'jog-cluster-btn jog-cluster-btn--step'} style={{ color }}
+        disabled={disabled} aria-label={`Jog ${axis} negative`}>{axis}-</button>
+      <button {...tabletJogPointerHandlers(positive.start, positive.stop, continuous)}
+        className={continuous ? 'jog-cluster-btn' : 'jog-cluster-btn jog-cluster-btn--step'} style={{ color }}
+        disabled={disabled} aria-label={`Jog ${axis} positive`}>{axis}+</button>
+    </>
+  )
+}
 
 export function TabletJogPad({
   onSwitchStyle,
@@ -1535,29 +1573,33 @@ export function TabletJogPad({
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerJobStarting = useControllerJobStarting()
   const units = useMachineStore(s => s.units)
+  const axes = useMachineStore(s => s.axes)
   const controllerSettings = useMachineStore(s => s.controllerSettings)
   const topBand = layout === 'topBand'
+  const rotaryAxes = (['A', 'B', 'C'] as const).slice(0, Math.max(0, axes - 3))
 
   const [xyFeed, setXyFeed] = useState(() => loadPersistedJogFeed('jog.xyFeed', 1000))
   const [zFeed, setZFeed]   = useState(() => loadPersistedJogFeed('jog.zFeed', 200))
+  const [abcFeed, setAbcFeed] = useState(() => loadPersistedJogFeed('jog.abcFeed', 500))
   const [continuous, setContinuous] = useState(false)
-  const [stepIdx, setStepIdx] = useState(() => tabletStepIdx)
+  const [stepSize, setStepSize] = useState(() => tabletStepSize)
   const fineJog = useMachineStore(s => s.fineJog)
   const setFineJog = useMachineStore(s => s.setFineJog)
-  const [feedModal, setFeedModal] = useState<'xy' | 'z' | null>(null)
+  const [feedModal, setFeedModal] = useState<'xy' | 'z' | 'abc' | null>(null)
   const [customFeedValue, setCustomFeedValue] = useState('')
   const prevUnitsRef = useRef(units)
 
-  const xyFeedMax = controllerSettings.maxRateX != null && controllerSettings.maxRateY != null
-    ? Math.min(controllerSettings.maxRateX, controllerSettings.maxRateY)
-    : controllerSettings.maxRateX ?? controllerSettings.maxRateY
-  const zFeedMax = controllerSettings.maxRateZ
+  const xyFeedMax = getJogFeedMax(controllerSettings, 'xy')
+  const zFeedMax = getJogFeedMax(controllerSettings, 'z')
+  const abcFeedMax = getJogFeedMax(controllerSettings, 'abc', axes)
   const linearFeedPresetValues = linearFeedPresets(units)
   const xyFeedPresetValues = buildLimitedFeedPresets(linearFeedPresetValues, xyFeedMax)
   const zFeedPresetValues  = buildLimitedFeedPresets(linearFeedPresetValues, zFeedMax)
+  const abcFeedPresetValues = buildLimitedFeedPresets(MM_FEED_PRESETS, abcFeedMax)
 
   useEffect(() => { localStorage.setItem('jog.xyFeed', JSON.stringify(xyFeed)) }, [xyFeed])
   useEffect(() => { localStorage.setItem('jog.zFeed',  JSON.stringify(zFeed))  }, [zFeed])
+  useEffect(() => { localStorage.setItem('jog.abcFeed', JSON.stringify(abcFeed)) }, [abcFeed])
 
   useEffect(() => {
     if (prevUnitsRef.current === units) return
@@ -1577,6 +1619,11 @@ export function TabletJogPad({
     setZFeed(prev => Math.min(prev, zFeedMax))
   }, [zFeedMax])
 
+  useEffect(() => {
+    if (abcFeedMax == null) return
+    setAbcFeed(prev => Math.min(prev, abcFeedMax))
+  }, [abcFeedMax])
+
   const jobActive = status.state === 'Run' || status.state === 'Hold' || controllerJobStarting || controllerResetPending
   const canJog = connected && (status.state === 'Idle' || status.state === 'Jog') && !controllerJobStarting && !controllerResetPending
   const jobRunning = useJobRunningWithLinger(jobActive)
@@ -1584,14 +1631,16 @@ export function TabletJogPad({
   const rootRef = useRef<HTMLDivElement>(null)
   const { keyboardJog, setKeyboardJog } = useKeyboardJog(continuous, canJog, xyFeed, zFeed, rootRef)
   const steps = withFineStep(linearRingSteps(units), units, fineJog)
-  const commandStepSize = displayToMm(steps[stepIdx], units)
+  const commandStepSize = displayToMm(stepSize, units)
+
+  function selectStep(size: number) {
+    setStepSize(size)
+    tabletStepSize = size
+  }
 
   function toggleFineJog() {
     // Turning fine on selects the fine step, so the next tap moves 0.01 mm.
-    if (!fineJog) {
-      setStepIdx(0)
-      tabletStepIdx = 0
-    }
+    if (!fineJog) selectStep(0.01)
     setFineJog(!fineJog)
   }
 
@@ -1604,20 +1653,25 @@ export function TabletJogPad({
 
   const stepBtnClass = topBand
     ? 'flex-1 px-1 py-2 font-bold text-sm transition-colors'
-    : 'flex-1 px-2 sm:px-4 portrait:px-4 max-sm:portrait:px-1 portrait:py-4 max-sm:portrait:py-2 font-bold text-base sm:text-lg portrait:text-xl max-sm:portrait:text-base transition-colors'
+    : 'flex-1 min-w-0 px-1 py-2 font-bold text-sm sm:px-2 sm:text-lg transition-colors'
   const jogClusterClass = topBand ? 'jog-cluster jog-cluster--top-band' : 'jog-cluster jog-cluster--default'
   // Step buttons let a vertical drag scroll the page; a held continuous button must not.
   const jogBtnClass = continuous ? 'jog-cluster-btn' : 'jog-cluster-btn jog-cluster-btn--step'
-  const jogAreaPadding = topBand ? 'p-1' : 'p-2 sm:p-3 portrait:p-3 landscape:p-4 max-sm:portrait:p-2'
   const jogPadRootClass = onSwitchStyle
     ? 'flex-none h-[440px]'
     : topBand
       ? 'h-full min-h-0'
       : 'flex-1 min-h-0'
 
-  function openFeedModal(axis: 'xy' | 'z') {
-    const current = axis === 'xy' ? xyFeed : zFeed
-    setCustomFeedValue(String(mmToDisplay(current, units)))
+  useEffect(() => {
+    if (steps.includes(stepSize)) return
+    // Fine swaps 0.1 mm and 0.01 mm; a units change starts again from the second step.
+    selectStep(stepSize === 0.1 && fineJog ? 0.01 : stepSize === 0.01 && !fineJog ? 0.1 : steps[1])
+  }, [units, fineJog])
+
+  function openFeedModal(axis: 'xy' | 'z' | 'abc') {
+    const current = axis === 'xy' ? xyFeed : axis === 'z' ? zFeed : abcFeed
+    setCustomFeedValue(String(axis === 'abc' ? current : mmToDisplay(current, units)))
     setFeedModal(axis)
   }
 
@@ -1626,19 +1680,20 @@ export function TabletJogPad({
     const displayValue = parseDecimalInput(customFeedValue)
     if (displayValue == null || displayValue <= 0) return
 
-    const max = feedModal === 'xy' ? xyFeedMax : zFeedMax
-    const converted = displayToMm(displayValue, units)
+    const max = feedModal === 'xy' ? xyFeedMax : feedModal === 'z' ? zFeedMax : abcFeedMax
+    const converted = feedModal === 'abc' ? displayValue : displayToMm(displayValue, units)
     const next = max != null && Number.isFinite(max) ? Math.min(converted, max) : converted
     if (feedModal === 'xy') setXyFeed(next)
-    else setZFeed(next)
+    else if (feedModal === 'z') setZFeed(next)
+    else setAbcFeed(next)
     setFeedModal(null)
   }
 
   return (
     <>
-    <div ref={rootRef} className={`panel ${hideDuringJob && jobRunning ? 'hidden' : 'flex'} flex-col portrait:flex-none portrait:min-h-[440px] max-sm:portrait:min-h-[300px] ${jogPadRootClass}`}>
+    <div ref={rootRef} className={`tablet-jog-pad panel w-full min-w-0 ${hideDuringJob && jobRunning ? 'hidden' : 'flex'} flex-col portrait:flex-none portrait:h-[440px] ${jogPadRootClass}`}>
       <div className="panel-header flex flex-row items-stretch justify-between shrink-0 !p-0 border-b border-border overflow-hidden">
-        <div className={`flex flex-col items-center justify-center border-r border-border shrink-0 gap-2 font-bold tracking-wider ${topBand ? 'w-12 py-1.5 text-sm' : 'w-16 py-3 text-lg'}`}>
+        <div className={`flex flex-col items-center justify-center border-r border-border shrink-0 gap-2 font-bold tracking-wider ${topBand ? 'w-12 py-1.5 text-sm' : 'w-16 max-sm:w-12 py-2 text-lg'}`}>
           JOG
           {onSwitchStyle && (
             <button
@@ -1651,11 +1706,11 @@ export function TabletJogPad({
           )}
         </div>
         <div className="flex flex-1 items-stretch divide-x divide-border bg-surface">
-          {steps.map((s, i) => (
+          {steps.map(s => (
             <button
               key={s}
-              className={`${stepBtnClass} ${!continuous && stepIdx === i ? 'bg-accent text-white shadow-inner' : 'bg-transparent text-text-primary hover:bg-elevated'}`}
-              onClick={() => { setContinuous(false); setStepIdx(i); tabletStepIdx = i }}
+              className={`${stepBtnClass} ${!continuous && stepSize === s ? 'bg-accent text-white shadow-inner' : 'bg-transparent text-text-primary hover:bg-elevated'}`}
+              onClick={() => { setContinuous(false); selectStep(s) }}
             >
               {s}
             </button>
@@ -1669,52 +1724,15 @@ export function TabletJogPad({
         </div>
       </div>
 
-      <div className="flex flex-row flex-1 min-h-0 overflow-hidden">
-
-        <div className={`flex flex-col border-r border-border shrink-0 ${topBand ? 'w-12 py-1' : 'w-16 max-sm:w-12 py-2'}`}>
-          <button
-            onClick={() => openFeedModal('xy')}
-            className={`flex flex-col items-center justify-center flex-1 rounded-lg hover:bg-accent/5 transition-all group ${topBand ? 'gap-1 mx-0.5' : 'gap-3 mx-1'}`}
-          >
-            <span className={`font-extrabold text-text-muted tracking-wider leading-none ${topBand ? 'text-sm' : 'text-xl'}`}>XY</span>
-            <div className="flex items-center">
-              <span
-                className={`font-mono font-semibold text-text-primary leading-none ${topBand ? 'text-base' : 'text-2xl'}`}
-                style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-              >
-                {formatDisplayNumber(mmToDisplay(xyFeed, units), 0)}
-              </span>
-              <span
-                className={`text-text-dim leading-none ${topBand ? 'text-xs' : 'text-xl'}`}
-                style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-              >{feedUnitLabel(units)}</span>
-            </div>
-          </button>
-          <div className={`h-px bg-border shrink-0 ${topBand ? 'mx-1' : 'mx-2'}`} />
-          <button
-            onClick={() => openFeedModal('z')}
-            className={`flex flex-col items-center justify-center flex-1 rounded-lg hover:bg-accent/5 transition-all group ${topBand ? 'gap-1 mx-0.5' : 'gap-3 mx-1'}`}
-          >
-            <span className={`font-extrabold text-text-muted tracking-wider leading-none ${topBand ? 'text-sm' : 'text-xl'}`}>Z</span>
-            <div className="flex items-center">
-              <span
-                className={`font-mono font-semibold text-text-primary leading-none ${topBand ? 'text-base' : 'text-2xl'}`}
-                style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-              >
-                {formatDisplayNumber(mmToDisplay(zFeed, units), 0)}
-              </span>
-              <span
-                className={`text-text-dim leading-none ${topBand ? 'text-xs' : 'text-xl'}`}
-                style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
-              >{feedUnitLabel(units)}</span>
-            </div>
-          </button>
-        </div>
-
+      <div
+        {...noContextMenu}
+        className={`jog-controls-layout ${rotaryAxes.length > 0 ? 'jog-controls-layout--rotary' : ''} ${topBand ? 'jog-controls-layout--top-band' : ''} ${jogDisabled ? 'opacity-40 pointer-events-none' : ''}`}
+        style={{ '--jog-rotary-rows': rotaryAxes.length } as React.CSSProperties}
+      >
         {/* Jog controls */}
         <div
           {...noContextMenu}
-          className={`jog-controls-area relative flex-1 min-h-0 flex justify-center items-center overflow-hidden ${jogAreaPadding} ${jogDisabled ? 'opacity-40 pointer-events-none' : ''}`}
+          className="jog-controls-area relative flex justify-center items-center"
         >
           {onSwitchStyle && continuous && (
             <button
@@ -1757,7 +1775,30 @@ export function TabletJogPad({
             <button {...tabletJogPointerHandlers(startZm, stopZm, continuous)} className={`${jogBtnClass} text-info`}>Z-</button>
           </div>
         </div>
-
+        {rotaryAxes.length > 0 && (
+          <div className="jog-rotary-controls">
+            {rotaryAxes.map((axis, i) => (
+              <CompactRotaryJogControls key={axis} axis={axis}
+                color={(['var(--accent)', 'var(--purple)', 'var(--teal)'] as const)[i]}
+                feed={abcFeed} step={axisStepToCommand(stepSize, axis, units)}
+                continuous={continuous} disabled={jogDisabled} />
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="jog-feed-controls grid grid-flow-col auto-cols-fr divide-x divide-border border-t border-border shrink-0">
+        {(['xy', 'z', ...(rotaryAxes.length > 0 ? ['abc'] : [])] as ('xy' | 'z' | 'abc')[]).map(group => {
+          const feed = group === 'xy' ? xyFeed : group === 'z' ? zFeed : abcFeed
+          return (
+            <button key={group} onClick={() => openFeedModal(group)}
+              className={`flex flex-wrap items-center justify-between gap-x-2 px-3 py-2 hover:bg-accent/5 transition-colors ${topBand ? 'text-sm' : 'text-base'}`}
+              aria-label={`Set ${group.toUpperCase()} feedrate`}>
+              <span className="font-bold text-text-muted">{group.toUpperCase()}</span>
+              <span className="font-mono text-text-primary">{formatDisplayNumber(group === 'abc' ? feed : mmToDisplay(feed, units), 0)}</span>
+              <span className="jog-feed-unit text-right text-xs text-text-dim">{group === 'abc' ? 'mm/min' : feedUnitLabel(units)}</span>
+            </button>
+          )
+        })}
       </div>
     </div>
 
@@ -1772,21 +1813,22 @@ export function TabletJogPad({
           className="my-auto bg-surface border border-border rounded-2xl shadow-2xl p-5 sm:p-8 w-[min(480px,calc(100vw-2rem))]"
           onClick={e => e.stopPropagation()}
         >
-          <div className="flex items-center justify-between mb-4 sm:mb-6">
-            <span className="text-2xl sm:text-3xl font-bold">
-              {feedModal === 'xy' ? 'XY' : 'Z'} Feedrate
+          <div className="flex items-center justify-between mb-6">
+            <span className="text-3xl font-bold">
+              {feedModal.toUpperCase()} Feedrate
             </span>
-            <span className="text-2xl text-text-muted font-mono">{feedUnitLabel(units)}</span>
+            <span className="text-2xl text-text-muted font-mono">{feedModal === 'abc' ? 'mm/min' : feedUnitLabel(units)}</span>
           </div>
           <div className="grid grid-cols-2 gap-4">
-            {(feedModal === 'xy' ? xyFeedPresetValues : zFeedPresetValues).map(preset => {
-              const active = preset === (feedModal === 'xy' ? xyFeed : zFeed)
+            {(feedModal === 'xy' ? xyFeedPresetValues : feedModal === 'z' ? zFeedPresetValues : abcFeedPresetValues).map(preset => {
+              const active = preset === (feedModal === 'xy' ? xyFeed : feedModal === 'z' ? zFeed : abcFeed)
               return (
                 <button
                   key={preset}
                   onClick={() => {
                     if (feedModal === 'xy') setXyFeed(preset)
-                    else setZFeed(preset)
+                    else if (feedModal === 'z') setZFeed(preset)
+                    else setAbcFeed(preset)
                     setFeedModal(null)
                   }}
                   className={`btn py-4 sm:py-6 text-2xl sm:text-3xl font-mono justify-center ${
@@ -1795,7 +1837,7 @@ export function TabletJogPad({
                       : 'btn-ghost'
                   }`}
                 >
-                  {formatDisplayNumber(mmToDisplay(preset, units), 0)}
+                  {formatDisplayNumber(feedModal === 'abc' ? preset : mmToDisplay(preset, units), 0)}
                 </button>
               )
             })}

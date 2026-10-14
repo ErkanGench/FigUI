@@ -71,16 +71,11 @@ Object.assign(globalThis, {
 const http = await import('../src/lib/http')
 http.setBase('http://fluidnc.test')
 
-const ESP800 = 'FW version: FluidNC v4.1.1 # FW target:grbl-embedded # webcommunication: Async:80:1.2.3.4'
+const ESP800 = '{"cmd":"800","status":"ok","data":{"FWVersion":"FluidNC v4.1.1"}}'
 commandReplies = [() => new Response(ESP800)]
 assert.equal(await http.getDeviceInfo(), ESP800)
-assert.equal(requests[0].searchParams.get('cmd'), '[ESP800]', '[ESP800] must use cmd=, which FluidNC allows during motion')
+assert.equal(requests[0].searchParams.get('cmd'), '[ESP800]json=yes', '[ESP800] must use cmd=, which FluidNC allows during motion')
 assert.equal(requests[0].searchParams.get('plain'), null)
-
-requests.length = 0
-commandReplies = [() => new Response('Invalid command', { status: 500 }), () => new Response(ESP800)]
-assert.equal(await http.getDeviceInfoFast(), ESP800, 'firmware without cmd= must fall back to plain=')
-assert.equal(requests[1].searchParams.get('plain'), '[ESP800]')
 
 requests.length = 0
 commandReplies = [() => { throw new TypeError('Failed to fetch') }]

@@ -18,12 +18,11 @@ import {
   Zap,
 } from "lucide-react";
 import {
-  loadFluidConfig,
   MOTOR_DRIVER_PREFIX,
   type ConfigItem,
   type FluidConfig,
 } from "../lib/fluidSchema";
-import { useMachineStore } from "../store";
+import type { ConfigStudioProps } from "../lib/configStudioContract";
 import { yamlCommentStart } from "../lib/configValidation";
 
 type NodeKind =
@@ -1835,11 +1834,9 @@ export function ConfigStudio({
   content,
   onChange,
   isActive = true,
-}: {
-  content: string;
-  onChange: (yaml: string) => void;
-  isActive?: boolean;
-}) {
+  firmwareVersion,
+  loadConfig,
+}: ConfigStudioProps) {
   const [nodes, setNodes] = useState<NodeData[]>(() => nodesFromYaml(content));
   const [selected, setSelected] = useState("machine");
   const [zoom, setZoom] = useState(1);
@@ -1865,7 +1862,6 @@ export function ConfigStudio({
   const [propertyQuery, setPropertyQuery] = useState("");
   const [mutationError, setMutationError] = useState("");
   const [fluidConfig, setFluidConfig] = useState<FluidConfig | null>(null);
-  const firmwareVersion = useMachineStore((s) => s.espInfo?.version);
 
   useEffect(() => {
     setPropertyQuery("");
@@ -1937,13 +1933,13 @@ export function ConfigStudio({
     // retry when the version changes or the studio is reopened.
     if (!isActive) return;
     let cancelled = false;
-    loadFluidConfig(firmwareVersion).then((config) => {
+    loadConfig(firmwareVersion).then((config) => {
       if (!cancelled) setFluidConfig(config);
     });
     return () => {
       cancelled = true;
     };
-  }, [isActive, firmwareVersion]);
+  }, [isActive, firmwareVersion, loadConfig]);
   useEffect(() => {
     if (!palette) return;
     const close = (e: PointerEvent) => {
@@ -2078,7 +2074,14 @@ export function ConfigStudio({
         ? renameYamlKey(sourceRef.current, path, value)
         : null
       : path
-        ? patchYamlValue(sourceRef.current, path, value)
+        ? patchYamlValue(
+            sourceRef.current,
+            path,
+            value,
+            propertyFields.find(
+              (field) => field.key.toLowerCase() === key.toLowerCase(),
+            )?.type,
+          )
         : null;
     if (nextSource == null) {
       setMutationError(
@@ -2989,6 +2992,7 @@ export function formatYamlScalar(
   value: string,
   oldValue: string,
   path: string,
+  fieldType?: FieldDef["type"],
 ) {
   if (!value) return "";
   if (
@@ -3002,15 +3006,18 @@ export function formatYamlScalar(
   const fieldDefinition = Object.values(FIELDS)
     .flat()
     .find((field) => field.key.toLowerCase() === leaf.toLowerCase());
+  const type = fieldType ?? fieldDefinition?.type;
   const numericToken = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
   if (
     /^(?:true|false)$/i.test(value) &&
-    (fieldDefinition?.type === "boolean" || /^(?:true|false)$/i.test(oldValue))
+    (type === "boolean" ||
+      (fieldType === undefined && /^(?:true|false)$/i.test(oldValue)))
   )
     return value.toLowerCase();
   if (
     numericToken.test(value) &&
-    (fieldDefinition?.type === "number" || numericToken.test(oldValue))
+    (type === "number" ||
+      (fieldType === undefined && numericToken.test(oldValue)))
   )
     return value;
   const looksAmbiguous =
@@ -3036,13 +3043,14 @@ export function patchYamlValue(
   source: string,
   path: string,
   value: string,
+  fieldType?: FieldDef["type"],
 ): string | null {
   const lines = splitYamlLines(source),
     entries = yamlEntries(source),
     existing = entries.find((entry) => yamlPathEquals(entry.path, path));
   if (existing) {
     const old = existing.value;
-    const formatted = formatYamlScalar(value, old, path);
+    const formatted = formatYamlScalar(value, old, path, fieldType);
     lines[existing.line] =
       `${" ".repeat(existing.indent)}${existing.key}: ${formatted}${existing.comment}`;
     return joinYamlLines(lines, source);
@@ -3059,7 +3067,7 @@ export function patchYamlValue(
     if (lines[insertAt].trim() && indent <= parent.indent) break;
     insertAt++;
   }
-  const formatted = formatYamlScalar(value, "", path);
+  const formatted = formatYamlScalar(value, "", path, fieldType);
   lines.splice(
     insertAt,
     0,

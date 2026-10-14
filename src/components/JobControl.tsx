@@ -1,12 +1,14 @@
-import { Play, Pause, Square, RotateCcw, DoorOpen } from 'lucide-react'
+import { Play, Pause, Square, RotateCcw, DoorOpen, StepForward } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { useGCodeSenderStore } from '../store/gcodeSender'
-import { formatRuntime, useJobRuntimeEstimate } from '../lib/jobRuntime'
+import { formatJobProgress, formatRuntime, useJobRuntimeEstimate } from '../lib/jobRuntime'
 import { useControllerJobStarting } from '../lib/jobState'
-import { sendRealtime } from '../lib/ws'
+import { sendRealtime, sendRealtimeNow } from '../lib/ws'
 import { clearMachineAlarm } from '../lib/alarm'
 import { useConfirmTap } from '../hooks/useConfirmTap'
+import { useGCodeSenderStore } from '../store/gcodeSender'
+import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
+import { useJobResume } from '../lib/jobResume'
 
 export function JobControl() {
   const status = useMachineStore(s => s.status)
@@ -26,10 +28,10 @@ export function JobControl() {
   // own pause, resume and abort, as in the Viewer.
   const senderPhase = useGCodeSenderStore(s => s.phase)
   const pauseSender = useGCodeSenderStore(s => s.pause)
-  const resumeSender = useGCodeSenderStore(s => s.resume)
   const abortSender = useGCodeSenderStore(s => s.abort)
   const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
   const senderPaused = senderPhase === 'paused'
+  const { stepHold, disabled: resumeDisabled, resume } = useJobResume()
 
   const isRunning = (state === 'Run' && !senderPaused) || controllerJobStarting || controllerResetPending
     || senderPhase === 'streaming' || senderPhase === 'draining'
@@ -38,13 +40,12 @@ export function JobControl() {
   const isDoor    = state === 'Door'
   const hasSd     = Boolean(sdFilename)
 
-  function resume()     { if (senderPaused) resumeSender(); else sendRealtime(0x7E) }
   function pause()      { if (senderActive) pauseSender(); else sendRealtime(0x21) }
   // Two taps instead of confirm(), which would stop the page while it is open.
   function softReset()  {
     abortConfirm.tap(() => {
       if (senderActive) abortSender()
-      else if (sendRealtime(0x18)) cancelTrackedJob('controller')
+      else if (sendRealtimeNow(0x18)) cancelTrackedJob('controller')
     })
   }
   function clearAlarm() { clearMachineAlarm(status.alarmCode) }
@@ -55,21 +56,28 @@ export function JobControl() {
     <div className="panel">
       <div className="panel-header">Job Control</div>
       <div className="p-4 space-y-3">
+        <SingleBlockToggle unavailable={senderActive} />
+        <SingleBlockNotice unavailable={senderActive} />
 
         {/* SD progress */}
         {hasSd && (
           <div className="space-y-1.5">
             <div className="text-sm text-text-muted font-mono truncate">{sdFilename}</div>
             {progressPercent != null && (
-              <div className="w-full h-1.5 bg-elevated rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-info transition-all duration-500 rounded-full"
-                  style={{ width: `${progressPercent}%` }}
-                />
+              <div className="flex items-center gap-2.5">
+                <div className="flex-1 h-1.5 bg-elevated rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-info transition-all duration-500 rounded-full"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
+                <span className="text-sm font-mono text-text-muted tabular-nums shrink-0">
+                  {runtime.source === 'sd' ? 'File ' : ''}{formatJobProgress(progressPercent, runtime.source)}
+                </span>
               </div>
             )}
             {runtime.source === 'estimated' && (
-              <div className="flex justify-between text-xs font-mono text-text-muted tabular-nums">
+              <div className="flex justify-between text-sm font-mono text-text-muted tabular-nums">
                 <span>Elapsed {formatRuntime(runtime.elapsedSeconds)}</span>
                 <span>Remain {formatRuntime(runtime.remainingSeconds)}</span>
                 <span>Total {formatRuntime(runtime.totalSeconds)}</span>
@@ -106,11 +114,11 @@ export function JobControl() {
         {/* Action buttons */}
         {isRunning ? (
           <div className="flex gap-2">
-            <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={pause} disabled={!connected}>
+            <button className="btn btn-warn-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={pause} disabled={!connected}>
               <Pause size={13} />
               Hold
             </button>
-            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={softReset}>
+            <button className="btn btn-danger-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={softReset}>
               <Square size={13} />
               {abortConfirm.armed ? 'Tap again to abort' : 'Abort'}
             </button>
@@ -118,18 +126,18 @@ export function JobControl() {
         ) : (
           <div className="flex gap-2">
             {(isHold || isDoor) ? (
-              <button className="btn btn-ok-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={resume} disabled={!connected || (senderPaused && isDoor)}>
-                <Play size={13} />
-                Resume
+              <button className={`btn ${stepHold ? 'btn-step' : 'btn-ok-solid'} job-action gap-1.5 text-sm justify-center flex-1`} onClick={resume} disabled={resumeDisabled}>
+                {stepHold ? <StepForward size={13} /> : <Play size={13} />}
+                {stepHold ? 'Next block' : 'Resume'}
               </button>
             ) : (
-              <button className="btn btn-warn-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={pause} disabled>
+              <button className="btn btn-warn-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={pause} disabled>
                 <Pause size={13} />
                 Hold
               </button>
             )}
 
-            <button className="btn btn-danger-solid gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={softReset}>
+            <button className="btn btn-danger-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={softReset}>
               <Square size={13} />
               {abortConfirm.armed ? 'Tap again to abort' : 'Abort'}
             </button>

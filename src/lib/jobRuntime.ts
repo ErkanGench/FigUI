@@ -524,6 +524,10 @@ function fileMatchesJob(status: Pick<MachineStatus, 'sdFilename'>, loadedPath: s
   return false
 }
 
+export function formatJobProgress(percent: number, source: JobRuntimeEstimate['source']) {
+  return `${source === 'sd' ? percent.toFixed(2) : Math.round(percent)}%`
+}
+
 export function formatRuntime(seconds: number | null) {
   if (seconds == null || !Number.isFinite(seconds)) return '--:--'
   const rounded = Math.max(0, Math.round(seconds))

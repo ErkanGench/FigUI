@@ -1,0 +1,1196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wallflower</title>
+<style>
+  /* FigUI injects its theme variables; the fallbacks are only for opening
+     this file outside FigUI. */
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+    background: var(--bg, #0c1018); color: var(--text-primary, #e2e6f4);
+    display: grid; grid-template-rows: auto auto 1fr; overflow: hidden;
+  }
+
+  header { display: flex; align-items: center; gap: .6rem; padding: 10px 12px 6px; }
+  #filename { color: var(--text-muted, #9aa3bd); overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+  #status { padding: 0 12px; color: var(--danger, #e2645f); }
+  #status:not(:empty) { padding-bottom: 6px; }
+
+  main { display: grid; grid-template-columns: 276px 1fr; min-height: 0; padding: 0 12px 12px; gap: 12px; }
+  /* scrollbar-gutter keeps a lane for the scrollbar so it can never sit on top
+     of the fields, and nothing shifts when it appears. */
+  .panel {
+    overflow-y: auto; scrollbar-gutter: stable; padding-right: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong, #3a4463) transparent;
+  }
+  .panel::-webkit-scrollbar { width: 8px; }
+  .panel::-webkit-scrollbar-track { background: transparent; }
+  .panel::-webkit-scrollbar-thumb {
+    background: var(--border-strong, #3a4463); border-radius: 4px;
+  }
+  .panel::-webkit-scrollbar-thumb:hover { background: var(--text-dim, #6c7793); }
+  .panel h2 {
+    font-size: 11px; letter-spacing: .06em; font-weight: 700; margin: 14px 0 6px;
+    color: var(--text-muted, #9aa3bd);
+  }
+  .panel h2:first-child { margin-top: 0; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: .6rem; padding: 3px 0; }
+  .row label { flex: 1; }
+  input[type=text] {
+    font: inherit; width: 9ch; text-align: right; padding: 4px 6px; color: inherit;
+    background: var(--elevated, #161c28); border: 1px solid var(--border, #28304a); border-radius: 5px;
+  }
+  input.wide { width: 100%; text-align: left; }
+  input[type=text]:focus-visible, button:focus-visible, .switch input:focus-visible {
+    outline: 2px solid var(--accent, #f0a030); outline-offset: 1px;
+  }
+
+  .switch { display: flex; align-items: center; gap: .55rem; padding: 4px 0; cursor: pointer; }
+  .switch input {
+    appearance: none; -webkit-appearance: none; margin: 0; flex: none; cursor: pointer;
+    width: 32px; height: 17px; border-radius: 9px; position: relative;
+    background: var(--border-strong, #3a4463);
+    transition: background .15s;
+  }
+  .switch input::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
+    border-radius: 50%; background: var(--text-primary, #e2e6f4); transition: transform .15s;
+  }
+  .switch input:checked { background: var(--accent, #f0a030); }
+  .switch input:checked::after { transform: translateX(15px); }
+
+  #info { font-size: 11px; color: var(--text-muted, #9aa3bd); white-space: pre; margin-top: 4px; }
+
+  button {
+    font: inherit; padding: 6px 10px; cursor: pointer; color: inherit;
+    background: var(--elevated, #161c28); border: 1px solid var(--border, #28304a); border-radius: 5px;
+  }
+  button:hover:not(:disabled) { border-color: var(--border-strong, #3a4463); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.accent { background: var(--accent, #f0a030); border-color: var(--accent, #f0a030); color: #11151c; }
+  button.accent:hover:not(:disabled) { background: var(--accent-hover, #d98f24); }
+  button.wide { width: 100%; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+  .link { background: none; border: 0; padding: 6px 0 0; color: var(--text-dim, #6c7793);
+          text-decoration: underline; font-size: 12px; }
+
+  #machine-status { font-size: 11px; color: var(--text-muted, #9aa3bd); margin-top: 8px; min-height: 1.4em; }
+  #machine-status.bad { color: var(--danger, #e2645f); }
+  #machine-status.good { color: var(--ok, #58b368); }
+
+  .stage { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+  .wrap { position: relative; min-height: 0; border: 1px solid var(--border, #28304a);
+          border-radius: 6px; background: var(--surface, #111622); overflow: hidden; }
+  .wrap.drag { outline: 2px dashed var(--accent, #f0a030); outline-offset: -6px; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #empty { position: absolute; inset: 0; place-items: center; color: var(--text-dim, #6c7793); }
+  #empty:not([hidden]) { display: grid; }
+  .caption { color: var(--text-dim, #6c7793); padding-top: 6px; font-size: 11px; }
+  input[type=file] { display: none; }
+
+  @media (max-width: 760px) {
+    body { overflow: auto; height: auto; }
+    main { grid-template-columns: 1fr; }
+    .panel { overflow: visible; padding-right: 0; }
+    .wrap { height: 70vw; }
+  }
+  @media (prefers-reduced-motion: reduce) { .switch input, .switch input::after { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <button id="open">Open SVG...</button>
+  <span id="filename"></span>
+  <input id="file" type="file" accept=".svg,.svgz,image/svg+xml">
+</header>
+<div id="status" role="alert"></div>
+
+<main>
+  <div class="panel">
+    <h2>MERGE AND SORT OPTIONS</h2>
+    <label class="switch"><input type="checkbox" data-key="merge"> Line Merge</label>
+    <div class="row"><label for="merge_tol">Tolerance (mm)</label><input id="merge_tol" type="text" data-key="merge_tol"></div>
+    <label class="switch"><input type="checkbox" data-key="sort"> Line Sort</label>
+    <label class="switch"><input type="checkbox" data-key="preserve"> Preserve Direction</label>
+    <div class="row"><label for="simplify">Simplify (mm)</label><input id="simplify" type="text" data-key="simplify"></div>
+
+    <h2>DRAWING OPTIONS</h2>
+    <div class="row"><label for="scale">Scale (%)</label><input id="scale" type="text" data-key="scale"></div>
+    <label class="switch"><input type="checkbox" data-key="flip_h"> Flip Horizontal</label>
+    <label class="switch"><input type="checkbox" data-key="flip_v"> Flip Vertical</label>
+    <div class="row"><label for="offx">Offset X (mm)</label><input id="offx" type="text" data-key="offx"></div>
+    <div class="row"><label for="offy">Offset Y (mm)</label><input id="offy" type="text" data-key="offy"></div>
+
+    <h2>SERVO VALUES</h2>
+    <div class="row"><label for="pen_up">Pen Up (M3 S)</label><input id="pen_up" type="text" data-key="pen_up"></div>
+    <div class="row"><label for="pen_down">Pen Down (M3 S)</label><input id="pen_down" type="text" data-key="pen_down"></div>
+    <div class="row"><label for="dwell">Dwell (s)</label><input id="dwell" type="text" data-key="dwell"></div>
+    <div class="row"><label for="pen_up_dwell">Pen Up Dwell (s)</label><input id="pen_up_dwell" type="text" data-key="pen_up_dwell"></div>
+    <div class="row"><label for="feed">Draw Speed (mm/min)</label><input id="feed" type="text" data-key="feed"></div>
+    <div class="pair">
+      <button id="pen-up-btn">Pen Up</button>
+      <button id="pen-down-btn">Pen Down</button>
+    </div>
+
+    <h2>DRAWING INFO</h2>
+    <div id="info">No drawing loaded.</div>
+
+    <h2>SAVE TO SD CARD</h2>
+    <div class="row"><input id="sd_name" class="wide" type="text" placeholder="drawing.gcode"></div>
+    <button id="save" class="accent wide" disabled>Save G-Code to SD</button>
+    <button id="run" class="wide" style="margin-top:6px" disabled>Start Job</button>
+    <div id="machine-status"></div>
+    <button id="reset" class="link" type="button">Reset settings</button>
+  </div>
+
+  <div class="stage">
+    <div class="wrap" id="wrap">
+      <canvas id="canvas"></canvas>
+      <div id="empty">Open an SVG, or drop one here.</div>
+    </div>
+    <div class="caption">Preview is in machine coordinates: 0,0 at the centre of the page, X right, Y up.</div>
+  </div>
+</main>
+
+<script>
+// Wallflower core - SVG to G-code, ported from svg2gcode.py.
+//
+// Pure functions only. The page hands this a plain element tree
+// ({tag, attrs, children}); all geometry is computed here rather than by the
+// browser, so the same code can be tested outside a browser and produces the
+// same points as the desktop app.
+
+"use strict";
+
+const WF = (() => {
+  const QUANTIZATION = 0.2;          // mm between sampled points on curves
+  const SIMPLIFY = 0.01;             // mm Douglas-Peucker tolerance
+  const MM_PER_PX = 25.4 / 96;
+
+  // ------------------------------------------------------------------ maths
+
+  const IDENTITY = [1, 0, 0, 1, 0, 0];      // [a b c d e f]: x' = ax+cy+e
+
+  function mul(m, n) {                       // m applied after n
+    return [
+      m[0] * n[0] + m[2] * n[1],
+      m[1] * n[0] + m[3] * n[1],
+      m[0] * n[2] + m[2] * n[3],
+      m[1] * n[2] + m[3] * n[3],
+      m[0] * n[4] + m[2] * n[5] + m[4],
+      m[1] * n[4] + m[3] * n[5] + m[5],
+    ];
+  }
+
+  const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  const NUM = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g;
+  const numbers = (s) => (String(s || "").match(NUM) || []).map(Number);
+
+  // ------------------------------------------------------------------ units
+
+  // svgelements' own conversions, in its own operation order, so both apps
+  // agree to the last digit. Its mm constant is rounded (0.0393701 in/mm).
+  const UNITS = {
+    "": (a) => a, px: (a) => a,
+    mm: (a) => a * 96 * 0.0393701, cm: (a) => a * 96 * 0.393701, in: (a) => a * 96,
+    pt: (a) => (a * 4.0) / 3.0, pc: (a) => a * 16.0, em: (a) => a * 16.0, ex: (a) => a * 8.0,
+  };
+
+  function lengthPx(s) {
+    if (s == null) return null;
+    const m = /^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([a-z%]*)\s*$/i.exec(String(s));
+    if (!m) return null;
+    const unit = m[2].toLowerCase();
+    return unit in UNITS ? UNITS[unit](parseFloat(m[1])) : null;   // % has no fixed size
+  }
+
+  function parseTransform(s) {
+    let m = IDENTITY;
+    if (!s) return m;
+    const re = /(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)/g;
+    let t;
+    while ((t = re.exec(s))) {
+      const v = numbers(t[2]);
+      let f = IDENTITY;
+      switch (t[1]) {
+        case "matrix":
+          if (v.length >= 6) f = v.slice(0, 6);
+          break;
+        case "translate":
+          f = [1, 0, 0, 1, v[0] || 0, v[1] || 0];
+          break;
+        case "scale": {
+          const sx = v.length ? v[0] : 1;
+          const sy = v.length > 1 ? v[1] : sx;
+          f = [sx, 0, 0, sy, 0, 0];
+          break;
+        }
+        case "rotate": {
+          const a = ((v[0] || 0) * Math.PI) / 180;
+          f = [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), 0, 0];
+          if (v.length >= 3)
+            f = mul(mul([1, 0, 0, 1, v[1], v[2]], f), [1, 0, 0, 1, -v[1], -v[2]]);
+          break;
+        }
+        case "skewX":
+          f = [1, 0, Math.tan(((v[0] || 0) * Math.PI) / 180), 1, 0, 0];
+          break;
+        case "skewY":
+          f = [1, Math.tan(((v[0] || 0) * Math.PI) / 180), 0, 1, 0, 0];
+          break;
+      }
+      m = mul(m, f);
+    }
+    return m;
+  }
+
+  // The root viewport: viewBox, width/height and preserveAspectRatio, ending in mm.
+  function viewport(root) {
+    const a = root.attrs;
+    const vb = numbers(a.viewBox || a.viewbox);
+    const hasVb = vb.length === 4 && vb[2] > 0 && vb[3] > 0;
+    let w = lengthPx(a.width);
+    let h = lengthPx(a.height);
+    if (w == null) w = hasVb ? vb[2] : 1000;
+    if (h == null) h = hasVb ? vb[3] : 1000;
+
+    let m = IDENTITY;
+    if (hasVb) {
+      let sx = w / vb[2];
+      let sy = h / vb[3];
+      let tx = 0;
+      let ty = 0;
+      const par = String(a.preserveAspectRatio || "xMidYMid meet").trim().split(/\s+/);
+      const align = par[0] || "xMidYMid";
+      if (align !== "none") {
+        const s = par[1] === "slice" ? Math.max(sx, sy) : Math.min(sx, sy);
+        sx = sy = s;
+        const ax = align.includes("xMid") ? 0.5 : align.includes("xMax") ? 1 : 0;
+        const ay = align.includes("YMid") ? 0.5 : align.includes("YMax") ? 1 : 0;
+        tx = (w - vb[2] * s) * ax;
+        ty = (h - vb[3] * s) * ay;
+      }
+      m = [sx, 0, 0, sy, -vb[0] * sx + tx, -vb[1] * sy + ty];
+    }
+    return { matrix: m, page: [w * MM_PER_PX, h * MM_PER_PX] };
+  }
+
+  // ------------------------------------------------------------ path data
+
+  const CMD = /[MmZzLlHhVvCcSsQqTtAa]/;
+  const NUMY = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/y;
+
+  // Path data to absolute segments. S becomes C, T becomes Q, H and V become L.
+  function parsePath(d) {
+    const s = String(d || "");
+    const n = s.length;
+    const out = [];
+    let i = 0;
+    const ws = () => { while (i < n && /[\s,]/.test(s[i])) i++; };
+    const num = () => {
+      ws();
+      NUMY.lastIndex = i;
+      const m = NUMY.exec(s);
+      if (!m) return null;
+      i = NUMY.lastIndex;
+      return parseFloat(m[0]);
+    };
+    const flag = () => {
+      ws();
+      if (s[i] === "0" || s[i] === "1") return s[i++] === "1";
+      return null;
+    };
+
+    let cx = 0, cy = 0, sx = 0, sy = 0;      // current point, subpath start
+    let qc = null, cc = null;                 // last quad / cubic control point
+    let cmd = null;
+
+    for (;;) {
+      ws();
+      if (i >= n) break;
+      if (CMD.test(s[i])) cmd = s[i++];
+      else if (cmd === null || cmd === "Z" || cmd === "z") break;   // stray numbers
+      else if (cmd === "M") cmd = "L";                               // implicit lineto
+      else if (cmd === "m") cmd = "l";
+
+      const C = cmd.toUpperCase();
+      const rel = cmd !== C;
+      const bx = rel ? cx : 0;
+      const by = rel ? cy : 0;
+
+      if (C === "Z") {
+        out.push({ t: "Z" });
+        cx = sx; cy = sy; qc = cc = null;
+        continue;
+      }
+      if (C === "M" || C === "L") {
+        const x = num(), y = num();
+        if (y === null) break;
+        cx = bx + x; cy = by + y;
+        if (C === "M") { sx = cx; sy = cy; }
+        out.push({ t: C, x: cx, y: cy });
+        qc = cc = null;
+      } else if (C === "H") {
+        const x = num();
+        if (x === null) break;
+        cx = bx + x;
+        out.push({ t: "L", x: cx, y: cy });
+        qc = cc = null;
+      } else if (C === "V") {
+        const y = num();
+        if (y === null) break;
+        cy = by + y;
+        out.push({ t: "L", x: cx, y: cy });
+        qc = cc = null;
+      } else if (C === "C" || C === "S") {
+        let x1, y1;
+        if (C === "C") {
+          x1 = num(); y1 = num();
+          if (y1 === null) break;
+          x1 += bx; y1 += by;
+        } else {
+          x1 = cc ? 2 * cx - cc[0] : cx;
+          y1 = cc ? 2 * cy - cc[1] : cy;
+        }
+        const x2 = num(), y2 = num(), x = num(), y = num();
+        if (y === null) break;
+        const seg = { t: "C", x1, y1, x2: bx + x2, y2: by + y2, x: bx + x, y: by + y };
+        out.push(seg);
+        cc = [seg.x2, seg.y2]; qc = null;
+        cx = seg.x; cy = seg.y;
+      } else if (C === "Q" || C === "T") {
+        let x1, y1;
+        if (C === "Q") {
+          x1 = num(); y1 = num();
+          if (y1 === null) break;
+          x1 += bx; y1 += by;
+        } else {
+          x1 = qc ? 2 * cx - qc[0] : cx;
+          y1 = qc ? 2 * cy - qc[1] : cy;
+        }
+        const x = num(), y = num();
+        if (y === null) break;
+        out.push({ t: "Q", x1, y1, x: bx + x, y: by + y });
+        qc = [x1, y1]; cc = null;
+        cx = bx + x; cy = by + y;
+      } else if (C === "A") {
+        const rx = num(), ry = num(), rot = num();
+        const fa = flag(), fs = flag();
+        const x = num(), y = num();
+        if (y === null || fa === null || fs === null) break;
+        out.push({ t: "A", rx, ry, rot, fa, fs, x: bx + x, y: by + y });
+        cx = bx + x; cy = by + y; qc = cc = null;
+      } else {
+        break;
+      }
+    }
+    return out;
+  }
+
+  // SVG spec F.6.5: endpoint arc to centre parameterisation.
+  function arcParams(x1, y1, g) {
+    let rx = Math.abs(g.rx), ry = Math.abs(g.ry);
+    if (rx === 0 || ry === 0 || (x1 === g.x && y1 === g.y)) return null;
+    const phi = ((g.rot || 0) * Math.PI) / 180;
+    const cos = Math.cos(phi), sin = Math.sin(phi);
+    const dx = (x1 - g.x) / 2, dy = (y1 - g.y) / 2;
+    const xp = cos * dx + sin * dy;
+    const yp = -sin * dx + cos * dy;
+    const lam = (xp * xp) / (rx * rx) + (yp * yp) / (ry * ry);
+    if (lam > 1) { rx *= Math.sqrt(lam); ry *= Math.sqrt(lam); }
+    const num = rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp;
+    const den = rx * rx * yp * yp + ry * ry * xp * xp;
+    const coef = (g.fa !== g.fs ? 1 : -1) * Math.sqrt(Math.max(0, num / den));
+    const cxp = (coef * rx * yp) / ry;
+    const cyp = (-coef * ry * xp) / rx;
+    const cx = cos * cxp - sin * cyp + (x1 + g.x) / 2;
+    const cy = sin * cxp + cos * cyp + (y1 + g.y) / 2;
+    const ang = (ux, uy, vx, vy) => Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+    const ux = (xp - cxp) / rx, uy = (yp - cyp) / ry;
+    const vx = (-xp - cxp) / rx, vy = (-yp - cyp) / ry;
+    const t1 = ang(1, 0, ux, uy);
+    let dt = ang(ux, uy, vx, vy);
+    if (!g.fs && dt > 0) dt -= 2 * Math.PI;
+    if (g.fs && dt < 0) dt += 2 * Math.PI;
+    return { cx, cy, rx, ry, cos, sin, t1, dt };
+  }
+
+  function arcAt(a, t) {
+    const th = a.t1 + a.dt * t;
+    const ex = a.rx * Math.cos(th), ey = a.ry * Math.sin(th);
+    return [a.cos * ex - a.sin * ey + a.cx, a.sin * ex + a.cos * ey + a.cy];
+  }
+
+  function cubicAt(p, t) {
+    const u = 1 - t;
+    const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+    return [a * p[0][0] + b * p[1][0] + c * p[2][0] + d * p[3][0],
+            a * p[0][1] + b * p[1][1] + c * p[2][1] + d * p[3][1]];
+  }
+
+  function quadAt(p, t) {
+    const u = 1 - t;
+    const a = u * u, b = 2 * u * t, c = t * t;
+    return [a * p[0][0] + b * p[1][0] + c * p[2][0],
+            a * p[0][1] + b * p[1][1] + c * p[2][1]];
+  }
+
+  const STEP_PX = Math.max(QUANTIZATION, 1e-3) / MM_PER_PX;
+  const LEN_ERROR = STEP_PX / 4;           // what the desktop passes to seg.length()
+
+  // svgelements PathSegment.segment_length: halve until the chord stops
+  // growing by more than `err`, and always at least `minDepth` levels.
+  function segmentLength(at, s, e, sp, ep, err, minDepth, depth) {
+    const mid = (s + e) / 2;
+    const mp = at(mid);
+    const length = dist(ep, sp);
+    const length2 = dist(mp, sp) + dist(ep, mp);
+    if (length2 - length > err || depth < minDepth) {
+      depth += 1;
+      return segmentLength(at, s, mid, sp, mp, err, minDepth, depth) +
+             segmentLength(at, mid, e, mp, ep, err, minDepth, depth);
+    }
+    return length2;
+  }
+  const lineLength = (at) => segmentLength(at, 0, 1, at(0), at(1), LEN_ERROR, 5, 0);
+
+  // svgelements QuadraticBezier.length: closed form, with its fallbacks.
+  function quadLength(p) {
+    const ax = p[0][0] - 2 * p[1][0] + p[2][0], ay = p[0][1] - 2 * p[1][1] + p[2][1];
+    const bx = 2 * (p[1][0] - p[0][0]), by = 2 * (p[1][1] - p[0][1]);
+    const A = 4 * (ax * ax + ay * ay);
+    const B = 4 * (ax * bx + ay * by);
+    const C = bx * bx + by * by;
+    const Sabc = 2 * Math.sqrt(A + B + C);
+    const A2 = Math.sqrt(A);
+    const A32 = 2 * A * A2;
+    const C2 = 2 * Math.sqrt(C);
+    if (A2 !== 0 && A32 !== 0) {
+      const BA = B / A2;
+      const den = BA + C2;
+      if (den !== 0) {
+        const arg = (2 * A2 + BA + Sabc) / den;
+        if (arg > 0) {
+          const s = (A32 * Sabc + A2 * B * (Sabc - C2) + (4 * C * A - B * B) * Math.log(arg)) / (4 * A32);
+          if (Number.isFinite(s)) return s;
+        }
+      }
+    }
+    const absA = Math.hypot(ax, ay), absB = Math.hypot(bx, by);
+    if (absA < 1e-10) return absB;
+    const k = absB / absA;
+    return k >= 2 ? absB - absA : absA * ((k * k) / 2 - k + 1);
+  }
+
+  // --------------------------------------------------------------- shapes
+
+  function shapeSegments(tag, a) {
+    const L = (k) => lengthPx(a[k]) || 0;
+    const M = (x, y) => ({ t: "M", x, y });
+    const Ln = (x, y) => ({ t: "L", x, y });
+    const A = (rx, ry, x, y) => ({ t: "A", rx, ry, rot: 0, fa: false, fs: true, x, y });
+
+    switch (tag) {
+      case "path":
+        return parsePath(a.d);
+      case "line":
+        return [M(L("x1"), L("y1")), Ln(L("x2"), L("y2"))];
+      case "polyline":
+      case "polygon": {
+        const v = numbers(a.points);
+        if (v.length < 4) return null;
+        const s = [M(v[0], v[1])];
+        for (let k = 2; k + 1 < v.length; k += 2) s.push(Ln(v[k], v[k + 1]));
+        if (tag === "polygon") s.push({ t: "Z" });
+        return s;
+      }
+      case "rect": {
+        const x = L("x"), y = L("y"), w = L("width"), h = L("height");
+        if (w <= 0 || h <= 0) return null;
+        let rx = lengthPx(a.rx), ry = lengthPx(a.ry);
+        if (rx == null && ry == null) rx = ry = 0;
+        else if (rx == null) rx = ry;
+        else if (ry == null) ry = rx;
+        rx = Math.min(Math.abs(rx), w / 2);
+        ry = Math.min(Math.abs(ry), h / 2);
+        if (!rx || !ry)
+          return [M(x, y), Ln(x + w, y), Ln(x + w, y + h), Ln(x, y + h), { t: "Z" }];
+        return [
+          M(x + rx, y), Ln(x + w - rx, y), A(rx, ry, x + w, y + ry),
+          Ln(x + w, y + h - ry), A(rx, ry, x + w - rx, y + h),
+          Ln(x + rx, y + h), A(rx, ry, x, y + h - ry),
+          Ln(x, y + ry), A(rx, ry, x + rx, y), { t: "Z" },
+        ];
+      }
+      case "circle":
+      case "ellipse": {
+        const cx = L("cx"), cy = L("cy");
+        const rx = tag === "circle" ? L("r") : L("rx");
+        const ry = tag === "circle" ? L("r") : L("ry");
+        if (rx <= 0 || ry <= 0) return null;
+        return [
+          M(cx + rx, cy), A(rx, ry, cx, cy + ry), A(rx, ry, cx - rx, cy),
+          A(rx, ry, cx, cy - ry), A(rx, ry, cx + rx, cy), { t: "Z" },
+        ];
+      }
+    }
+    return null;
+  }
+
+  // Segments to polylines: lines kept exact, curves sampled every QUANTIZATION mm.
+  function sampleInto(segs, m, out) {
+    let cur = [];
+    let px = 0, py = 0, sx = 0, sy = 0;
+    for (const g of segs) {
+      if (g.t === "M") {
+        if (cur.length > 1) out.push(cur);
+        cur = [apply(m, g.x, g.y)];
+        px = sx = g.x; py = sy = g.y;
+        continue;
+      }
+      if (!cur.length) cur = [apply(m, px, py)];
+      if (g.t === "L") {
+        cur.push(apply(m, g.x, g.y));
+        px = g.x; py = g.y;
+        continue;
+      }
+      if (g.t === "Z") {
+        cur.push(apply(m, sx, sy));
+        px = sx; py = sy;
+        continue;
+      }
+      let len, at;
+      if (g.t === "C") {
+        const p = [[px, py], [g.x1, g.y1], [g.x2, g.y2], [g.x, g.y]].map((q) => apply(m, q[0], q[1]));
+        at = (t) => cubicAt(p, t);
+        len = lineLength(at);
+      } else if (g.t === "Q") {
+        const p = [[px, py], [g.x1, g.y1], [g.x, g.y]].map((q) => apply(m, q[0], q[1]));
+        at = (t) => quadAt(p, t);
+        len = quadLength(p);
+      } else {
+        const arc = arcParams(px, py, g);
+        if (!arc) {                               // degenerate arc is a straight line
+          cur.push(apply(m, g.x, g.y));
+          px = g.x; py = g.y;
+          continue;
+        }
+        at = (t) => { const q = arcAt(arc, t); return apply(m, q[0], q[1]); };
+        // svgelements measures the transformed semi-axes: equal means a circle.
+        const ux = arc.rx * arc.cos, uy = arc.rx * arc.sin;
+        const vx = -arc.ry * arc.sin, vy = arc.ry * arc.cos;
+        const rxT = Math.hypot(m[0] * ux + m[2] * uy, m[1] * ux + m[3] * uy);
+        const ryT = Math.hypot(m[0] * vx + m[2] * vy, m[1] * vx + m[3] * vy);
+        len = Math.abs(rxT - ryT) < 1e-12 ? Math.abs(rxT * arc.dt) : lineLength(at);
+      }
+      const k = Math.max(2, Math.min(4000, Math.ceil(len / STEP_PX)));
+      for (let j = 1; j <= k; j++) cur.push(at(j / k));
+      px = g.x; py = g.y;
+    }
+    if (cur.length > 1) out.push(cur);
+  }
+
+  // ---------------------------------------------------------------- loading
+
+  const SKIP = new Set(["defs", "clippath", "mask", "symbol", "marker", "pattern",
+    "style", "script", "title", "desc", "metadata", "foreignobject",
+    "lineargradient", "radialgradient", "filter", "text", "image"]);
+
+  const localName = (tag) => String(tag).replace(/^.*:/, "").toLowerCase();
+
+  function hidden(node) {
+    if (String(node.attrs.display || "").trim().toLowerCase() === "none") return true;
+    return String(node.attrs.style || "").replace(/\s+/g, "").toLowerCase().includes("display:none");
+  }
+
+  function collectIds(node, ids) {
+    if (node.attrs && node.attrs.id) ids.set(node.attrs.id, node);
+    for (const c of node.children || []) collectIds(c, ids);
+  }
+
+  function walk(node, m, out, ids, depth) {
+    if (depth > 64) return;
+    const tag = localName(node.tag);
+    if (SKIP.has(tag) || hidden(node)) return;
+    const mm = mul(m, parseTransform(node.attrs.transform));
+
+    if (tag === "g" || tag === "a" || tag === "switch" || tag === "svg") {
+      for (const c of node.children) walk(c, mm, out, ids, depth + 1);
+      return;
+    }
+    if (tag === "use") {
+      const ref = ids.get(String(node.attrs.href || node.attrs["xlink:href"] || "").replace(/^#/, ""));
+      if (!ref) return;
+      const mu = mul(mm, [1, 0, 0, 1, lengthPx(node.attrs.x) || 0, lengthPx(node.attrs.y) || 0]);
+      if (localName(ref.tag) === "symbol") {
+        for (const c of ref.children) walk(c, mu, out, ids, depth + 1);
+      } else {
+        walk(ref, mu, out, ids, depth + 1);
+      }
+      return;
+    }
+    const segs = shapeSegments(tag, node.attrs);
+    if (segs && segs.length) sampleInto(segs, mm, out);
+  }
+
+  function dedupe(line) {
+    const out = [line[0]];
+    for (let k = 1; k < line.length; k++) {
+      const p = line[k], q = out[out.length - 1];
+      if (Math.abs(p[0] - q[0]) > 1e-9 || Math.abs(p[1] - q[1]) > 1e-9) out.push(p);
+    }
+    return out;
+  }
+
+  // root: {tag, attrs, children}. Returns {lines, page} in millimetres.
+  function loadTree(root) {
+    const vp = viewport(root);
+    const ids = new Map();
+    collectIds(root, ids);
+    const raw = [];
+    for (const c of root.children) walk(c, vp.matrix, raw, ids, 1);
+    const mm = raw.map((l) => l.map(([x, y]) => [x * MM_PER_PX, y * MM_PER_PX]));
+    const lines = mm.map(dedupe).filter((l) => l.length > 1);
+    return { lines, page: vp.page };
+  }
+
+  // ------------------------------------------------------------ measuring
+
+  function drawLength(lines) {
+    let s = 0;
+    for (const l of lines) for (let k = 1; k < l.length; k++) s += dist(l[k - 1], l[k]);
+    return s;
+  }
+
+  function travelLength(lines, start = [0, 0]) {
+    let s = 0, pos = start;
+    for (const l of lines) { s += dist(pos, l[0]); pos = l[l.length - 1]; }
+    return s + dist(pos, start);
+  }
+
+  function bbox(lines) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const l of lines) for (const p of l) {
+      if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+      if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+    }
+    return x0 === Infinity ? [0, 0, 0, 0] : [x0, y0, x1, y1];
+  }
+
+  // ----------------------------------------------------------- optimising
+
+  class Grid {
+    constructor(cell) { this.cell = Math.max(cell, 1e-6); this.d = new Map(); }
+    key(p) { return Math.floor(p[0] / this.cell) + "," + Math.floor(p[1] / this.cell); }
+    add(p, item) {
+      const k = this.key(p);
+      if (!this.d.has(k)) this.d.set(k, []);
+      this.d.get(k).push(item);
+    }
+    *block(p, r) {
+      const kx = Math.floor(p[0] / this.cell), ky = Math.floor(p[1] / this.cell);
+      for (let dx = -r; dx <= r; dx++)
+        for (let dy = -r; dy <= r; dy++) {
+          const cell = this.d.get((kx + dx) + "," + (ky + dy));
+          if (cell) yield* cell;
+        }
+    }
+  }
+
+  function linemerge(input, tol) {
+    const lines = input.filter((l) => l.length > 1);
+    const grid = new Grid(Math.max(tol, 1e-6));
+    lines.forEach((l, i) => { grid.add(l[0], [i, 0]); grid.add(l[l.length - 1], [i, 1]); });
+    const used = new Array(lines.length).fill(false);
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (used[i]) continue;
+      used[i] = true;
+      let chain = lines[i].slice();
+      for (let pass = 0; pass < 2; pass++) {
+        for (;;) {
+          const end = chain[chain.length - 1];
+          let hit = null;
+          for (const [j, which] of grid.block(end, 1)) {
+            if (used[j]) continue;
+            const seg = lines[j];
+            if (dist(end, which === 0 ? seg[0] : seg[seg.length - 1]) <= tol) { hit = [j, which]; break; }
+          }
+          if (!hit) break;
+          used[hit[0]] = true;
+          const seg = hit[1] === 0 ? lines[hit[0]] : lines[hit[0]].slice().reverse();
+          for (let k = 1; k < seg.length; k++) chain.push(seg[k]);
+        }
+        chain.reverse();
+      }
+      out.push(chain);
+    }
+    return out;
+  }
+
+  function douglasPeucker(line, tol) {
+    const keep = new Array(line.length).fill(false);
+    keep[0] = keep[line.length - 1] = true;
+    const stack = [[0, line.length - 1]];
+    while (stack.length) {
+      const [lo, hi] = stack.pop();
+      if (hi <= lo + 1) continue;
+      const [ax, ay] = line[lo], [bx, by] = line[hi];
+      const dx = bx - ax, dy = by - ay;
+      const norm = Math.hypot(dx, dy);
+      let worst = -1, at = lo;
+      for (let k = lo + 1; k < hi; k++) {
+        const [px, py] = line[k];
+        const dev = norm < 1e-12 ? Math.hypot(px - ax, py - ay)
+                                 : Math.abs(dy * px - dx * py + bx * ay - by * ax) / norm;
+        if (dev > worst) { worst = dev; at = k; }
+      }
+      if (worst > tol) { keep[at] = true; stack.push([lo, at]); stack.push([at, hi]); }
+    }
+    return line.filter((_, k) => keep[k]);
+  }
+
+  const linesimplify = (lines, tol) => lines.map((l) => (l.length > 2 ? douglasPeucker(l, tol) : l));
+
+  function linesort(lines, start = [0, 0], allowReverse = true) {
+    if (!lines.length) return [];
+    const b = bbox(lines);
+    const span = Math.max(b[2] - b[0], b[3] - b[1], 1.0);
+    const grid = new Grid(Math.max(span / Math.max(Math.floor(Math.sqrt(lines.length)) || 1, 1), 0.5));
+    lines.forEach((l, i) => {
+      grid.add(l[0], [i, 0]);
+      if (allowReverse) grid.add(l[l.length - 1], [i, 1]);
+    });
+    const used = new Array(lines.length).fill(false);
+    const out = [];
+    let pos = start;
+    for (let n = 0; n < lines.length; n++) {
+      let best = null, bestD = Infinity, r = 1;
+      for (;;) {
+        for (const [j, which] of grid.block(pos, r)) {
+          if (used[j]) continue;
+          const p = which === 0 ? lines[j][0] : lines[j][lines[j].length - 1];
+          const dd = dist(pos, p);
+          if (dd < bestD) { best = [j, which]; bestD = dd; }
+        }
+        if (best && bestD <= (r - 1) * grid.cell) break;
+        r++;
+        if (r > 4096) break;
+      }
+      if (!best) {
+        const j = used.indexOf(false);
+        if (j < 0) break;
+        best = [j, 0];
+      }
+      used[best[0]] = true;
+      const l = best[1] === 0 ? lines[best[0]] : lines[best[0]].slice().reverse();
+      out.push(l);
+      pos = l[l.length - 1];
+    }
+    return out;
+  }
+
+  function optimize(lines, o = {}) {
+    const stat = (ls) => ({ lines: ls.length, points: ls.reduce((s, l) => s + l.length, 0) });
+    const before = stat(lines);
+    if ((o.mergeTol || 0) > 0) lines = linemerge(lines, o.mergeTol);
+    const simp = o.simplifyTol == null ? SIMPLIFY : o.simplifyTol;
+    if (simp > 0) lines = linesimplify(lines, simp);
+    if (o.sort) lines = linesort(lines, [0, 0], o.allowReverse !== false);
+    return { lines, before, after: stat(lines) };
+  }
+
+  // -------------------------------------------------------------- placing
+
+  // Page centre becomes 0,0. SVG Y points down and the machine's points up,
+  // so Y is always negated; the two flips are mirrors on top of that.
+  function place(lines, page, o = {}) {
+    const cx = page[0] / 2, cy = page[1] / 2;
+    const scale = o.scale == null ? 1 : o.scale;
+    const sx = o.flipH ? -scale : scale;
+    const sy = o.flipV ? scale : -scale;
+    const ox = o.offsetX || 0, oy = o.offsetY || 0;
+    return lines.map((l) => l.map(([x, y]) => [(x - cx) * sx + ox, (y - cy) * sy + oy]));
+  }
+
+  // ---------------------------------------------------------------- gcode
+
+  const f4 = (v) => (Object.is(v, -0) ? "-0.0000" : v.toFixed(4));   // match Python's {:.4f}
+  const pyFloat = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+
+  function emit(lines, v) {
+    const up = String(Math.round(v.penUp)), down = String(Math.round(v.penDown));
+    const feed = String(Math.round(v.feed)), dwell = pyFloat(Number(v.dwell));
+    const upDwell = Number(v.upDwell) || 0;           // pause after lifting; 0 writes no line
+    const lift = upDwell > 0 ? `M3 S${up}\nG4 P${pyFloat(upDwell)}\n` : `M3 S${up}\n`;
+    const out = [
+      "G90              ; Force Absolute Distance Mode (Critical for WallPlotters)\n" +
+      "G21              ; Force Millimeters Mode\n" +
+      `M3 S${up}\nG4 P${dwell}\n`,
+    ];
+    for (const l of lines) {
+      out.push(`\nG0 F${feed} X${f4(l[0][0])} Y${f4(l[0][1])}\nG4 P${dwell}\nM3 S${down}\nG4 P${dwell}\n`);
+      for (let k = 1; k < l.length; k++) out.push(`G1 X${f4(l[k][0])} Y${f4(l[k][1])}\n`);
+      out.push(lift);
+    }
+    out.push("\nG0 X0.0000 Y0.0000\n");
+    return out.join("");
+  }
+
+  function estimateMinutes(lines, v) {
+    const feed = Number(v.feed) || 2000;
+    const dwell = Number(v.dwell) || 0;
+    const upDwell = Number(v.upDwell) || 0;
+    return (drawLength(lines) + travelLength(lines)) / Math.max(feed, 1e-9) +
+           (lines.length * (2 * dwell + upDwell)) / 60;
+  }
+
+  return { QUANTIZATION, SIMPLIFY, loadTree, parsePath, parseTransform, viewport,
+           optimize, linemerge, linesimplify, linesort, place, emit, estimateMinutes,
+           drawLength, travelLength, bbox, localName };
+})();
+
+if (typeof module !== "undefined") module.exports = WF;
+
+</script>
+<script>
+"use strict";
+(() => {
+  // ------------------------------------------------------- FigUI plugin API
+
+  let msgId = 0;
+  const pending = {};
+
+  function call(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = String(++msgId);
+      pending[id] = { resolve, reject };
+      window.parent.postMessage({ type: "fluid-request", id, method, params: params ?? {} }, "*");
+    });
+  }
+
+  window.addEventListener("message", (e) => {
+    if (e.data && e.data.type === "fluid-response") {
+      const p = pending[e.data.id];
+      if (p) {
+        delete pending[e.data.id];
+        e.data.error ? p.reject(new Error(e.data.error)) : p.resolve(e.data.result);
+      }
+    }
+    // the theme can change under us; the canvas colours are read from CSS
+    if (e.data && e.data.type !== "fluid-response") setTimeout(draw, 0);
+  });
+
+  // --------------------------------------------------------------- settings
+
+  const DEFAULTS = {
+    merge: false, merge_tol: "0.1", sort: false, preserve: false, simplify: "0.01",
+    scale: "100", flip_h: false, flip_v: false, offx: "0", offy: "0",
+    pen_up: "0", pen_down: "80", dwell: "0.2", pen_up_dwell: "0.2", feed: "2300",
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const controls = [...document.querySelectorAll("[data-key]")];
+  let settings = { ...DEFAULTS };
+  let drawing = null, result = [], stats = null, name = "", timer = null;
+  // Axis travel limits ($130/$131), straight from the controller. Used only to
+  // warn when a drawing won't fit - it never changes the gcode.
+  let travel = null;
+
+  const num = (k, fallback) => {
+    const v = parseFloat(String(settings[k]).trim().replace(",", "."));
+    return Number.isFinite(v) ? v : fallback;
+  };
+  // The fields are free text, so clamp before anything reaches the G-code.
+  // A negative dwell or feed is rejected by the controller mid-job, and a value
+  // under 0.001 would be written in exponent form, which no parser accepts.
+  const dwellValue = (v) => Math.max(0, Math.round(v * 1000) / 1000);
+  const values = () => ({
+    penUp: Math.max(0, Math.round(num("pen_up", 0))),
+    penDown: Math.max(0, Math.round(num("pen_down", 80))),
+    dwell: dwellValue(num("dwell", 0.2)),
+    upDwell: dwellValue(num("pen_up_dwell", 0.2)),
+    feed: Math.max(1, Math.round(num("feed", 2300))),
+  });
+
+  function showSettings() {
+    for (const el of controls) {
+      const v = settings[el.dataset.key];
+      if (el.type === "checkbox") el.checked = !!v; else el.value = v;
+    }
+  }
+  const persist = () => call("saveSettings", { data: settings }).catch(() => {});
+
+  // ------------------------------------------------------------------ files
+
+  const toTree = (el) => ({
+    tag: el.localName,
+    attrs: Object.fromEntries([...el.attributes].map((a) => [a.name, a.value])),
+    children: [...el.children].map(toTree),
+  });
+
+  async function readText(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (!bytes.length) throw new Error("This file is empty (0 bytes).");
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      if (typeof DecompressionStream === "undefined")
+        throw new Error("This browser can't open compressed .svgz files. Save it as a plain SVG.");
+      return await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+    }
+    return new TextDecoder().decode(bytes);
+  }
+
+  function loadSVGText(text, fileName) {
+    const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+    if (doc.getElementsByTagName("parsererror").length)
+      throw new Error("This file isn't valid SVG, so it can't be read.");
+    const root = doc.documentElement;
+    if (!root || root.localName !== "svg") throw new Error("This file doesn't contain an SVG drawing.");
+    const d = WF.loadTree(toTree(root));
+    if (!d.lines.length)
+      throw new Error("No drawable lines found. Text and images are skipped - convert text to paths first.");
+    drawing = d;
+    name = (fileName || "drawing.svg").replace(/\.svgz?$/i, "");
+    $("filename").textContent = fileName || "";
+    $("sd_name").value = name + ".gcode";
+    $("status").textContent = "";
+    $("empty").hidden = true;
+    recompute();
+  }
+
+  async function openFile(file) {
+    if (!file) return;
+    try { loadSVGText(await readText(file), file.name); }
+    catch (e) { $("status").textContent = e.message || String(e); }
+  }
+
+  // --------------------------------------------------------------- pipeline
+
+  function recompute() {
+    timer = null;
+    if (!drawing) return;
+    const o = WF.optimize(drawing.lines, {
+      mergeTol: settings.merge ? num("merge_tol", 0.1) : 0,
+      simplifyTol: num("simplify", WF.SIMPLIFY),
+      sort: !!settings.sort,
+      allowReverse: !settings.preserve,
+    });
+    result = WF.place(o.lines, drawing.page, {
+      scale: num("scale", 100) / 100,
+      flipH: !!settings.flip_h, flipV: !!settings.flip_v,
+      offsetX: num("offx", 0), offsetY: num("offy", 0),
+    });
+    stats = o;
+    $("save").disabled = !result.length;
+    invalidateSaved();               // the card still holds the previous G-code
+    draw();
+    report();
+  }
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(recompute, 150); };
+
+  function report() {
+    const [pw, ph] = drawing.page;
+    const [x0, y0, x1, y1] = WF.bbox(result);
+    const n = (v) => v.toLocaleString("en-US");
+    const over = travel && (x0 < -travel[0] / 2 - 1e-6 || x1 > travel[0] / 2 + 1e-6 ||
+                            y0 < -travel[1] / 2 - 1e-6 || y1 > travel[1] / 2 + 1e-6);
+    $("info").textContent =
+      `page  ${pw.toFixed(0)} x ${ph.toFixed(0)} mm\n` +
+      (travel ? `machine  ${travel[0].toFixed(0)} x ${travel[1].toFixed(0)} mm\n` : "") +
+      `${n(stats.after.lines)} lines, ${n(stats.after.points)} points\n` +
+      `draw  ${WF.drawLength(result).toFixed(0)} mm\n` +
+      `travel  ${WF.travelLength(result).toFixed(0)} mm\n` +
+      `X  ${x0.toFixed(1)} .. ${x1.toFixed(1)} mm\n` +
+      `Y  ${y0.toFixed(1)} .. ${y1.toFixed(1)} mm\n` +
+      `about ${WF.estimateMinutes(result, values()).toFixed(1)} min` +
+      (over ? "\n\nDRAWING EXCEEDS THE MACHINE TRAVEL" : "");
+  }
+
+  // ---------------------------------------------------------------- preview
+
+  function draw() {
+    const canvas = $("canvas");
+    const ctx = canvas.getContext && canvas.getContext("2d");
+    if (!ctx || !drawing) return;
+    const css = getComputedStyle(document.documentElement);
+    const color = (name, fallback) => (css.getPropertyValue(name) || "").trim() || fallback;
+    const dpr = window.devicePixelRatio || 1;
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    canvas.width = Math.max(1, Math.round(cw * dpr));
+    canvas.height = Math.max(1, Math.round(ch * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    const [pw, ph] = drawing.page;
+    const hw = pw / 2, hh = ph / 2;
+    const [bx0, by0, bx1, by1] = WF.bbox(result);
+    const minx = Math.min(-hw, bx0), maxx = Math.max(hw, bx1);
+    const miny = Math.min(-hh, by0), maxy = Math.max(hh, by1);
+    const k = Math.min((cw - 24) / Math.max(maxx - minx, 1e-6), (ch - 24) / Math.max(maxy - miny, 1e-6));
+    const mx = (minx + maxx) / 2, my = (miny + maxy) / 2;
+    const X = (x) => cw / 2 + (x - mx) * k;
+    const Y = (y) => ch / 2 - (y - my) * k;
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = color("--border-strong", "#3a4463");
+    ctx.strokeRect(X(-hw), Y(hh), pw * k, ph * k);
+    ctx.strokeStyle = color("--border", "#28304a");
+    ctx.beginPath();
+    ctx.moveTo(X(0) - 8, Y(0)); ctx.lineTo(X(0) + 8, Y(0));
+    ctx.moveTo(X(0), Y(0) - 8); ctx.lineTo(X(0), Y(0) + 8);
+    ctx.stroke();
+
+    if (result.length <= 4000) {
+      ctx.strokeStyle = color("--warn", "#c9a227");
+      ctx.globalAlpha = .45;
+      ctx.beginPath();
+      let pos = [0, 0];
+      for (const l of result) {
+        ctx.moveTo(X(pos[0]), Y(pos[1])); ctx.lineTo(X(l[0][0]), Y(l[0][1]));
+        pos = l[l.length - 1];
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.strokeStyle = color("--text-primary", "#e2e6f4");
+    ctx.beginPath();
+    for (const l of result) {
+      ctx.moveTo(X(l[0][0]), Y(l[0][1]));
+      for (let i = 1; i < l.length; i++) ctx.lineTo(X(l[i][0]), Y(l[i][1]));
+    }
+    ctx.stroke();
+  }
+
+  // ---------------------------------------------------------------- machine
+
+  function machineStatus(text, kind) {
+    const el = $("machine-status");
+    el.textContent = text;
+    el.className = kind || "";
+  }
+
+  function sdPath() {
+    let f = $("sd_name").value.trim().replace(/^\/+/, "").replace(/^sd\//i, "");
+    if (!f) return null;
+    if (!/\.(gcode|nc|gc|g)$/i.test(f)) f += ".gcode";
+    return f;
+  }
+
+  // The path last written to the SD card, or null when what is on the card no
+  // longer matches the preview. Start Job is only enabled while this is set.
+  let savedPath = null;
+
+  function invalidateSaved() {
+    savedPath = null;
+    armed = null;
+    if ($("run")) { $("run").disabled = true; $("run").textContent = "Start Job"; }
+  }
+
+  async function save() {
+    const file = sdPath();
+    if (!result.length || !file) return;
+    const content = WF.emit(result, values());
+    machineStatus(`Saving ${file}...`);
+    $("save").disabled = true;
+    try {
+      await call("writeFile", { path: "/sd/" + file, content, fs: "sd" });
+      $("sd_name").value = file;
+      savedPath = file;
+      $("run").disabled = false;
+      machineStatus(`Saved ${file} (${content.length.toLocaleString("en-US")} bytes) to the SD card.`, "good");
+    } catch (e) {
+      machineStatus(`Couldn't save: ${e.message || e}`, "bad");
+    } finally {
+      $("save").disabled = !result.length;
+    }
+  }
+
+  // Two-step rather than a dialog: sandboxed plugins can't open modals.
+  let armed = null;
+  function startJob() {
+    const file = savedPath;          // never sdPath(): the field can have moved on
+    if (!file) return;
+    if (armed !== file) {
+      armed = file;
+      $("run").textContent = "Confirm - start drawing";
+      machineStatus("The machine will start moving. Click again to confirm.", "bad");
+      setTimeout(() => {
+        if (armed === file) { armed = null; $("run").textContent = "Start Job"; machineStatus(""); }
+      }, 4000);
+      return;
+    }
+    armed = null;
+    $("run").textContent = "Start Job";
+    call("sendCommand", { command: "$SD/Run=/" + file })
+      .then(() => machineStatus(`Started ${file}.`, "good"))
+      .catch((e) => machineStatus(`Couldn't start: ${e.message || e}`, "bad"));
+  }
+
+  function pen(which) {
+    const v = which === "up" ? values().penUp : values().penDown;
+    call("sendCommand", { command: `M3 S${v}` })
+      .then(() => machineStatus(`Pen ${which}: M3 S${v}`))
+      .catch((e) => machineStatus(`Couldn't send: ${e.message || e}`, "bad"));
+  }
+
+  // ----------------------------------------------------------------- wiring
+
+  for (const el of controls) {
+    const key = el.dataset.key;
+    if (el.type === "checkbox") {
+      el.addEventListener("change", () => { settings[key] = el.checked; persist(); schedule(); });
+    } else {
+      el.addEventListener("input", () => { settings[key] = el.value; persist(); schedule(); });
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter") recompute(); });
+    }
+  }
+  $("open").addEventListener("click", () => $("file").click());
+  $("file").addEventListener("change", (e) => { openFile(e.target.files[0]); e.target.value = ""; });
+  $("sd_name").addEventListener("input", invalidateSaved);
+  $("save").addEventListener("click", save);
+  $("run").addEventListener("click", startJob);
+  $("pen-up-btn").addEventListener("click", () => pen("up"));
+  $("pen-down-btn").addEventListener("click", () => pen("down"));
+  $("reset").addEventListener("click", () => {
+    settings = { ...DEFAULTS }; persist(); showSettings(); recompute();
+  });
+
+  const wrap = $("wrap");
+  window.addEventListener("dragover", (e) => { e.preventDefault(); wrap.classList.add("drag"); });
+  window.addEventListener("dragleave", (e) => { if (!e.relatedTarget) wrap.classList.remove("drag"); });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault(); wrap.classList.remove("drag");
+    openFile(e.dataTransfer && e.dataTransfer.files[0]);
+  });
+  if (typeof ResizeObserver !== "undefined") new ResizeObserver(() => draw()).observe(wrap);
+
+  // settings live on the controller, so they follow the machine
+  call("getSettings").then((saved) => {
+    if (saved && typeof saved === "object")
+      for (const k of Object.keys(DEFAULTS)) if (k in saved) settings[k] = saved[k];
+    showSettings();
+    if (drawing) recompute();
+  }).catch(() => showSettings());
+
+  // travel limits straight from the controller
+  call("getMachineSettings").then((s) => {
+    const x = Number(s && s.maxTravelX), y = Number(s && s.maxTravelY);
+    if (Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0) {
+      travel = [x, y];
+      if (drawing) report();
+    }
+  }).catch(() => {});
+
+  window.wallflower = { loadSVGText, gcode: () => WF.emit(result, values()),
+                        info: () => $("info").textContent, settings: () => settings };
+})();
+</script>
+</body>
+</html>

@@ -45,6 +45,7 @@ The DRO displays live axis positions in both work coordinates (WPos) and machine
 
 - Zero any axis independently or all at once
 - "Go to zero" buttons for each axis
+- Tap an axis readout to enter a coordinate using your device’s keyboard, or the compact numpad in tablet mode. **Set** assigns the current position that work coordinate; **Go** moves the axis at its jog feed rate.
 - Home all axes or individual axes
 - Live feed rate and spindle RPM display
 
@@ -64,6 +65,8 @@ Keyboard jogging is supported: arrow keys for X/Y, `+`/`-` for Z. Feed rates for
 ### G-Code Viewer
 
 A 3D toolpath viewer renders the loaded G-code file using WebGL. It provides a spatial overview of the job before and during execution.
+
+Controller file previews and their work offsets are saved in IndexedDB. Reloading during a running or held job restores the matching preview from this browser without reading the file from the controller. The cache keeps the last prepared and last running file for each controller; successful uploads are included. Restored previews show a **Cached** label. Use the same browser and controller address, and prepare the file at least once before running it. Edits, replacements, renames, and deletions through FigUI invalidate saved copies; changes made elsewhere cannot be verified during a job.
 
 > [!Info]
 > For very large G-code files, toolhead progress tracking is intentionally disabled. Rendering a live toolhead position on a dense toolpath is expensive and may degrade responsiveness.
@@ -104,6 +107,8 @@ The file manager gives access to both the SD card and the ESP32 internal filesys
 ### Code Editor
 
 Text files stored on the controller can be opened and edited directly in the browser. The editor includes syntax highlighting and saves changes back to the controller filesystem.
+
+Config Studio, the visual YAML editor, is available on desktops and tablets; phones use YAML view. Open it from Settings → Machine Config to choose a YAML file from Internal storage. It downloads from GitHub Pages when first opened. After a successful download, the browser caches that Studio build for offline use on the same controller address. Clearing browser storage, changing browsers or controller addresses, or installing firmware that needs a different Studio build requires another download. Code view and config validation remain part of the controller UI.
 
 ---
 
@@ -184,6 +189,10 @@ npm run build:esp32
 ```
 
 The `dist/` directory contains the static index.html.gz file you can upload to the internal filesystem of the ESP32. Simply refresh the page to show changes.
+
+Config Studio is built separately with `npm run build:studio`. Production UI builds reference an exact Studio build under `config-studio/<build-id>/` on GitHub Pages; deploy those assets before distributing a custom firmware build. Both Pages workflows build Studio and restore previously published versions through `scripts/prepare-config-studio-pages.mjs`, so older controllers continue to work. The archive is retained as `config-studio/archive.json.gz`; restoration failures stop deployment instead of silently deleting old builds. Keep the build input list in `scripts/config-studio-build-id.mjs` current when adding Studio dependencies.
+
+For local development, `npm run dev` loads Studio from the local source when opened. Run `npm run test:config` and `npm run test:studio` to check config compatibility, remote loading, offline caching, retries, and asset preservation.
 
 ---
 

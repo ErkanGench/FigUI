@@ -12,6 +12,8 @@ export function parseStatusReport(raw: string, options: ParseStatusOptions = {})
 
   const stateParts = parts[0].split(':')
   status.state = stateParts[0] as MachineState
+  status.holdComplete = stateParts[0] === 'Hold' && stateParts[1] === '0'
+    ? true : stateParts[0] === 'Hold' && stateParts[1] === '1' ? false : undefined
   if (stateParts[0] === 'Alarm' && stateParts[1]) {
     status.alarmCode = parseInt(stateParts[1], 10)
   } else if (stateParts[0] !== 'Alarm') {
@@ -20,7 +22,7 @@ export function parseStatusReport(raw: string, options: ParseStatusOptions = {})
 
   status.feed = 0
   status.spindle = 0
-  // FluidNC leaves Pn: out once no pin is active.
+  // Pn is omitted when no inputs are active, including when block mode is off.
   status.pinState = ''
 
   const linearScale = options.reportInches ? MM_PER_INCH : 1
@@ -85,14 +87,27 @@ function parsePos(str: string, linearScale = 1): Position {
   }
 }
 
+// [ESP800]json=yes wraps the same fields the legacy "FW version:... #
+// FW target:... # ..." plain-text response carried in {cmd,status,data}
+// instead -- see WifiConfig.cpp's showFwInfoJSON()/wasm/FwInfo.cpp. Field
+// names change shape too (e.g. "webcommunication:Sync:81:127.0.0.1"
+// becomes separate WebCommunication/WebSocketPort/WebSocketIP fields, and
+// "authentication:yes" becomes "Authentication":"Enabled") -- see
+// App.tsx's resolveWsHost(), the only real consumer, for how those are
+// read now.
 export function parseESP800(raw: string): Record<string, string> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return {}
+  }
+  const data = (parsed as { data?: Record<string, unknown> })?.data
+  if (!data) return {}
   const result: Record<string, string> = {}
-  raw.split('#').forEach(part => {
-    const idx = part.indexOf(':')
-    if (idx > -1) {
-      result[part.slice(0, idx).trim()] = part.slice(idx + 1).trim()
-    }
-  })
+  for (const [key, value] of Object.entries(data)) {
+    result[key] = String(value)
+  }
   return result
 }
 
@@ -169,7 +184,11 @@ export function parseGcStateLine(line: string): Partial<MachineStatus> | null {
 
   if (modal.has('M5')) {
     result.spindleRunning = false
-    result.spindle = spindleValue ?? 0
+    // The S word is retained under M5 (e.g. after M3 S12000; M5). Copying it
+    // here made the 2 s $G poll fight the 500 ms FS: status poll — the DRO
+    // flapped between 0 and the stale commanded speed. The spindle is off
+    // under M5, so report 0.
+    result.spindle = 0
   } else if (modal.has('M3') || modal.has('M4')) {
     result.spindleRunning = true
     if (spindleValue != null) result.spindle = spindleValue
@@ -189,6 +208,9 @@ const CONTROLLER_SETTING_MAP: Record<string, keyof ControllerSettings> = {
   '110': 'maxRateX',
   '111': 'maxRateY',
   '112': 'maxRateZ',
+  '113': 'maxRateA',
+  '114': 'maxRateB',
+  '115': 'maxRateC',
   '120': 'accelX',
   '121': 'accelY',
   '122': 'accelZ',
@@ -210,7 +232,7 @@ export function parseControllerSettingLine(line: string): Partial<ControllerSett
     return flag === undefined ? null : { laserMode: flag }
   }
 
-  const match = line.match(/^\$(11|23|30|31|100|101|102|110|111|112|120|121|122|130|131|132)=(-?\d+(?:\.\d+)?)(?:\s|$)/)
+  const match = line.match(/^\$(11|23|30|31|100|101|102|110|111|112|113|114|115|120|121|122|130|131|132)=(-?\d+(?:\.\d+)?)(?:\s|$)/)
   if (!match) return null
 
   const value = Number.parseFloat(match[2])

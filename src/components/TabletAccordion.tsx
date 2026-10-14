@@ -12,6 +12,7 @@ import { OverridesPanel, SpindlePanel } from './JogPad'
 import { PluginLauncher } from './PluginLauncher'
 import type { Plugin } from '../types'
 import { useMachineStore } from '../store'
+import { useSingleBlockStore } from '../store/singleBlock'
 import {
   buildFullTabletTabs,
   buildLandscapeAccordionTabs,
@@ -35,6 +36,11 @@ export function TabletAccordion({
   variant = 'default',
 }: TabletAccordionProps) {
   const [expanded, setExpanded] = useState<'visualizer' | 'program' | 'controls'>('visualizer')
+  useEffect(() => {
+    const showFiles = () => setExpanded('visualizer')
+    window.addEventListener('config:show-studio', showFiles)
+    return () => window.removeEventListener('config:show-studio', showFiles)
+  }, [])
   const compactTabContentHeight = useCompactLandscapeTabContentHeight()
   const isPortrait = useIsPortrait()
   const spindleMax = useMachineStore(s => s.controllerSettings.spindleMax)
@@ -46,8 +52,9 @@ export function TabletAccordion({
   const hasProbingInput = Boolean(reportedHasProbe || reportedHasToolsetter)
   const hasManualATC = useMachineStore(s => s.controllerSettings.hasManualATC === true)
   const status = useMachineStore(s => s.status)
+  const pendingBlock = useSingleBlockStore(s => s.pendingBlock)
   const isProgramRunning = (status.state === 'Run' || status.state === 'Hold')
-    && (!!status.sdFilename || status.plannerLineNumber != null)
+    && (!!status.sdFilename || status.plannerLineNumber != null || !!pendingBlock)
 
   const landscapeTabs = useMemo(
     () => buildLandscapeAccordionTabs(hasProbingInput, hasManualATC),
@@ -102,7 +109,7 @@ export function TabletAccordion({
 
       <div className="portrait:flex landscape:hidden flex-col gap-3">
         {isProgramRunning && <ProgramExecutionPanel isTablet />}
-        <TabletTabbedPanel
+        {isPortrait && <TabletTabbedPanel
           tabs={fullTabs}
           activeTab={tabletTab}
           onTabChange={setTabletTab}
@@ -111,7 +118,7 @@ export function TabletAccordion({
           hasSpindle={hasSpindle}
           hasManualATC={hasManualATC}
           portraitMinHeight
-        />
+        />}
       </div>
 
       <div className="landscape:flex portrait:hidden flex-col gap-3 flex-1 min-h-0 overflow-hidden">
@@ -152,7 +159,7 @@ export function TabletAccordion({
                 <div className={`h-full flex flex-col gap-3 p-3 overflow-y-auto ${tabletTab !== 'viewer' ? 'hidden' : ''}`}>
                   <GCodeViewer className="flex-1 min-h-[300px]" isTablet fitToViewSignal={expanded === 'visualizer'} />
                 </div>
-                {tabletTab === 'files' && <FileManager isTablet />}
+                {!isPortrait && tabletTab === 'files' && <FileManager isTablet />}
                 {tabletTab === 'macros' && <Macros isTablet />}
                 {tabletTab === 'tooling' && hasManualATC && (
                   <div className="h-full overflow-y-auto p-3"><ManualATCPanel isTablet embedded /></div>

@@ -4,9 +4,11 @@ import { useGCodeStore } from './store/gcode'
 import { useGCodeSenderStore } from './store/gcodeSender'
 import { useTerminalStore } from './store/terminal'
 import { connect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from './lib/ws'
-import { setBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg } from './lib/http'
+import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, WebUIBlockedError } from './lib/http'
+import { isWasmBridgeActive, WASM_BRIDGE_BASE } from './wasmBridge/shimTransport'
 import { parseESP800 } from './lib/parser'
-import { prefetchControllerConfigSettings } from './lib/controllerConfig'
+import { loadControllerConfigSettings } from './lib/controllerConfig'
+import { scheduleControllerStartup } from './lib/controllerResources'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from './lib/updateCheck'
 import { startWatchdog, stopWatchdog } from './lib/jogWatchdog'
 import { playJobSound, prepareJobSoundOnFirstGesture } from './lib/jobSound'
@@ -22,6 +24,7 @@ import { Macros } from './components/Macros'
 import { SettingsPanel } from './components/SettingsPanel'
 import { AboutModal } from './components/AboutModal'
 import { JobControl } from './components/JobControl'
+import { WebUIBlocked } from './components/WebUIBlocked'
 import { PluginLauncher } from './components/PluginLauncher'
 import { WifiOff, RefreshCw, Crosshair, Monitor, FolderOpen, TerminalSquare, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 import type { Plugin, Position, SidebarTab, ActiveLayout } from './types'
@@ -29,6 +32,7 @@ import { getEffectiveLayout } from './types'
 import { PluginFrame } from './components/PluginFrame'
 import { DesktopLayout } from './components/DesktopLayout'
 import { ManualATCPrompt } from './components/ManualATCPrompt'
+import { HoldPrompt } from './components/HoldPrompt'
 import { TabletMainShell } from './components/TabletMainShell'
 import { ViewportProvider, useViewportMetrics } from './lib/viewport'
 import type { TabletTabId } from './lib/tabletTabs'
@@ -307,6 +311,8 @@ function ControllerJobTracker() {
 
 function AppContent() {
   const connected = useMachineStore(s => s.connected)
+  const statusReceived = useMachineStore(s => s.statusReceived)
+  const runningFile = useMachineStore(s => s.status.sdFilename)
   const restarting = useMachineStore(s => s.restarting)
   const sidebarTab = useMachineStore(s => s.sidebarTab)
   const layoutMode = useMachineStore(s => s.layoutMode)
@@ -322,6 +328,7 @@ function AppContent() {
   const { isCompactLandscape } = useViewportMetrics()
   const compactLandscapeScroll = isCompactLandscape && activeLayout === 'tablet'
   const loadGCodeFile = useGCodeStore(s => s.loadFile)
+  const restoreRunningFile = useGCodeStore(s => s.restoreRunningFile)
   const senderPhase = useGCodeSenderStore(s => s.phase)
   const senderFileName = useGCodeSenderStore(s => s.fileName)
   const senderError = useGCodeSenderStore(s => s.error)
@@ -332,6 +339,7 @@ function AppContent() {
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const [phase, setPhase]   = useState<Phase>('connecting')
   const [errMsg, setErrMsg] = useState('')
+  const [webUIBlocked, setWebUIBlocked] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const requestSettingsCloseRef = useRef<(() => void) | null>(null)
   const requestSettingsClose = useCallback(() => {
@@ -349,23 +357,30 @@ function AppContent() {
     let firstFrame: number | null = null
     let secondFrame: number | null = null
 
-    const showConfigEditor = () => {
+    const showConfigEditor = (event: Event) => {
+      const studio = event.type === 'config:show-studio'
+      if (studio && window.innerWidth < 768) return
       setFullPlugin(null)
+      setWorkspacePlugin(null)
+      setControlsPlugin(null)
       setSidebarTab('files')
       setMobilePanel('right')
+      setTabletTab('files')
 
-      // FileManager only exists while the mobile Files panel is visible.
+      // FileManager only exists while the Files panel is visible.
       // Dispatch once it has mounted and installed its event listener.
       firstFrame = requestAnimationFrame(() => {
         secondFrame = requestAnimationFrame(() => {
-          window.dispatchEvent(new CustomEvent('files:open-config-editor'))
+          window.dispatchEvent(new CustomEvent(studio ? 'config:open-studio' : 'files:open-config-editor'))
         })
       })
     }
 
     window.addEventListener('files:show-config-editor', showConfigEditor)
+    window.addEventListener('config:show-studio', showConfigEditor)
     return () => {
       window.removeEventListener('files:show-config-editor', showConfigEditor)
+      window.removeEventListener('config:show-studio', showConfigEditor)
       if (firstFrame !== null) cancelAnimationFrame(firstFrame)
       if (secondFrame !== null) cancelAnimationFrame(secondFrame)
     }
@@ -394,8 +409,6 @@ function AppContent() {
   const inFlightPromise = useRef<Promise<boolean> | null>(null)
   const backoffMs = useRef(0)
   const stableConnectionTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const startupQueriesSent = useRef(false)
-  const startupQueriesDeferred = useRef(false)
   const cachedWsHost = useRef<string | null>(null)
   const cachedHostFailures = useRef(0)
   const [showReconnectOverlay, setShowReconnectOverlay] = useState(false)
@@ -459,28 +472,29 @@ function AppContent() {
       throw e
     }
     const info = parseESP800(raw)
-    const wsComm = info['webcommunication']?.trim() ?? ''
-    const parts  = wsComm.split(':')
-    const asyncMode = parts[0]?.trim() === 'Async'
-    const wsPort = parts[1]?.trim() ?? '80'
-    const wsIp   = parts[2]?.trim() ?? httpHost.split(':')[0]
+    const asyncMode = info['WebCommunication']?.trim() === 'Asynchronous'
+    const wsPort = info['WebSocketPort']?.trim() || '80'
+    const wsIp   = info['WebSocketIP']?.trim() || httpHost.split(':')[0]
     const wsHost = asyncMode
       ? `${httpHost}/ws`
       : wsPort === '80' ? wsIp : `${wsIp}:${wsPort}`
     cachedWsHost.current = wsHost
     cachedHostFailures.current = 0
     // Only refresh ESP info on a fresh probe.
-    const axes = parseInt(info['axis'] ?? '3', 10)
+    const axes = (info['Axisletters'] ?? '').length
     setEspInfo({
-      version:        info['FW version']?.trim()     ?? '',
-      hostname:       info['hostname']?.trim()        ?? httpHost,
-      authentication: info['authentication']?.trim()  === 'yes',
+      version:        info['FWVersion']?.trim()       ?? '',
+      hostname:       info['HostName']?.trim()         ?? httpHost,
+      authentication: info['Authentication']?.trim()   === 'Enabled',
       asyncMode,
       wsPort:         parseInt(wsPort, 10),
       wsIp,
-      axes:           isNaN(axes) ? 3 : axes,
-      primarySd:      info['primary sd']?.trim()     ?? '/sd/',
-      secondarySd:    info['secondary sd']?.trim()   ?? '/ext/',
+      axes:           axes || 3,
+      // No JSON equivalent for these (the legacy plain-text response's
+      // "primary sd"/"secondary sd" fields) -- same defaults the old
+      // parse already fell back to whenever they were absent/unparseable.
+      primarySd:      '/sd/',
+      secondarySd:    '/ext/',
     })
     return { wsHost, info }
   }
@@ -490,7 +504,9 @@ function AppContent() {
     const p = (async () => {
       try {
         const httpHost = window.location.host
-        setBase(`http://${httpHost}`)
+        // The page's own origin, so an https page (e.g. the wasm demo) does
+        // not make http requests, which the browser blocks as mixed content
+        setBase(isWasmBridgeActive() ? WASM_BRIDGE_BASE : window.location.origin)
         const { wsHost } = await resolveWsHost(httpHost)
         await connect(wsHost)
         cachedHostFailures.current = 0
@@ -499,6 +515,7 @@ function AppContent() {
         cachedHostFailures.current++
         if (phase !== 'ready') {
           setErrMsg(e instanceof Error ? e.message : 'Connection failed')
+          setWebUIBlocked(e instanceof WebUIBlockedError)
         }
         return false
       } finally {
@@ -507,18 +524,6 @@ function AppContent() {
     })()
     inFlightPromise.current = p
     return p
-  }
-
-  function runStartupQueries() {
-    startupQueriesSent.current = true
-    startupQueriesDeferred.current = false
-    setStartupPending(true)
-    sendStartupQueries()
-      .finally(() => {
-        setStartupPending(false)
-        prefetchControllerConfigSettings()
-        window.setTimeout(() => prefetchInternalFiles(), 1000)
-      })
   }
 
   function scheduleReconnect() {
@@ -565,14 +570,6 @@ function AppContent() {
         stableConnectionTimer.current = null
         backoffMs.current = 0
       }, 10_000)
-      // What these queries report cannot change during a job, and FluidNC
-      // refuses them in motion or runs them on the task feeding the job. On a
-      // reconnect mid-job, send them once the job has ended.
-      if (startupQueriesSent.current && useGCodeStore.getState().trackedJob) {
-        startupQueriesDeferred.current = true
-      } else {
-        runStartupQueries()
-      }
     } else {
       setStartupPending(false)
       if (stableConnectionTimer.current) {
@@ -594,11 +591,24 @@ function AppContent() {
     }
   }, [connected, phase])
 
+  const macrosLoaded = useRef(false)
   useEffect(() => {
-    if (activeJobSource || !connected || phase !== 'ready' || !startupQueriesDeferred.current) return
-    runStartupQueries()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeJobSource, connected, phase])
+    if (phase !== 'ready' || !connected) return
+    return scheduleControllerStartup(async canContinue => {
+      if (!await sendStartupQueries(canContinue)) return false
+      await loadControllerConfigSettings().catch(() => {})
+      if (!canContinue()) return false
+      if (!macrosLoaded.current) {
+        const data = await loadMacroCfg()
+        if (!canContinue()) return false
+        if (data.length > 0) setMacros(data)
+        macrosLoaded.current = true
+      }
+      if (!canContinue()) return false
+      await prefetchInternalFiles()
+      return canContinue()
+    }, setStartupPending)
+  }, [connected, phase, setMacros, setStartupPending])
 
   // After the first connect failed, keep retrying with backoff, and leave the
   // error screen as soon as any attempt (also one from kick()) gets through.
@@ -631,47 +641,33 @@ function AppContent() {
 
   useEffect(() => {
     if (!connected) return
-    const errors: string[] = []
-    let done = false
-    let fallbackTimer: ReturnType<typeof setTimeout>
+    let errors: string[] = []
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
 
     const finish = () => {
-      if (done) return
-      done = true
-      unsub()
-      clearTimeout(fallbackTimer)
+      if (fallbackTimer !== null) clearTimeout(fallbackTimer)
+      fallbackTimer = null
       if (errors.length > 0) {
         setStartupErrors(errors)
         setStartupErrorsOpen(true)
+        errors = []
       }
     }
 
     const unsub = onLine((line: string) => {
-      if (done) return
       if (line.includes('[MSG:ERR:') && line.includes('Configuration error')) {
         errors.push(line)
+        if (fallbackTimer === null) fallbackTimer = setTimeout(finish, 5000)
       } else if (line === 'ok' || line.startsWith('error:')) {
         finish()
       }
     })
 
-    fallbackTimer = setTimeout(finish, 5000)
-
     return () => {
-      done = true
       unsub()
-      clearTimeout(fallbackTimer)
+      if (fallbackTimer !== null) clearTimeout(fallbackTimer)
     }
   }, [connected])
-
-  const macrosLoaded = useRef(false)
-  useEffect(() => {
-    if (!connected || macrosLoaded.current) return
-    macrosLoaded.current = true
-    loadMacroCfg()
-      .then(data => { if (data.length > 0) setMacros(data) })
-      .catch(() => { macrosLoaded.current = false })
-  }, [connected]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Debounce the "Reconnecting…" overlay so transient drops don't flash it.
   useEffect(() => {
@@ -715,6 +711,7 @@ function AppContent() {
   async function retryFromError() {
     setPhase('connecting')
     setErrMsg('')
+    setWebUIBlocked(false)
     backoffMs.current = 0
     cachedWsHost.current = null
     cachedHostFailures.current = 0
@@ -740,6 +737,10 @@ function AppContent() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [settingsOpen, requestSettingsClose])
+
+  useEffect(() => {
+    if (connected && statusReceived && runningFile) void restoreRunningFile(runningFile)
+  }, [connected, statusReceived, runningFile, restoreRunningFile])
 
   // On mobile/tablet, switch to the viewer when a file is selected; also kick off
   // the single shared download via the gcode store.
@@ -774,6 +775,9 @@ function AppContent() {
   }
 
   if (phase === 'error') {
+    if (webUIBlocked) {
+      return <WebUIBlocked base={getBase()} onReload={retryFromError} />
+    }
     return (
       <div className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-[var(--bg)]">
         <WifiOff size={28} className="text-danger" />
@@ -862,6 +866,7 @@ function AppContent() {
       />
 
       <ManualATCPrompt />
+      <HoldPrompt />
 
       {fullPlugin && (
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden p-3">

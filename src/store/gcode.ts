@@ -11,6 +11,9 @@ import { useMachineStore } from '../store'
 import { encodeFilePath, getBase, sendCommand } from '../lib/http'
 import { MM_PER_INCH } from '../lib/units'
 import { sendRaw } from '../lib/ws'
+import { controllerPathsMatch, controllerRunCommand } from '../lib/controllerFiles'
+import { canLoadControllerResources } from '../lib/controllerResources'
+import { cachePreparedGCode, getCachedRunningGCode } from '../lib/gcodeCache'
 import {
   buildRenderLinesAsync,
   buildStatic2DPathsAsync,
@@ -51,6 +54,7 @@ interface GCodeStore {
   loadedPath: string | null
   fileName: string | null
   sourceText: string | null
+  restoredFromCache: boolean
   restartSource: {
     path: string | null
     fileName: string
@@ -99,6 +103,7 @@ interface GCodeStore {
     path?: string | null,
     restartSource?: GCodeStore['restartSource'],
   ) => Promise<void>
+  restoreRunningFile: (path: string) => Promise<void>
   cancelAndStartJob: (path: string) => boolean
   startTrackedJob: (source: TrackedJobSource, resumed?: { startedAt: number; adopted: boolean }) => void
   finishTrackedJob: (source: TrackedJobSource) => void
@@ -109,12 +114,13 @@ interface GCodeStore {
   setShowRapids: (v: boolean) => void
   setActiveSourceLine: (line: number | null) => void
   beginSdUpload: (path: string) => void
-  completeSdUpload: (path: string) => void
+  completeSdUpload: (path: string) => Promise<void>
   failSdUpload: (path: string) => void
   clear: () => void
 }
 
 
+let loadedParseOptions: ParseGCodeOptions = {}
 let activeLoadPath: string | null = null
 let loadRequestId = 0
 let abortController: AbortController | null = null
@@ -129,7 +135,7 @@ function isLoadBlockedByMachineState() {
   const state = machine.status.state
   // A browser stream reports Idle whenever the planner drains (each M5/M4
   // pair), so the machine state alone does not show it is running.
-  return machine.connected && (state === 'Run' || state === 'Hold')
+  return machine.connected && (!!machine.status.sdFilename || !machine.statusReceived || state === 'Run' || state === 'Hold' || state === 'Door')
     || useGCodeStore.getState().trackedJob?.source === 'local'
 }
 
@@ -199,7 +205,7 @@ async function getParseOptions(text: string): Promise<ParseGCodeOptions> {
   // Only programs that select a work offset need the controller's table. The
   // preview must not wait on the controller otherwise: a $# request that got
   // no answer left a phone's preview stuck at 5%.
-  if (machine.connected && /G\s*5[4-9]/i.test(text)) {
+  if (canLoadControllerResources(machine) && /G\s*5[4-9]/i.test(text)) {
     try {
       const linearScale = machine.controllerSettings.reportInches ? MM_PER_INCH : 1
       const response = await withTimeout(sendCommand('$#', WORK_OFFSET_QUERY_TIMEOUT_MS), WORK_OFFSET_QUERY_TIMEOUT_MS)
@@ -240,8 +246,9 @@ async function buildPreview(
   text: string,
   onProgress: (progress: number) => void,
   shouldContinue: () => boolean,
+  savedOptions?: ParseGCodeOptions,
 ) {
-  const parseOptions = await getParseOptions(text)
+  const parseOptions = savedOptions ?? await getParseOptions(text)
   if (!shouldContinue()) throw new Error('stale-load')
 
   let lastProgress = -1
@@ -256,13 +263,111 @@ async function buildPreview(
   const model = await parseGCodeAsync(text, parseOptions, fraction => report(5 + fraction * 55), shouldContinue)
   const renderLines = await buildRenderLinesAsync(model.segments, progress => report(60 + progress * 0.2), shouldContinue)
   const paths2D = await buildStatic2DPathsAsync(renderLines, progress => report(80 + progress * 0.2), shouldContinue)
-  return { model, renderLines, paths2D }
+  return { model, renderLines, paths2D, parseOptions }
+}
+
+async function loadTextPreview(
+  text: string,
+  name: string,
+  path: string | null,
+  restartSource: GCodeStore['restartSource'],
+  savedOptions?: ParseGCodeOptions,
+  canContinue = () => true,
+) {
+  const { setState: set, getState: get } = useGCodeStore
+  const controller = getBase()
+  set({ finishedJobElapsedMs: null, interruptedJob: null })
+  abortInFlight()
+  const requestId = ++loadRequestId
+  const current = () => requestId === loadRequestId && canContinue()
+
+  set({
+    loading: true,
+    loadError: null,
+    restoredFromCache: savedOptions !== undefined,
+    pendingPath: null,
+    pendingFileName: name,
+    downloadProgress: 100,
+    isProcessing2D: true,
+    processing2DProgress: 5,
+    isProcessing3D: false,
+    processing3DProgress: 0,
+    is3DReady: false,
+    geometry3D: null,
+    paths2D: null,
+    activeSourceLine: null,
+  })
+
+  try {
+    await yieldToEventLoop()
+    const preview = await buildPreview(
+      text,
+      progress => {
+        if (current()) set({ processing2DProgress: progress })
+      },
+      current,
+      savedOptions,
+    )
+    if (!current()) return
+
+    if (path && !savedOptions && !restartSource && get().sdUploadPath !== path) {
+      await cachePreparedGCode(controller, { path, fileName: name, text, parseOptions: preview.parseOptions })
+      if (!current()) return
+    }
+    loadedParseOptions = preview.parseOptions
+    set({
+      restoredFromCache: savedOptions !== undefined,
+      model: preview.model,
+      renderLines: preview.renderLines,
+      paths2D: preview.paths2D,
+      fileName: name,
+      loadedPath: path,
+      sourceText: text,
+      restartSource,
+      processing2DProgress: 100,
+      isProcessing2D: false,
+      loading: false,
+      pendingPath: null,
+      pendingFileName: null,
+      isProcessing3D: true,
+      processing3DProgress: 0,
+    })
+
+    await yieldToEventLoop()
+    if (!current()) return
+    const showRapids = get().showRapids
+    const built3DGeometry = buildStatic3DGeometry(preview.renderLines, showRapids)
+
+    set({
+      geometry3D: { ...built3DGeometry, showRapids },
+      processing3DProgress: 100,
+      isProcessing3D: false,
+      is3DReady: true,
+    })
+  } catch (e) {
+    if (requestId === loadRequestId && (!(e instanceof Error) || e.message !== 'stale-load')) {
+      console.error('Failed to load G-code from text:', e)
+      set({ ...NO_PREVIEW, loadError: loadErrorMessage(name, e) })
+    }
+  } finally {
+    if (requestId === loadRequestId) {
+      set({
+        loading: false,
+        pendingPath: null,
+        pendingFileName: null,
+        isProcessing2D: false,
+        isProcessing3D: false,
+        is3DReady: get().geometry3D !== null,
+      })
+    }
+  }
 }
 
 export const useGCodeStore = create<GCodeStore>((set, get) => ({
   loadedPath: null,
   fileName: null,
   sourceText: null,
+  restoredFromCache: false,
   restartSource: null,
   activeSourceLine: null,
   model: null,
@@ -293,6 +398,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     set({ finishedJobElapsedMs: null, interruptedJob: null })
     abortInFlight()
     activeLoadPath = path
+    const controller = getBase()
     const requestId = ++loadRequestId
 
     set({
@@ -312,9 +418,9 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     })
 
     try {
-      const url = `${getBase()}${encodeFilePath(path)}`
+      const url = `${controller}${encodeFilePath(path)}`
       abortController = new AbortController()
-      const res = await fetch(url, { signal: abortController.signal })
+      const res = await fetch(url, { signal: abortController.signal, cache: 'no-store' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
 
       const contentLength = Number(res.headers.get('content-length') ?? '0')
@@ -367,7 +473,11 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       if (requestId !== loadRequestId) return
 
       const fileName = path.split('/').pop() ?? path
+      await cachePreparedGCode(controller, { path, fileName, text, parseOptions: preview.parseOptions })
+      if (requestId !== loadRequestId) return
+      loadedParseOptions = preview.parseOptions
       set({
+        restoredFromCache: false,
         model: preview.model,
         renderLines: preview.renderLines,
         paths2D: preview.paths2D,
@@ -421,85 +531,31 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     }
   },
 
-  loadFromText: async (text: string, name: string, path = null, restartSource = null) => {
+  loadFromText: async (text, name, path = null, restartSource = null) => {
     if (isLoadBlockedByMachineState()) return
-    set({ finishedJobElapsedMs: null, interruptedJob: null })
-    abortInFlight()
-    const requestId = ++loadRequestId
+    await loadTextPreview(text, name, path, restartSource)
+  },
 
-    set({
-      loading: true,
-      loadError: null,
-      pendingPath: null,
-      pendingFileName: name,
-      downloadProgress: 100,
-      isProcessing2D: true,
-      processing2DProgress: 5,
-      isProcessing3D: false,
-      processing3DProgress: 0,
-      is3DReady: false,
-      geometry3D: null,
-      paths2D: null,
-      activeSourceLine: null,
-    })
-
-    try {
-      await yieldToEventLoop()
-      const preview = await buildPreview(
-        text,
-        progress => {
-          if (requestId === loadRequestId) set({ processing2DProgress: progress })
-        },
-        () => requestId === loadRequestId,
-      )
-      if (requestId !== loadRequestId) return
-
-      set({
-        model: preview.model,
-        renderLines: preview.renderLines,
-        paths2D: preview.paths2D,
-        fileName: name,
-        loadedPath: path,
-        sourceText: text,
-        restartSource,
-        processing2DProgress: 100,
-        isProcessing2D: false,
-        loading: false,
-        pendingFileName: null,
-        isProcessing3D: true,
-        processing3DProgress: 0,
-      })
-
-      await yieldToEventLoop()
-      if (requestId !== loadRequestId) return
-      const showRapids = get().showRapids
-      const built3DGeometry = buildStatic3DGeometry(preview.renderLines, showRapids)
-
-      set({
-        geometry3D: { ...built3DGeometry, showRapids },
-        processing3DProgress: 100,
-        isProcessing3D: false,
-        is3DReady: true,
-      })
-    } catch (e) {
-      if (requestId === loadRequestId && (!(e instanceof Error) || e.message !== 'stale-load')) {
-        console.error('Failed to load G-code from text:', e)
-        set({ ...NO_PREVIEW, loadError: loadErrorMessage(name, e) })
-      }
-    } finally {
-      if (requestId === loadRequestId) {
-        set({
-          loading: false,
-          pendingFileName: null,
-          isProcessing2D: false,
-          isProcessing3D: false,
-          is3DReady: get().geometry3D !== null,
-        })
-      }
+  restoreRunningFile: async path => {
+    const controller = getBase()
+    const requestId = loadRequestId
+    const stillRunning = () => {
+      const machine = useMachineStore.getState()
+      return machine.connected && machine.statusReceived && machine.status.sdFilename === path && getBase() === controller
     }
+    if (!stillRunning() || get().loading) return
+    // Start without preview deliberately leaves only the path in this session.
+    // A fresh page has no such marker and can still restore the saved copy.
+    const loadedPath = get().loadedPath
+    if (loadedPath && controllerPathsMatch(path, loadedPath) && get().sourceText === null) return
+    const file = await getCachedRunningGCode(controller, path)
+    if (!file || !stillRunning() || requestId !== loadRequestId || get().loading) return
+    if (get().model && get().sourceText === file.text && get().loadedPath === file.path) return
+    await loadTextPreview(file.text, file.fileName, file.path, null, file.parseOptions, stillRunning)
   },
 
   cancelAndStartJob: (path: string) => {
+    if (isLoadBlockedByMachineState()) return false
     // Stop any in-flight download immediately. The ESP32 must not be serving a
     set({ finishedJobElapsedMs: null, interruptedJob: null })
     abortInFlight()
@@ -510,11 +566,12 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       isProcessing2D: false,
       isProcessing3D: false,
       downloadProgress: null,
-      // Mark this path as the loaded one so the SD-job-start auto-load doesn't
+      // Mark this path as loaded so controller-job tracking doesn't
       // re-fetch it. The user explicitly chose to skip the preview.
       loadedPath: path,
       fileName: path.split('/').pop() ?? path,
       sourceText: null,
+      restoredFromCache: false,
       restartSource: null,
       activeSourceLine: null,
       // Drop any partial built data — they're stale now.
@@ -524,16 +581,20 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       geometry3D: null,
       is3DReady: false,
     })
-    return sendRaw(`$SD/Run=${path}`)
+    return sendRaw(controllerRunCommand(path))
   },
 
-  startTrackedJob: (source, resumed) => set({
-    trackedJob: resumed
-      ? { source, startedAt: resumed.startedAt, adopted: resumed.adopted }
-      : { source, startedAt: Date.now() },
-    finishedJobElapsedMs: null,
-    interruptedJob: null,
-  }),
+  startTrackedJob: (source, resumed) => {
+    const path = get().loadedPath
+    if (source === 'controller' && path) void getCachedRunningGCode(getBase(), path)
+    set({
+      trackedJob: resumed
+        ? { source, startedAt: resumed.startedAt, adopted: resumed.adopted }
+        : { source, startedAt: Date.now() },
+      finishedJobElapsedMs: null,
+      interruptedJob: null,
+    })
+  },
 
   finishTrackedJob: source => {
     const trackedJob = get().trackedJob
@@ -591,7 +652,12 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
 
   beginSdUpload: path => set({ sdUploadPath: path }),
 
-  completeSdUpload: path => {
+  completeSdUpload: async path => {
+    const file = get()
+    if (file.sdUploadPath !== path) return
+    if (file.loadedPath === path && file.sourceText !== null && file.model) {
+      await cachePreparedGCode(getBase(), { path, fileName: file.fileName!, text: file.sourceText, parseOptions: loadedParseOptions })
+    }
     if (get().sdUploadPath === path) set({ sdUploadPath: null })
   },
 
@@ -605,6 +671,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
         loadedPath: null,
         fileName: null,
         sourceText: null,
+        restoredFromCache: false,
         restartSource: null,
         activeSourceLine: null,
         model: null,
@@ -633,6 +700,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
       loadedPath: null,
       fileName: null,
       sourceText: null,
+      restoredFromCache: false,
       restartSource: null,
       activeSourceLine: null,
       model: null,

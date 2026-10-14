@@ -27,17 +27,22 @@ import {
   replaceFileContent,
   uploadFirmware,
   getDeviceInfoFast,
+  WebUIBlockedError,
 } from "../lib/http";
 import { useMachineStore } from "../store";
 import type { Theme } from "../store";
 import { useGCodeSenderStore } from "../store/gcodeSender";
 import { useTerminalStore } from "../store/terminal";
 import type { FluidNCSetting } from "../types";
-import { loadControllerConfigSettings } from "../lib/controllerConfig";
 import { playJobSound } from "../lib/jobSound";
 import { parseDecimalInput } from "../lib/numberInput";
 import { useConfirmTap } from "../hooks/useConfirmTap";
+import {
+  loadControllerConfigSettings,
+  updateControllerConfigSetting,
+} from "../lib/controllerConfig";
 import { LimitsTab } from "./LimitsTab";
+import { useViewportMetrics } from "../lib/viewport";
 
 type Setting = FluidNCSetting;
 
@@ -503,7 +508,7 @@ function numericSettingValue(
 function saveErrorText(e: unknown): string {
   if (!(e instanceof Error)) return "Save failed";
   // FluidNC answers 503 to web commands while the machine is moving.
-  if (e.message === "HTTP 503") return "Controller busy: try again when not moving";
+  if (e instanceof WebUIBlockedError || e.message === "HTTP 503") return "Controller busy: try again when not moving";
   return `Save failed: ${e.message}`;
 }
 
@@ -1717,6 +1722,7 @@ export function SettingsPanel({
   onClose,
   onRequestCloseReady,
 }: SettingsPanelProps) {
+  const isMobile = useViewportMetrics().innerWidth < 768;
   const espInfo = useMachineStore((s) => s.espInfo);
   const units = useMachineStore((s) => s.units);
   const setUnits = useMachineStore((s) => s.setUnits);
@@ -1764,16 +1770,13 @@ export function SettingsPanel({
   const [savingConfigFile, setSavingConfigFile] = useState(false);
 
   async function openConfigStudio() {
+    if (window.innerWidth < 768) return;
     const closed = await requestClose();
     if (!closed) return;
     setTimeout(
       () =>
         window.dispatchEvent(
-          new CustomEvent(
-            window.innerWidth < 768
-              ? "files:show-config-editor"
-              : "config:open-studio",
-          ),
+          new CustomEvent("config:show-studio"),
         ),
       0,
     );
@@ -1820,14 +1823,18 @@ export function SettingsPanel({
 
   async function saveSetting(p: string, t: string, v: string) {
     // Always update runtime configuration first
-    const reply = await sendCommand(`[ESP401]P=${p} T=${t} V=${v}`);
+    // FluidNC's V= parser stops at an unescaped space and treats backslash as an escape
+    const escaped = v.replace(/\\/g, "\\\\").replace(/ /g, "\\ ");
+    const reply = await sendCommand(`[ESP401]P=${p} T=${t} V=${escaped}`);
     // FluidNC answers HTTP 200 and puts a refusal in the text ("error:N").
     const rejected = reply.match(/^\s*error\s*:.*$/im);
     if (rejected) throw new Error(`controller refused it (${rejected[0].trim()})`);
 
     const setting = settings.find((s) => s.P === p);
-    const updatedSettings = settings.map((s) =>
-      s.P === p ? { ...s, V: v } : s,
+    const updatedSettings = updateControllerConfigSetting(
+      useMachineStore.getState().controllerConfigSettings ?? settings,
+      p,
+      v,
     );
     setSettings(updatedSettings);
     useMachineStore.getState().setControllerConfigSettings(updatedSettings);
@@ -2206,9 +2213,11 @@ export function SettingsPanel({
                   <button
                     className="btn btn-primary shrink-0 px-3 py-1.5 text-sm"
                     onClick={openConfigStudio}
+                    disabled={isMobile}
+                    title={isMobile ? "Config Studio is available on tablets and desktops" : undefined}
                   >
                     <FileCode2 size={14} />
-                    <span className="sm:hidden">Edit Config</span>
+                    <span className="sm:hidden">Config Studio</span>
                     <span className="hidden sm:inline">Open Config Studio</span>
                   </button>
                 )}

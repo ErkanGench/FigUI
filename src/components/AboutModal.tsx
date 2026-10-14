@@ -3,7 +3,7 @@ import { X, Download, CheckCircle2, AlertCircle, ArrowUp, RefreshCw, Heart } fro
 import fluidncLogo from '../assets/fluidnc-logo.svg'
 import { useMachineStore } from '../store'
 import { useGCodeSenderStore } from '../store/gcodeSender'
-import { uploadFile } from '../lib/http'
+import { uploadFile, uiDir, putUiFile } from '../lib/http'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from '../lib/updateCheck'
 
 const FIRMWARE_URL = 'https://figamore.github.io/FigUI/firmware/index.html.gz'
@@ -246,6 +246,7 @@ const TIPS: Tip[] = [
   },
 ]
 
+/** Display application details, usage tips, release notes, and self-update controls. */
 export function AboutModal({ onClose }: Props) {
   const theme = useMachineStore(s => s.theme)
   const espInfo = useMachineStore(s => s.espInfo)
@@ -326,6 +327,11 @@ export function AboutModal({ onClose }: Props) {
     }
   }
 
+  /**
+   * Download and install FigUI in its own UI directory, or the LocalFS root
+   * when served outside /ui/<name>/, reporting upload progress and errors.
+   * Clear the dismissed and pending update state after a successful upload.
+   */
   async function performUpdate() {
     downloadedBuffer.current = null
     try {
@@ -343,7 +349,10 @@ export function AboutModal({ onClose }: Props) {
       setUpdateState('uploading')
       setUploadProgress(0)
       const file = new File([downloadedBuffer.current], 'index.html.gz', { type: 'application/gzip' })
-      await uploadFile('/', file, 'local', pct => setUploadProgress(pct))
+      // Update this copy of FigUI: under /ui/<name>/, the one in that
+      // directory, not the WebUI on LocalFS
+      if (uiDir) await putUiFile('index.html.gz', file, pct => setUploadProgress(pct))
+      else await uploadFile('/', file, 'local', pct => setUploadProgress(pct))
 
       localStorage.removeItem(DISMISSED_VERSION_KEY)
       setPendingUpdateVersion(null)

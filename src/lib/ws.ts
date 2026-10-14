@@ -391,7 +391,9 @@ export function connect(host: string): Promise<void> {
     const myGen = generation
 
     let ws: WebSocket
-    const url = new URL(host.includes('/') ? `ws://${host}` : `ws://${host}/`)
+    // ws: from https is mixed content. Tests and other non-browser hosts have no location.
+    const scheme = globalThis.location?.protocol === 'https:' ? 'wss' : 'ws'
+    const url = new URL(host.includes('/') ? `${scheme}://${host}` : `${scheme}://${host}/`)
     url.searchParams.set('independent_session', '1')
     try {
       ws = new WebSocket(url.toString(), 'arduino')
@@ -663,7 +665,8 @@ function isManualATCCapabilityLine(line: string) {
 
 // Reports that arrive in a burst (a tab Chrome froze and then resumed) are
 // merged and applied at most once per interval, so a backlog does not cost a
-// full render per report. State changes and local streams stay exact.
+// full render per report. State changes (including a hold completing and the
+// single-block pin) and local streams stay exact.
 const STATUS_APPLY_INTERVAL_MS = 100
 let pendingStatusReport: Partial<MachineStatus> | null = null
 let statusApplyTimer: ReturnType<typeof setTimeout> | null = null
@@ -675,15 +678,20 @@ function flushStatusReport() {
   if (!report) return
   pendingStatusReport = null
   lastStatusAppliedAt = Date.now()
-  useMachineStore.getState().updateStatus(report)
+  const machine = useMachineStore.getState()
+  machine.updateStatus(report)
+  if (!machine.statusReceived) machine.setStatusReceived(true)
 }
 
 function applyStatusReport(report: Partial<MachineStatus>) {
   pendingStatusReport = pendingStatusReport ? { ...pendingStatusReport, ...report } : report
   const sinceLastApply = Date.now() - lastStatusAppliedAt
+  const current = useMachineStore.getState().status
   if (
     responseTrafficSuspensions > 0
-    || report.state !== useMachineStore.getState().status.state
+    || report.state !== current.state
+    || report.holdComplete !== current.holdComplete
+    || report.pinState !== current.pinState
     || sinceLastApply >= STATUS_APPLY_INTERVAL_MS
   ) {
     flushStatusReport()
@@ -987,9 +995,11 @@ export function resumeResponseTraffic() {
 }
 
 
-export async function sendStartupQueries() {
+export async function sendStartupQueries(canContinue: () => boolean = () => true): Promise<boolean> {
+  if (!canContinue()) return false
   try {
     const ssText = await sendCommand('$SS')
+    if (!canContinue()) return false
     const hasMist  = /\[MSG:INFO:\s*Mist coolant/i.test(ssText)
     const hasFlood = /\[MSG:INFO:\s*Flood coolant/i.test(ssText)
     const hasManualATC = ssText.split('\n').some(raw => isManualATCCapabilityLine(raw.trim()))
@@ -1008,8 +1018,10 @@ export async function sendStartupQueries() {
     })
   } catch { /* noop */ }
 
+  if (!canContinue()) return false
   try {
     const settingsText = await sendCommand('$$')
+    if (!canContinue()) return false
     settingsText.split('\n').forEach(raw => {
       const line = raw.trim()
       if (!line) return
@@ -1024,6 +1036,7 @@ export async function sendStartupQueries() {
     // ($Report/Inches is not). Status reports are scaled by $13.
     sendSilentRaw('$$', SETTINGS_QUERY_SILENT_RESPONSE)
   }
+  return canContinue()
 }
 
 export function sendRealtime(byte: number) {

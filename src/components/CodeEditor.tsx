@@ -14,7 +14,8 @@ import {
 import { sendCommand } from "../lib/http";
 import { useMachineStore } from "../store";
 import { useTerminalStore } from "../store/terminal";
-import { ConfigStudio } from "./ConfigStudio";
+import { RemoteConfigStudio } from "./RemoteConfigStudio";
+import { useViewportMetrics } from "../lib/viewport";
 import {
   validateFluidConfigForSave,
   type ConfigIssue,
@@ -302,6 +303,7 @@ export function CodeEditor({
   initialView = "code",
   restoreFromHistory = false,
 }: CodeEditorProps) {
+  const canUseStudio = useViewportMetrics().innerWidth >= 768;
   const editorRef = useRef<HTMLDivElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -328,7 +330,7 @@ export function CodeEditor({
   const [matchIndex, setMatchIndex] = useState(0);
   const [matchCount, setMatchCount] = useState(0);
   const [view, setView] = useState<"studio" | "code">(
-    isYamlFile ? initialView : "code",
+    isYamlFile && canUseStudio ? initialView : "code",
   );
   const [studioSource, setStudioSource] = useState(content);
   const [studioKey, setStudioKey] = useState(0);
@@ -542,6 +544,7 @@ export function CodeEditor({
   );
 
   const switchToStudio = useCallback(() => {
+    if (window.innerWidth < 768) return;
     setStudioSource(currentContent.current);
     setStudioKey((key) => key + 1);
     setView("studio");
@@ -551,6 +554,10 @@ export function CodeEditor({
     jarRef.current?.updateCode(currentContent.current);
     setView("code");
   }, []);
+
+  useEffect(() => {
+    if (!canUseStudio && view === "studio") switchToCode();
+  }, [canUseStudio, view, switchToCode]);
 
   const pushHistoryEntry = useCallback(() => {
     const currentState = window.history.state;
@@ -749,8 +756,10 @@ export function CodeEditor({
             {isYamlFile && (
               <div className="mr-1 flex rounded-md border border-border bg-elevated p-0.5">
                 <button
-                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${view === "studio" ? "bg-surface text-accent shadow-sm" : "text-text-muted"}`}
+                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:opacity-40 ${view === "studio" ? "bg-surface text-accent shadow-sm" : "text-text-muted"}`}
                   onClick={switchToStudio}
+                  disabled={!canUseStudio}
+                  title={!canUseStudio ? "Config Studio is available on tablets and desktops" : undefined}
                 >
                   <SlidersHorizontal size={12} /> Studio
                 </button>
@@ -867,7 +876,7 @@ export function CodeEditor({
           <div
             className={`${view === "studio" ? "flex" : "hidden"} min-h-0 flex-1`}
           >
-            <ConfigStudio
+            <RemoteConfigStudio
               key={studioKey}
               content={studioSource}
               onChange={handleStudioChange}

@@ -1,13 +1,13 @@
 import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react'
-import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench } from 'lucide-react'
+import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench, StepForward } from 'lucide-react'
 import { MOVE_FEED, MOVE_RAPID, NO_TOOL, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { isLineInputHeldByJob, onLine, releaseUnseenJobInputHold, sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { isLineInputHeldByJob, onLine, releaseUnseenJobInputHold, sendRaw, sendRealtime, sendRealtimeNow, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
 import { sendControlLine } from '../lib/macros'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
-import { buildJobTimingEstimate, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
+import { buildJobTimingEstimate, formatJobProgress, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
 import { createRenderer, renderLines, setStaticLineData, type WebGLRenderer, type Camera, type Vector3 } from '../lib/webgl'
 import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, completedPlungeCount, EMPTY_UINT8, findPlungePoints, getArcGeometry, getArcPoint, type PlungePoints, type RenderLines } from '../lib/gcodeBuild'
 import {
@@ -24,7 +24,10 @@ import {
 } from '../lib/toolpathTracking'
 import { RestartFromLineDialog } from './RestartFromLineDialog'
 import { useGCodeSenderStore } from '../store/gcodeSender'
+import { useSingleBlockStore } from '../store/singleBlock'
+import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
+import { controllerRunCommand } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
 import { programMovesZ } from '../lib/gcodeRestart'
 import { parseDecimalInput } from '../lib/numberInput'
@@ -1173,6 +1176,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const fileName = useGCodeStore(s => s.fileName)
   const loadedPath = useGCodeStore(s => s.loadedPath)
   const sourceText = useGCodeStore(s => s.sourceText)
+  const restoredFromCache = useGCodeStore(s => s.restoredFromCache)
   const restartSource = useGCodeStore(s => s.restartSource)
   const loading = useGCodeStore(s => s.loading)
   const pendingPath = useGCodeStore(s => s.pendingPath)
@@ -1834,6 +1838,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     spindleOverride: s.status.spindleOverride,
     sdFilename: s.status.sdFilename,
     sdPercent: s.status.sdPercent,
+    pinState: s.status.pinState,
+    holdComplete: s.status.holdComplete,
   })))
   const connected = useMachineStore(s => s.connected)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
@@ -1954,20 +1960,29 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     }
   }, [controllerJobStarting, connected, trackedJobStartedAt, spindleSpinupMs, cancelTrackedJob])
 
+  const singleBlockEnabled = status.pinState.includes('Q')
+  const pendingBlock = useSingleBlockStore(s => s.pendingBlock)
+  const blockReady = useSingleBlockStore(s => s.ready)
+  const blockAdvancing = useSingleBlockStore(s => s.advancing)
+  const blockModePending = useSingleBlockStore(s => s.requestedMode !== null)
+  const resumeController = useSingleBlockStore(s => s.resume)
+  const isStepHold = !senderActive && singleBlockEnabled && (!!pendingBlock || blockAdvancing)
+  const controllerResumeDisabled = !connected || controllerResetPending || blockModePending
+    || blockAdvancing || status.holdComplete === false || (status.state === 'Hold' && !!pendingBlock && !blockReady)
   const isLargeProgressOverlayDisabled = !!model && isRunning && model.segments.length > LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
   const cancelAndStartJob = useGCodeStore(s => s.cancelAndStartJob)
   const cancelLoad = useGCodeStore(s => s.clear)
   const handleStartWithoutPreview = useCallback(() => {
     const path = pendingPath
-    if (!path) return
+    if (!path || blockModePending) return
     releaseLaserPointerForJob()
     if (cancelAndStartJob(path)) {
       setControllerStartError(null)
       startTrackedJob('controller')
     }
-  }, [pendingPath, cancelAndStartJob, startTrackedJob])
+  }, [pendingPath, blockModePending, cancelAndStartJob, startTrackedJob])
 
-  const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending
+  const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending || blockModePending
   const is3DToggleDisabled = pendingPath !== null || isProcessing2D || (!!model && !is3DReady)
   const [autoFollow, setAutoFollow] = useState(true)
   const [followMode, setFollowMode] = useState<FollowMode>(() => getStoredFollowMode())
@@ -1990,12 +2005,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   // for a zoomed-in page) until the operator turns on Move; two fingers zoom
   // and move the view. Mouse, pen and wheel always act on the view.
   const touchScrollsPage = !!isTablet && viewerInScrollingPage && !touchMovesView
-  // On a phone (touch is the main pointer) the toolbar and job buttons get
-  // finger-sized targets; tablet layouts already ask for them with isTablet.
+  // On a phone (touch is the main pointer) the toolbar gets finger-sized
+  // targets; tablet layouts already ask for them with isTablet.
   const [coarsePointer] = useState(() => !!window.matchMedia?.('(pointer: coarse)').matches)
   const phoneTargets = coarsePointer && !isTablet
   const largeToolbar = isTablet || phoneTargets
-  const jobButtonSize = isTablet ? 'text-xl py-3' : phoneTargets ? 'text-base py-2.5' : 'text-sm'
   const isLocalFile = !!sourceText && !loadedPath
   const simulationProgressPercent = simulationTotalSeconds && simulationTotalSeconds > 0
     ? clamp01(simulationElapsedSeconds / simulationTotalSeconds) * 100
@@ -3204,6 +3218,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
             <span className="text-text-dim text-sm whitespace-nowrap">No file loaded</span>
           )}
           {isLocalFile && <span className="tag border-info/30 bg-info/10 text-info normal-case tracking-normal">Local</span>}
+          {restoredFromCache && <span className="tag normal-case tracking-normal" title="Preview restored from this browser's saved copy">Cached</span>}
           {restartSource && (
             <span className="px-1.5 py-0.5 rounded text-xs font-semibold text-accent bg-accent/10 border border-accent/25 shrink-0" title={`Prepared from ${restartSource.fileName}, requested line ${restartSource.requestedLine}`}>
               Restart L{restartSource.resumeLine}
@@ -3466,7 +3481,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               </div>
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-base text-text-dim uppercase tracking-wide">
-                  <span>{pendingPath ? 'Download from controller' : 'Read local file'}</span>
+                  <span>{restoredFromCache ? 'Read cached file' : pendingPath ? 'Download from controller' : 'Read local file'}</span>
                   <span>{downloadProgress == null ? 'Streaming' : `${downloadProgress}%`}</span>
                 </div>
                 <div className="h-1.5 bg-elevated rounded-full overflow-hidden">
@@ -3499,6 +3514,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                   <button
                     className="btn btn-warn gap-2 justify-center text-sm flex-1"
                     onClick={handleStartWithoutPreview}
+                    disabled={blockModePending}
                     title="Cancel the preview download and start the job immediately"
                   >
                     <Zap size={12} />
@@ -3844,15 +3860,15 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                   </span>
                 )}
                 {!simulationActive && !senderActive && runtime.source === 'sd' && (
-                  <span className="text-[11px] font-mono text-text-muted tabular-nums" title="Estimated from SD file progress">
-                    SD {Math.round(displayedProgressPercent)}%
+                  <span className="text-[11px] font-mono text-text-muted tabular-nums" title="File progress reported by FluidNC">
+                    File {formatJobProgress(displayedProgressPercent, runtime.source)}
                     {runtime.remainingSeconds != null && <>, Remain ~{formatRuntime(runtime.remainingSeconds)}</>}
                   </span>
                 )}
               </div>
             )}
             {showDisplayedTiming && (
-              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-text-muted tabular-nums">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm font-mono text-text-muted tabular-nums">
                 <div className="flex items-center justify-between gap-3 min-w-[220px] flex-1">
                   <span>Elapsed {formatRuntime(displayedElapsedSeconds)}</span>
                   <span>Remain {formatRuntime(displayedRemainingSeconds)}</span>
@@ -3990,21 +4006,21 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="flex gap-1.5 sm:flex-[6]">
             {controllerSettings.hasMist && <button
               onClick={() => { sendRealtime(0xA1); setCoolantState('mist') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'mist' ? 'border-accent/50 text-accent' : 'btn-ghost'}`}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'mist' ? 'border-accent/50 text-accent' : 'btn-ghost'}`}
             >
               <CloudDrizzle size={isTablet ? 18 : 13} />
               Mist
             </button>}
             {controllerSettings.hasFlood && <button
               onClick={() => { sendRealtime(0xA0); setCoolantState('flood') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'flood' ? 'border-info/50 text-info' : 'btn-ghost'}`}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'flood' ? 'border-info/50 text-info' : 'btn-ghost'}`}
             >
               <Waves size={isTablet ? 18 : 13} />
               Flood
             </button>}
             <button
               onClick={() => { if (sendControlLine('M9', 'Coolant off')) setCoolantState('off') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
             >
               <PowerOff size={isTablet ? 18 : 13} />
               Off
@@ -4013,10 +4029,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="hidden sm:block w-px bg-border self-stretch" />
         </>}
 
-        <div className={`flex ${phoneTargets ? 'gap-3' : 'gap-1.5'} ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
+        <div className={`flex flex-wrap items-center gap-1.5 ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
+          <SingleBlockToggle isTablet={isTablet} unavailable={senderActive || simulationActive || (isLocalFile && !machineJobActive)} />
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ghost justify-center shrink-0 ${isTablet ? 'px-3 py-3' : phoneTargets ? 'px-3 py-2.5' : 'px-2'}`}
+              className={`btn btn-ghost justify-center shrink-0 job-action px-2`}
               onClick={() => localFileInputRef.current?.click()}
               disabled={isRunning}
               title="Open a G-code file from this device"
@@ -4027,7 +4044,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && restartSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${jobButtonSize}`}
+              className={`btn btn-ghost gap-1.5 justify-center job-action ${isTablet ? 'text-base' : 'text-sm'}`}
               onClick={() => restartSource.path
                 ? loadFile(restartSource.path)
                 : restartSource.sourceText && loadFromText(restartSource.sourceText, restartSource.fileName)}
@@ -4040,10 +4057,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && !restartSource && hasLoadedSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${jobButtonSize}`}
+              className={`btn btn-ghost gap-1.5 justify-center job-action ${isTablet ? 'text-base' : 'text-sm'}`}
               onClick={() => { setRestartInitialLine(null); setShowRestartFromLine(true) }}
               disabled={isViewerStartBlocked}
-              title={isLocalFile ? 'Prepare a safe local stream that resumes from a file line' : 'Prepare a reviewable SD-card program that restarts from a file line'}
+              title={isLocalFile ? 'Prepare a safe local stream that resumes from a file line' : 'Prepare a reviewable controller program that restarts from a file line'}
             >
               <ListStart size={isTablet ? 18 : 14} />
               From line
@@ -4051,12 +4068,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ok-solid gap-2 justify-center font-bold ${isTablet ? 'text-xl py-3' : phoneTargets ? 'text-base py-2.5' : 'text-base'} flex-1`}
+              className={`btn btn-ok-solid gap-2 justify-center font-bold job-action ${isTablet ? 'text-base' : 'text-sm'} flex-1`}
               onClick={() => {
                 if (isLocalFile) startLocalSenderWithWarning()
                 else if (loadedPath) {
                   releaseLaserPointerForJob()
-                  if (sendRaw(`$SD/Run=${loadedPath}`)) {
+                  if (sendRaw(controllerRunCommand(loadedPath))) {
                     setControllerStartError(null)
                     startTrackedJob('controller')
                   }
@@ -4066,6 +4083,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               title={isViewerStartBlocked
                 ? controllerResetPending
                   ? 'Controller is resetting after the abort'
+                  : blockModePending
+                    ? 'Waiting for FluidNC to confirm single block mode'
                   : sdUploadPath
                     ? 'Wait for the SD-card upload to finish before starting the job'
                     : 'Wait for file processing to finish before starting the job'
@@ -4077,7 +4096,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobRunning && (
             <button
-              className={`btn btn-warn-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
+              className={`btn btn-warn-solid job-cycle-action gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
               onClick={() => senderActive ? pauseSender() : sendRealtime(0x21)}
               title={controllerJobStarting ? 'Request a feed hold while the job starts' : undefined}
             >
@@ -4087,22 +4106,24 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobHeld && (
             <button
-              className={`btn btn-ok-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
-              onClick={() => senderPhase === 'paused' ? resumeSender() : sendRealtime(0x7e)}
-              disabled={senderPhase === 'paused' && status.state === 'Door'}
-              title={senderPhase === 'paused' && status.state === 'Door' ? 'Close the safety door before resuming' : undefined}
+              className={`btn ${isStepHold ? 'btn-step' : 'btn-ok-solid'} job-cycle-action gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
+              onClick={() => senderPhase === 'paused' ? resumeSender() : resumeController()}
+              disabled={senderActive ? status.state === 'Door' : controllerResumeDisabled}
+              title={senderPhase === 'paused' && status.state === 'Door'
+                ? 'Close the safety door before resuming'
+                : isStepHold ? 'Run one line. Spindle and coolant stay on.' : undefined}
             >
-              <Play size={isTablet ? 18 : 13} />
-              Resume
+              {isStepHold ? <StepForward size={isTablet ? 18 : 13} /> : <Play size={isTablet ? 18 : 13} />}
+              {isStepHold ? 'Next block' : 'Resume'}
             </button>
           )}
           {(isJobRunning || isJobHeld) && (
             <button
-              className={`btn btn-danger-solid gap-1.5 ${jobButtonSize} justify-center flex-1`}
+              className={`btn btn-danger-solid gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
               onClick={() => abortConfirm.tap(() => {
                 if (senderActive) abortSender()
                 else {
-                  if (sendRealtime(0x18)) cancelTrackedJob('controller')
+                  if (sendRealtimeNow(0x18)) cancelTrackedJob('controller')
                 }
               })}
               title={abortConfirm.armed ? undefined : 'Tap twice to abort the job with a controller reset'}
@@ -4113,6 +4134,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
         </div>
         </div>
+        <SingleBlockNotice unavailable={senderActive || (isLocalFile && !machineJobActive)} />
         {isTablet && (
           <div className="flex items-center gap-2 min-w-0 pt-1 border-t border-border">
             {fileName ? (
@@ -4120,6 +4142,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 <span className="text-text-primary font-mono normal-case tracking-normal font-normal truncate text-base">
                   {fileName}
                 </span>
+                {restoredFromCache && <span className="tag normal-case tracking-normal" title="Preview restored from this browser's saved copy">Cached</span>}
                 {restartSource && (
                   <span className="px-1.5 py-0.5 rounded text-sm font-semibold text-accent bg-accent/10 border border-accent/25 shrink-0">
                     Restart L{restartSource.resumeLine}
