@@ -3,7 +3,7 @@ import { useMachineStore } from './store'
 import { useGCodeStore } from './store/gcode'
 import { useGCodeSenderStore } from './store/gcodeSender'
 import { useTerminalStore } from './store/terminal'
-import { connect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from './lib/ws'
+import { connect, disconnect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from './lib/ws'
 import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, WebUIBlockedError } from './lib/http'
 import { isWasmBridgeActive, WASM_BRIDGE_BASE } from './wasmBridge/shimTransport'
 import { parseESP800 } from './lib/parser'
@@ -409,6 +409,8 @@ function AppContent() {
   const inFlightPromise = useRef<Promise<boolean> | null>(null)
   const backoffMs = useRef(0)
   const stableConnectionTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The page closed its socket while hidden or frozen and reconnects when shown.
+  const socketParked = useRef(false)
   const cachedWsHost = useRef<string | null>(null)
   const cachedHostFailures = useRef(0)
   const [showReconnectOverlay, setShowReconnectOverlay] = useState(false)
@@ -528,12 +530,13 @@ function AppContent() {
 
   function scheduleReconnect() {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+    if (socketParked.current) return
     // Exponential backoff, cap @ 30s.
     const next = backoffMs.current === 0 ? 1000 : Math.min(backoffMs.current * 2, 30000)
     backoffMs.current = next
     reconnectTimer.current = setTimeout(async () => {
       reconnectTimer.current = null
-      if (isSocketOpen()) return
+      if (socketParked.current || isSocketOpen()) return
       await attemptConnect()
       if (!isSocketOpen()) scheduleReconnect()
     }, next)
@@ -578,12 +581,12 @@ function AppContent() {
         stableConnectionTimer.current = null
         backoffMs.current = backoffMs.current === 0 ? 1000 : Math.min(backoffMs.current * 2, 30000)
       }
-      if (!reconnectTimer.current) {
+      if (!reconnectTimer.current && !socketParked.current) {
         // Respect existing backoff so rapid connect/drop loops slow down.
         const delay = backoffMs.current > 0 ? Math.min(backoffMs.current, 30000) : 300
         reconnectTimer.current = setTimeout(async () => {
           reconnectTimer.current = null
-          if (isSocketOpen()) return
+          if (socketParked.current || isSocketOpen()) return
           await attemptConnect()
           if (!isSocketOpen()) scheduleReconnect()
         }, delay)
@@ -684,7 +687,16 @@ function AppContent() {
   }, [connected, phase])
 
   useEffect(() => {
+    // A page that stops reading its socket - frozen by the browser, or a phone
+    // page in the background - fills FluidNC's small per-client send queue
+    // within seconds during a job; the controller holds that backlog on its
+    // scarce heap and then closes the socket itself. Close it here instead
+    // and reconnect when the page is back. Desktop pages stay connected while
+    // merely hidden, so the job-end sound still plays from a background tab.
+    const parkWhenHidden = window.matchMedia?.('(pointer: coarse)').matches ?? false
     function kick() {
+      if (parkWhenHidden && document.visibilityState === 'hidden') return
+      socketParked.current = false
       if (isSocketOpen()) return
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current)
@@ -695,14 +707,27 @@ function AppContent() {
         if (!isSocketOpen()) scheduleReconnect()
       })
     }
+    function park() {
+      socketParked.current = true
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current)
+        reconnectTimer.current = null
+      }
+      disconnect()
+    }
     function onVisibility() {
       if (document.visibilityState === 'visible') kick()
+      else if (parkWhenHidden) park()
     }
     window.addEventListener('online', kick)
     document.addEventListener('visibilitychange', onVisibility)
+    document.addEventListener('freeze', park)
+    document.addEventListener('resume', kick)
     return () => {
       window.removeEventListener('online', kick)
       document.removeEventListener('visibilitychange', onVisibility)
+      document.removeEventListener('freeze', park)
+      document.removeEventListener('resume', kick)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
