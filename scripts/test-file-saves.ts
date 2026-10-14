@@ -117,6 +117,6 @@ const lastLine = () => useTerminalStore.getState().lines.at(-1)?.text ?? ''
 await runMacro({ id: '1', label: 'Air', command: '', color: 'default', filename: '/air.macro', target: 'SD' })
 assert.match(lastLine(), /Macro "Air" not run: \/air\.macro could not be read \(HTTP 404\)/)
 await runMacro({ id: '2', label: 'Home', command: '$H', color: 'default' })
-assert.match(lastLine(), /Macro "Home" not run: the controller is busy or not connected/)
+assert.match(lastLine(), /Macro "Home" not run: not connected to the controller/)
 
 console.log('File save tests passed.')

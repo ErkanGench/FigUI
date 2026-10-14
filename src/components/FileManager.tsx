@@ -845,6 +845,20 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
             : null;
         let previewLoad: Promise<void> | null = null;
 
+        // A job may have started while an earlier file of this selection
+        // was uploading; the check above only saw the state before that.
+        if (
+          pathHoldsRunningFile(
+            useMachineStore.getState().status.sdFilename,
+            fs,
+            `${dir}${file.name}`,
+          )
+        ) {
+          throw new Error(
+            `${file.name} is in use by the running job. Replace it after the job.`,
+          );
+        }
+
         setUploadIdx(i + 1);
         setUploadPct(0);
         setUploadPhase("preparing");
@@ -885,6 +899,8 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
       });
     } catch (e) {
       alert(e instanceof Error ? e.message : "Upload failed");
+      // Show the files of the selection that did arrive.
+      void load(path, fs);
     } finally {
       setUploading(false);
       if (fileInput.current) fileInput.current.value = "";

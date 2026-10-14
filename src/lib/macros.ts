@@ -1,4 +1,4 @@
-import { isLineInputHeldByJob, LINE_INPUT_HELD_BY_JOB, sendRaw } from './ws'
+import { isLineInputHeldByJob, LINE_INPUT_HELD_BY_JOB, lineRefusalReason, sendRaw } from './ws'
 import { fetchFileContent } from './http'
 import { useTerminalStore } from '../store/terminal'
 import type { Macro } from '../types'
@@ -10,10 +10,7 @@ function reportMacro(macro: Macro, problem: string) {
 /** Sends a line from a control button; a refused line is reported in the terminal. */
 export function sendControlLine(cmd: string, label: string) {
   if (sendRaw(cmd)) return true
-  const reason = isLineInputHeldByJob()
-    ? LINE_INPUT_HELD_BY_JOB
-    : 'the controller is not ready (disconnected, or a reset is in progress)'
-  useTerminalStore.getState().appendLine(`[MSG:WARN: ${label} not sent: ${reason}]`)
+  useTerminalStore.getState().appendLine(`[MSG:WARN: ${label} not sent: ${lineRefusalReason()}]`)
   return false
 }
 
@@ -47,7 +44,7 @@ export async function runMacro(macro: Macro): Promise<void> {
     // Refused while a job stream owns the connection, while an SD job started
     // here holds the controller's input, during a reset, or while disconnected.
     if (!sendRaw(line)) {
-      reportMacro(macro, isLineInputHeldByJob() ? LINE_INPUT_HELD_BY_JOB : 'the controller is busy or not connected')
+      reportMacro(macro, lineRefusalReason())
       return
     }
   }

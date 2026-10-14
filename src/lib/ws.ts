@@ -190,6 +190,15 @@ export function isLineInputHeldByJob() {
 /** Why a line was refused while isLineInputHeldByJob() is true. */
 export const LINE_INPUT_HELD_BY_JOB = 'FluidNC would run it only after the SD job ends'
 
+/** Why sendRaw() refuses a line at this moment, for the message shown to the user. */
+export function lineRefusalReason(): string {
+  if (isLineInputHeldByJob()) return LINE_INPUT_HELD_BY_JOB
+  if (responseTrafficSuspensions > 0) return 'a G-code stream from this page owns the connection'
+  if (useMachineStore.getState().controllerResetPending) return 'a controller reset is in progress'
+  if (socket?.readyState !== WebSocket.OPEN) return 'not connected to the controller'
+  return 'the controller is not accepting commands right now'
+}
+
 function beginSoftResetCooldown() {
   if (resetReadyTimer) clearTimeout(resetReadyTimer)
   // A reset cancels controller work. Do not let ordinary commands that were

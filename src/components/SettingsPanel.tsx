@@ -490,9 +490,10 @@ function numericSettingValue(
   if (setting.T === "I" && !Number.isInteger(n))
     return { error: "Must be a whole number" };
   const min = settingLimit(setting.M);
-  const max = settingLimit(setting.S);
-  // FluidNC reports a uint32 default maximum as -1, so the range is unknown.
-  if (min !== null && max !== null && min > max) return { value: String(n) };
+  const reportedMax = settingLimit(setting.S);
+  // FluidNC reports a uint32 default maximum as -1: that maximum is unknown,
+  // but the minimum (usually 0) still holds.
+  const max = min !== null && reportedMax !== null && reportedMax < min ? null : reportedMax;
   if ((min !== null && n < min) || (max !== null && n > max)) {
     return {
       error:

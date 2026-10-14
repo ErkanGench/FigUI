@@ -42,7 +42,8 @@ const options = { mode: 'rectangle' as const, feedMmPerMin: 1000, clearanceMm: 5
 
 // Optionally a real Z-less laser file: FIGUI_FRAMING_SAMPLE=<path to .nc>.
 const userFile = process.env.FIGUI_FRAMING_SAMPLE
-if (userFile && existsSync(userFile)) {
+if (userFile) {
+  assert.ok(existsSync(userFile), `FIGUI_FRAMING_SAMPLE names a missing file: ${userFile}`)
   const text = readFileSync(userFile, 'utf8')
   const started = performance.now()
   assert.equal(programMovesZ(text), false)

@@ -510,7 +510,14 @@ function AppContent() {
         // not make http requests, which the browser blocks as mixed content
         setBase(isWasmBridgeActive() ? WASM_BRIDGE_BASE : window.location.origin)
         const { wsHost } = await resolveWsHost(httpHost)
+        // The page may have been hidden or frozen meanwhile; it reconnects
+        // when it is shown again.
+        if (socketParked.current) return false
         await connect(wsHost)
+        if (socketParked.current) {
+          disconnect()
+          return false
+        }
         cachedHostFailures.current = 0
         return true
       } catch (e) {
