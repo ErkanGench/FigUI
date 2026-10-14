@@ -272,6 +272,12 @@ export function isRunningLoadedFile(sdFilename: string, loadedPath: string | nul
   return (!!fileName && fileName.toLowerCase() === running) || (!!loadedPath && baseName(loadedPath) === running)
 }
 
+/** The path to load the file a status report names. FluidNC reports it with its /sd or /localfs mount. */
+export function runningFilePath(sdFilename: string) {
+  const path = sdFilename.replace(/\\/g, '/')
+  return /^\/(sd|localfs)\//i.test(path) ? path : `/sd/${path.replace(/^\/+/, '')}`
+}
+
 /**
  * Z to compare the live position against. A program that never moves Z (a
  * laser focused by hand) says nothing about where the machine's Z is, so it

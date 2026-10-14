@@ -8,6 +8,7 @@ import {
   findToolpathProgress,
   getTrackingZ,
   isRunningLoadedFile,
+  runningFilePath,
 } from '../src/lib/toolpathTracking'
 
 // Two identical passes of 400 short moves along Y=0, the way a repeated
@@ -109,6 +110,10 @@ const onSecondPass = (index: number) => index >= firstSecondPassSegment
   assert.equal(isRunningLoadedFile('/sd/jobs/Maske.nc', 'jobs\\Maske.nc', null), true)
   assert.equal(isRunningLoadedFile('/sd/Maske-Lazer.nc', '/sd/F-Cu-Lazer.nc', 'F-Cu-Lazer.nc'), false)
   assert.equal(isRunningLoadedFile('/sd/Maske-Lazer.nc', null, null), false)
+  assert.equal(runningFilePath('/sd/jobs/Maske.nc'), '/sd/jobs/Maske.nc')
+  assert.equal(runningFilePath('/localfs/a.nc'), '/localfs/a.nc')
+  assert.equal(runningFilePath('Maske.nc'), '/sd/Maske.nc', 'a bare name is on the SD card')
+  assert.equal(runningFilePath('/jobs/Maske.nc'), '/sd/jobs/Maske.nc')
 }
 
 console.log('Toolpath tracking tests passed')
