@@ -269,5 +269,14 @@ assert.ok(!socket.sent.includes('G0 X50'), 'a command typed while disconnected m
 assert.ok(!socket.sent.includes(0x7E), 'cycle start must not replay after reconnect')
 assert.equal(socket.sent.filter(item => item === 0x85).length, 1, 'jog cancel is replayed once after reconnect')
 
+// ── A disconnect while the socket is still opening settles that connect ─────
 ws.disconnect()
+const opening = ws.connect('fluidnc.test')
+ws.disconnect()
+const outcome = await Promise.race([
+  opening.then(() => 'opened', () => 'rejected'),
+  delay(200).then(() => 'pending'),
+])
+assert.equal(outcome, 'rejected', 'the pending connect is rejected at once, not after its timeout')
+
 console.log('line gate tests passed')

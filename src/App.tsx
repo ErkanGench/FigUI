@@ -302,6 +302,8 @@ function AppContent() {
         cachedHostFailures.current = 0
         return true
       } catch (e) {
+        // An attempt cut short by park() is not a failure of the host.
+        if (socketParked.current) return false
         cachedHostFailures.current++
         if (cachedHostFailures.current >= 3) cachedWsHost.current = null
         if (phase !== 'ready') {

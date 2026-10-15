@@ -3,6 +3,9 @@ import { useMachineStore } from '../store'
 import { sendCommand } from './http'
 
 let socket: WebSocket | null = null
+// Rejects a connect() still waiting for onopen; disconnect() detaches the
+// socket's handlers, so the attempt would otherwise wait for its timeout.
+let cancelPendingConnect: (() => void) | null = null
 
 let generation = 0
 let lastDisconnectReason: string | null = null
@@ -385,6 +388,12 @@ export function connect(host: string): Promise<void> {
       }
       reject(new Error('WebSocket connection timed out'))
     }, OPEN_TIMEOUT_MS)
+    cancelPendingConnect = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(openTimeout)
+      reject(new Error('WebSocket closed before opening'))
+    }
 
     ws.onopen = () => {
       if (myGen !== generation || settled) return
@@ -1035,6 +1044,8 @@ export function disconnect() {
   pendingAcknowledgments.forEach(({ timeoutId }) => clearTimeout(timeoutId))
   pendingAcknowledgments.clear()
   commandQueue.length = 0
+  cancelPendingConnect?.()
+  cancelPendingConnect = null
   closeCurrentSocket()
   if (useMachineStore.getState().connected) {
     useMachineStore.getState().setConnected(false)
