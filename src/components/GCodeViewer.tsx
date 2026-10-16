@@ -1,17 +1,20 @@
 import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react'
-import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench } from 'lucide-react'
-import { type GCodeModel, type Segment } from '../lib/gcode'
+import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, CloudDrizzle, Waves, PowerOff, Box, Zap, Orbit, Hand, ListStart, RotateCcw, FilePlus, X, AlertTriangle, Maximize, ChevronDown, Wrench, StepForward } from 'lucide-react'
+import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { sendRaw, sendRealtime, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { sendRaw, sendRealtime, sendRealtimeNow, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
-import { buildJobTimingEstimate, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
+import { buildJobTimingEstimate, formatJobProgress, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
 import { createRenderer, renderLines, setStaticLineData, type WebGLRenderer, type Camera, type Vector3 } from '../lib/webgl'
-import { addSegmentToPath, clamp01, getArcGeometry, normalizeAngle } from '../lib/gcodeBuild'
+import { addSegmentToPath, buildRenderLines, buildStatic2DPaths, buildStatic3DGeometry, clamp01, EMPTY_UINT8, getArcGeometry, normalizeAngle, type RenderLines } from '../lib/gcodeBuild'
 import { RestartFromLineDialog } from './RestartFromLineDialog'
 import { useGCodeSenderStore } from '../store/gcodeSender'
+import { useSingleBlockStore } from '../store/singleBlock'
+import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
+import { controllerRunCommand } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
 
 const GCODE_EXTENSIONS_PREVIEW = '.g, .nc, .gcode, .ngc, .tap, or .cnc'
@@ -123,7 +126,19 @@ const SEGMENT_LOOKAHEAD = 12
 const LOOKAHEAD_DISTANCE_FLOOR_MM = 1
 const LOOKAHEAD_FEED_MARGIN = 3
 const LOOKAHEAD_MAX_SEGMENTS = 4000
+/** Consecutive missed reports before the tracker searches the whole job again. */
+const PROGRESS_RELOCK_MISSES = 4
+/** Matches this close to the file-progress hint count as equally likely. */
+const PROGRESS_HINT_SLACK_SEGMENTS = 300
 const LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT = 100_000
+/** Above this many lines, 2D pan and zoom stretch the cached layer until the view settles. */
+const LARGE_2D_LAYER_LINE_LIMIT = 100_000
+const STATIC_2D_SETTLE_MS = 150
+/** Share of the view size drawn beyond each edge of the cached 2D layer. */
+const STATIC_2D_LAYER_PAD_RATIO = 0.25
+const FOLLOW_EDGE_MARGIN_PX = 40
+const FOLLOW_EDGE_MARGIN_RATIO = 0.1
+const FOLLOW_MODE_KEY = 'gcode.followMode'
 const EMPTY_FLOAT32 = new Float32Array(0)
 const WHEEL_ZOOM_SENSITIVITY = 0.0012
 const ORBIT_ROTATIONS_PER_VIEWPORT = 1
@@ -182,9 +197,10 @@ function getBedEnvelope(settings: ControllerSettings, status: MachineStatus): Be
 interface StaticPathGeometry {
   model: GCodeModel
   showRapids: boolean
+  /** Tools filtered out of this geometry; null for the full toolpath. */
+  hiddenTools: Set<number> | null
   vertices: Float32Array
-  colors: Float32Array
-  uploadedRenderer: WebGLRenderer | null
+  colors: Uint8Array
 }
 
 interface Static2DPaths {
@@ -198,6 +214,24 @@ interface Static2DPaths {
     traversePath: Path2D
     cutPath: Path2D
   }>
+}
+
+/** The static toolpath stroked once into an offscreen canvas for a given view. */
+interface Static2DLayer {
+  paths: Static2DPaths
+  canvas: HTMLCanvasElement
+  ox: number
+  oy: number
+  scale: number
+  w: number
+  h: number
+  dpr: number
+  /** Margin drawn beyond each side of the view, in CSS pixels. */
+  pad: number
+  showRapids: boolean
+  hiddenTools: Set<number>
+  /** Set once panning or zooming pauses, so the next render strokes it sharply again. */
+  settled: boolean
 }
 
 interface Progress2DPath {
@@ -226,19 +260,23 @@ function getRapidMarkerPoint(seg: Segment) {
     : { x: seg.x1, y: seg.y1, z: seg.z1 }
 }
 
-function findEntryExitMarkerPoints(segments: Segment[]) {
+function segmentAt(segments: SegmentTable, index: number): Segment | undefined {
+  return index >= 0 && index < segments.length ? segments.get(index) : undefined
+}
+
+function findEntryExitMarkerPoints(segments: SegmentTable) {
   let firstCutIndex = -1
   let lastCutIndex = -1
 
   for (let index = 0; index < segments.length; index++) {
-    if (segments[index].moveType === 'feed') {
+    if (segments.moveCode(index) === MOVE_FEED) {
       firstCutIndex = index
       break
     }
   }
 
   for (let index = segments.length - 1; index >= 0; index--) {
-    if (segments[index].moveType === 'feed') {
+    if (segments.moveCode(index) === MOVE_FEED) {
       lastCutIndex = index
       break
     }
@@ -248,11 +286,11 @@ function findEntryExitMarkerPoints(segments: Segment[]) {
     return { entry: null, exit: null }
   }
 
-  const entryRapid = firstCutIndex > 0 && segments[firstCutIndex - 1].moveType === 'rapid'
-    ? segments[firstCutIndex - 1]
+  const entryRapid = firstCutIndex > 0 && segments.moveCode(firstCutIndex - 1) === MOVE_RAPID
+    ? segments.get(firstCutIndex - 1)
     : null
-  const exitRapid = lastCutIndex < segments.length - 1 && segments[lastCutIndex + 1].moveType === 'rapid'
-    ? segments[lastCutIndex + 1]
+  const exitRapid = lastCutIndex < segments.length - 1 && segments.moveCode(lastCutIndex + 1) === MOVE_RAPID
+    ? segments.get(lastCutIndex + 1)
     : null
 
   return {
@@ -313,7 +351,7 @@ function appendConeGeometry(
   }
 }
 
-function buildEntryExitMarkerGeometry(segments: Segment[]) {
+function buildEntryExitMarkerGeometry(segments: SegmentTable) {
   if (segments.length === 0) {
     return {
       vertices: EMPTY_FLOAT32,
@@ -441,6 +479,31 @@ function strokeModelPath(
   ctx.setLineDash(lineDashPx.map(value => value / safeScale))
   ctx.stroke(path)
   ctx.restore()
+}
+
+function strokeStatic2DPaths(
+  ctx: CanvasRenderingContext2D,
+  paths: Static2DPaths,
+  t: Transform,
+  showRapids: boolean,
+  hiddenTools: Set<number>,
+) {
+  if (paths.toolPaths?.length) {
+    for (const toolPaths of paths.toolPaths) {
+      if (toolPaths.tool != null && hiddenTools.has(toolPaths.tool)) continue
+      strokeModelPath(ctx, toolPaths.cutPath, t, toolPathColor(toolPaths.tool), 1)
+      if (showRapids) {
+        strokeModelPath(ctx, toolPaths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
+        strokeModelPath(ctx, toolPaths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
+      }
+    }
+    return
+  }
+  strokeModelPath(ctx, paths.cutPath, t, CUT_COLOR_FG, 1)
+  if (showRapids) {
+    strokeModelPath(ctx, paths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
+    strokeModelPath(ctx, paths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
+  }
 }
 
 function toolPathColor(tool: number | null | undefined) {
@@ -783,8 +846,32 @@ function getWheelZoomScale(deltaY: number, deltaMode: number, pageSize: number) 
   return Math.exp(-deltaPixels * WHEEL_ZOOM_SENSITIVITY)
 }
 
+/** Reused result of measureProgressAt; read it before the next call. */
+const lineProgressMeasurement = { fraction: 0, distanceSq: 0 }
+
+/**
+ * Same as measureProgressAlongSegment for one move of the table, without
+ * building the move object for straight lines, so a whole large job can be
+ * searched quickly.
+ */
+function measureProgressAt(segments: SegmentTable, index: number, px: number, py: number, pz: number) {
+  if (segments.isArc(index)) return measureProgressAlongSegment(segments.get(index), px, py, pz)
+  const x0 = segments.px[index], y0 = segments.py[index], z0 = segments.pz[index]
+  const dx = segments.px[index + 1] - x0
+  const dy = segments.py[index + 1] - y0
+  const dz = segments.pz[index + 1] - z0
+  const lenSq = dx * dx + dy * dy
+  const fraction = lenSq < 1e-9 ? 0 : clamp01(((px - x0) * dx + (py - y0) * dy) / lenSq)
+  const ex = px - (x0 + dx * fraction)
+  const ey = py - (y0 + dy * fraction)
+  const ez = pz - (z0 + dz * fraction)
+  lineProgressMeasurement.fraction = fraction
+  lineProgressMeasurement.distanceSq = ex * ex + ey * ey + ez * ez
+  return lineProgressMeasurement
+}
+
 function findNearbyProgress(
-  segments: Segment[],
+  segments: SegmentTable,
   px: number,
   py: number,
   pz: number,
@@ -793,11 +880,16 @@ function findNearbyProgress(
   toleranceSq: number,
   previous: ToolpathProgress | null,
   preferLatest: boolean,
+  /** Segment the job is roughly at; matches far from it lose to nearer ones. */
+  hintIndex: number | null = null,
 ): ToolpathProgress | null {
   let best: (ToolpathProgress & { distanceSq: number }) | null = null
+  const hintDistance = (index: number) => hintIndex == null ? 0 : Math.max(0, Math.abs(index - hintIndex) - PROGRESS_HINT_SLACK_SEGMENTS)
 
   for (let i = startIndex; i <= endIndex && i < segments.length; i++) {
-    const measurement = measureProgressAlongSegment(segments[i], px, py, pz)
+    const measurement = measureProgressAt(segments, i, px, py, pz)
+    if (measurement.distanceSq > toleranceSq) continue
+
     const candidate: ToolpathProgress & { distanceSq: number } = {
       segmentIndex: i,
       fraction: measurement.fraction,
@@ -808,10 +900,12 @@ function findNearbyProgress(
       candidate.fraction = previous.fraction
     }
 
-    if (candidate.distanceSq > toleranceSq) continue
+    const hintGain = best ? hintDistance(best.segmentIndex) - hintDistance(i) : 0
+    if (hintGain < 0) continue
 
     if (
       !best
+      || hintGain > 0
       || (preferLatest && (
         compareProgress(candidate, best) > 0
         || (compareProgress(candidate, best) === 0 && candidate.distanceSq < best.distanceSq)
@@ -903,10 +997,17 @@ function segmentXYLength(seg: Segment) {
   return Math.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0, seg.z1 - seg.z0)
 }
 
-function buildCumulativeXYLengths(segments: Segment[]) {
+function buildCumulativeXYLengths(segments: SegmentTable) {
   const cumulative = new Float64Array(segments.length + 1)
   for (let i = 0; i < segments.length; i++) {
-    cumulative[i + 1] = cumulative[i] + segmentXYLength(segments[i])
+    const length = segments.isArc(i)
+      ? segmentXYLength(segments.get(i))
+      : Math.hypot(
+          segments.px[i + 1] - segments.px[i],
+          segments.py[i + 1] - segments.py[i],
+          segments.pz[i + 1] - segments.pz[i],
+        )
+    cumulative[i + 1] = cumulative[i] + length
   }
   return cumulative
 }
@@ -917,7 +1018,7 @@ function getLookaheadDistanceMm(feedMmPerMin: number) {
 }
 
 function findToolpathProgress(
-  segments: Segment[],
+  segments: SegmentTable,
   cumulativeXYLengths: Float64Array,
   px: number,
   py: number,
@@ -925,22 +1026,33 @@ function findToolpathProgress(
   previous: ToolpathProgress | null,
   lookaheadDistanceMm: number,
   maxSegmentIndex = segments.length - 1,
+  hintIndex: number | null = null,
 ): ToolpathProgress | null {
   const allowedEndIndex = Math.min(maxSegmentIndex, segments.length - 1)
   if (segments.length === 0 || allowedEndIndex < 0) return null
 
-  if (!previous) {
-    return findNearbyProgress(
-      segments,
-      px,
-      py,
-      pz,
-      0,
-      allowedEndIndex,
-      INITIAL_LOCK_TOLERANCE_MM ** 2,
-      null,
-      false,
-    )
+  const lockAnywhere = (hint: number | null) => findNearbyProgress(
+    segments,
+    px,
+    py,
+    pz,
+    0,
+    allowedEndIndex,
+    INITIAL_LOCK_TOLERANCE_MM ** 2,
+    null,
+    false,
+    hint,
+  )
+
+  if (!previous) return lockAnywhere(hintIndex)
+
+  // Lost for several reports (for example the preview was opened mid-job):
+  // search the whole job again rather than only just ahead of a stale position.
+  // Without a job position hint, prefer matches near where the tool was last
+  // seen, so a repeated pass does not fall back to an earlier one.
+  if ((previous.misses ?? 0) >= PROGRESS_RELOCK_MISSES) {
+    const relocked = lockAnywhere(hintIndex ?? previous.segmentIndex)
+    if (relocked) return { ...relocked, misses: 0 }
   }
 
   const startIndex = previous.segmentIndex
@@ -980,7 +1092,7 @@ function findToolpathProgress(
     if (far) return { ...far, misses: 0 }
   }
 
-  const current = segments[startIndex]
+  const current = segments.get(startIndex)
   if (pointDistanceSq(px, py, pz, current.x1, current.y1, current.z1) <= ENDPOINT_TOLERANCE_MM ** 2) {
     return { segmentIndex: startIndex, fraction: 1, misses: 0 }
   }
@@ -988,13 +1100,32 @@ function findToolpathProgress(
   return { ...previous, misses: priorMisses + 1 }
 }
 
-function findLastSegmentAtOrBeforeSourceLine(segments: Segment[], sourceLine: number) {
+/**
+ * Z to compare the live position against. A program that never moves Z (a
+ * laser focused by hand) says nothing about where the machine's Z is, so it
+ * is tracked in XY only.
+ */
+function getTrackingZ(model: GCodeModel, machineZ: number) {
+  return model.bounds.minZ === model.bounds.maxZ ? model.bounds.minZ : machineZ
+}
+
+/** Offset of every line in `text`. */
+function buildLineStarts(text: string) {
+  let count = 1
+  for (let index = text.indexOf('\n'); index >= 0; index = text.indexOf('\n', index + 1)) count++
+  const starts = new Uint32Array(count)
+  let line = 1
+  for (let index = text.indexOf('\n'); index >= 0; index = text.indexOf('\n', index + 1)) starts[line++] = index + 1
+  return starts
+}
+
+function findLastSegmentAtOrBeforeSourceLine(segments: SegmentTable, sourceLine: number) {
   let low = 0
   let high = segments.length - 1
   let result = -1
   while (low <= high) {
     const middle = Math.floor((low + high) / 2)
-    if (segments[middle].sourceLine <= sourceLine) {
+    if (segments.sourceLine(middle) <= sourceLine) {
       result = middle
       low = middle + 1
     } else {
@@ -1062,6 +1193,18 @@ function getStoredFramingMode(): FramingMode {
   const value = localStorage.getItem(FRAMING_MODE_KEY)
   return value === 'contour' || value === 'rectangle' ? value : 'rectangle'
 }
+
+/** 'edge': re-center the tool once it nears an edge. 'center': keep it centered. */
+type FollowMode = 'edge' | 'center'
+
+function getStoredFollowMode(): FollowMode {
+  return localStorage.getItem(FOLLOW_MODE_KEY) === 'center' ? 'center' : 'edge'
+}
+
+const FOLLOW_MODE_OPTIONS: Array<{ mode: FollowMode; label: string; detail: string }> = [
+  { mode: 'edge', label: 'Re-center at edge', detail: 'The view moves only when the tool nears an edge.' },
+  { mode: 'center', label: 'Keep centered', detail: 'The tool stays in the middle; the toolpath moves under it.' },
+]
 
 function getStoredPositiveNumber(key: string, fallback: number) {
   const parsed = Number.parseFloat(localStorage.getItem(key) ?? '')
@@ -1212,6 +1355,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const fileName = useGCodeStore(s => s.fileName)
   const loadedPath = useGCodeStore(s => s.loadedPath)
   const sourceText = useGCodeStore(s => s.sourceText)
+  const restoredFromCache = useGCodeStore(s => s.restoredFromCache)
   const restartSource = useGCodeStore(s => s.restartSource)
   const loading = useGCodeStore(s => s.loading)
   const pendingPath = useGCodeStore(s => s.pendingPath)
@@ -1227,14 +1371,21 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const setShowRapids = useGCodeStore(s => s.setShowRapids)
   const storePaths2D = useGCodeStore(s => s.paths2D)
   const storeGeometry3D = useGCodeStore(s => s.geometry3D)
+  const storeRenderLines = useGCodeStore(s => s.renderLines)
   const loadFile = useGCodeStore(s => s.loadFile)
   const setActiveSourceLine = useGCodeStore(s => s.setActiveSourceLine)
   const modelRef = useRef<GCodeModel | null>(null)
   const staticPathGeometryRef = useRef<StaticPathGeometry | null>(null)
+  const filteredPathGeometryRef = useRef<StaticPathGeometry | null>(null)
+  const uploadedPathGeometryRef = useRef<{ geometry: StaticPathGeometry; renderer: WebGLRenderer } | null>(null)
+  const renderLinesRef = useRef<RenderLines | null>(null)
   const static2DPathsRef = useRef<Static2DPaths | null>(null)
+  const static2DLayerRef = useRef<Static2DLayer | null>(null)
+  const static2DSettleTimerRef = useRef(0)
   const progress2DPathRef = useRef<Progress2DPath | null>(null)
   const markerGeometryRef = useRef<MarkerGeometry | null>(null)
   const pathXYLengthsRef = useRef<{ model: GCodeModel; cumulative: Float64Array } | null>(null)
+  const sourceLineStartsRef = useRef<{ text: string; starts: Uint32Array } | null>(null)
   const [showTool, setShowTool] = useState(true)
   const [hiddenTools, setHiddenTools] = useState<Set<number>>(() => new Set())
   const [showToolPathMenu, setShowToolPathMenu] = useState(false)
@@ -1583,7 +1734,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
 
   function createVertexData(
-    segments: Segment[],
+    segments: SegmentTable | null,
     progress: ToolpathProgress | null,
     toolWpos: { x: number; y: number; z: number } | null,
   ) {
@@ -1600,8 +1751,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     const TOOL_CAP_C  = [1.0,  0.35, 0.35, 0.38] as const
     const TOOL_TIP_C  = [1.0,  0.96, 0.96, 1.0] as const
 
-    for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-      const seg = segments[segIdx]
+    const segmentCount = segments?.length ?? 0
+    for (let segIdx = 0; segIdx < segmentCount; segIdx++) {
+      const seg = segments!.get(segIdx)
       if (seg.moveType !== 'feed' && !showRapidsRef.current) continue
       if (seg.tool != null && hiddenToolsRef.current.has(seg.tool)) continue
 
@@ -1707,24 +1859,43 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
 
   function ensureStaticPathGeometry(mdl: GCodeModel) {
-    const cached = staticPathGeometryRef.current
-    if (!cached || cached.model !== mdl || cached.showRapids !== showRapidsRef.current) return null
+    let geometry = staticPathGeometryRef.current
+    if (!geometry || geometry.model !== mdl || geometry.showRapids !== showRapidsRef.current) return null
 
-    if (rendererRef.current && cached.uploadedRenderer !== rendererRef.current) {
-      setStaticLineData(rendererRef.current, cached.vertices, cached.colors)
-      cached.uploadedRenderer = rendererRef.current
+    // Filter hidden tools once per change instead of rebuilding every frame.
+    const hiddenTools = hiddenToolsRef.current
+    if (hiddenTools.size > 0) {
+      const filtered = filteredPathGeometryRef.current
+      if (filtered && filtered.model === mdl && filtered.showRapids === geometry.showRapids && filtered.hiddenTools === hiddenTools) {
+        geometry = filtered
+      } else {
+        const lines = renderLinesRef.current
+        if (!lines) return null
+        geometry = {
+          model: mdl,
+          showRapids: geometry.showRapids,
+          hiddenTools,
+          ...buildStatic3DGeometry(lines, geometry.showRapids, hiddenTools),
+        }
+        filteredPathGeometryRef.current = geometry
+      }
     }
 
-    return cached
+    const renderer = rendererRef.current
+    const uploaded = uploadedPathGeometryRef.current
+    if (renderer && (uploaded?.geometry !== geometry || uploaded.renderer !== renderer)) {
+      setStaticLineData(renderer, geometry.vertices, geometry.colors)
+      uploadedPathGeometryRef.current = { geometry, renderer }
+    }
+
+    return geometry
   }
 
   function clearStaticPathGeometryUpload() {
-    if (rendererRef.current) {
-      setStaticLineData(rendererRef.current, EMPTY_FLOAT32, EMPTY_FLOAT32)
+    if (rendererRef.current && uploadedPathGeometryRef.current) {
+      setStaticLineData(rendererRef.current, EMPTY_FLOAT32, EMPTY_UINT8)
     }
-    if (staticPathGeometryRef.current) {
-      staticPathGeometryRef.current.uploadedRenderer = null
-    }
+    uploadedPathGeometryRef.current = null
   }
 
   function ensureCumulativeXYLengths(mdl: GCodeModel) {
@@ -1750,40 +1921,62 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     const cached = static2DPathsRef.current
     if (cached && cached.model === mdl) return cached
 
-    const rapidPath = new Path2D()
-    const traversePath = new Path2D()
-    const cutPath = new Path2D()
-    const hasTools = mdl.segments.some(seg => seg.tool != null)
-    const byTool = hasTools
-      ? new Map<number | null, { tool: number | null; rapidPath: Path2D; traversePath: Path2D; cutPath: Path2D }>()
-      : null
-    const pathsForTool = (tool: number | null) => {
-      let paths = byTool?.get(tool)
-      if (!paths && byTool) {
-        paths = { tool, rapidPath: new Path2D(), traversePath: new Path2D(), cutPath: new Path2D() }
-        byTool.set(tool, paths)
+    // The store builds these paths in time slices. Building them here blocks
+    // the page, so skip it for large jobs (for example while the next file loads).
+    if (mdl.segments.length > LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT) return null
+    const paths = { model: mdl, ...buildStatic2DPaths(buildRenderLines(mdl.segments)) }
+    static2DPathsRef.current = paths
+    return paths
+  }
+
+  /**
+   * Draws the toolpath from a cached layer. Status reports redraw the tool
+   * marker several times a second, and re-stroking millions of lines each
+   * time would starve the page. The layer extends past the view, so panning
+   * within that margin (dragging, Follow) reuses it at full sharpness. While a
+   * large layer is zoomed or panned further, the cached image is stretched
+   * into place and stroked again once the view settles.
+   */
+  function drawStatic2DLayer(ctx: CanvasRenderingContext2D, paths: Static2DPaths, t: Transform, w: number, h: number, lineCount: number) {
+    const dpr = window.devicePixelRatio || 1
+    const showRapids = showRapidsRef.current
+    const hiddenTools = hiddenToolsRef.current
+    const layer = static2DLayerRef.current
+
+    if (layer && layer.paths === paths && layer.w === w && layer.h === h && layer.dpr === dpr
+      && layer.showRapids === showRapids && layer.hiddenTools === hiddenTools) {
+      const { pad } = layer
+      if (layer.scale === t.scale) {
+        // Whole device pixels keep the reused image sharp.
+        const dx = Math.round((t.ox - layer.ox) * dpr) / dpr
+        const dy = Math.round((t.oy - layer.oy) * dpr) / dpr
+        if (Math.abs(dx) <= pad && Math.abs(dy) <= pad) {
+          ctx.drawImage(layer.canvas, dx - pad, dy - pad, w + 2 * pad, h + 2 * pad)
+          return
+        }
       }
-      return paths
-    }
-    for (const seg of mdl.segments) {
-      const path = seg.moveType === 'rapid' ? rapidPath : seg.moveType === 'traverse' ? traversePath : cutPath
-      addSegmentToPath(path, seg)
-      const toolPaths = pathsForTool(seg.tool ?? null)
-      if (toolPaths) {
-        const toolPath = seg.moveType === 'rapid' ? toolPaths.rapidPath : seg.moveType === 'traverse' ? toolPaths.traversePath : toolPaths.cutPath
-        addSegmentToPath(toolPath, seg)
+      if (!layer.settled && lineCount > LARGE_2D_LAYER_LINE_LIMIT) {
+        const k = t.scale / layer.scale
+        ctx.drawImage(layer.canvas, t.ox - (layer.ox + pad) * k, t.oy - (layer.oy + pad) * k, (w + 2 * pad) * k, (h + 2 * pad) * k)
+        window.clearTimeout(static2DSettleTimerRef.current)
+        static2DSettleTimerRef.current = window.setTimeout(() => {
+          layer.settled = true
+          scheduleRender()
+        }, STATIC_2D_SETTLE_MS)
+        return
       }
     }
 
-    const paths = {
-      model: mdl,
-      rapidPath,
-      traversePath,
-      cutPath,
-      toolPaths: byTool ? Array.from(byTool.values()).sort((a, b) => (a.tool ?? -1) - (b.tool ?? -1)) : undefined,
-    }
-    static2DPathsRef.current = paths
-    return paths
+    const pad = Math.round(Math.max(w, h) * STATIC_2D_LAYER_PAD_RATIO)
+    const canvas = layer?.canvas ?? document.createElement('canvas')
+    canvas.width = Math.round((w + 2 * pad) * dpr)
+    canvas.height = Math.round((h + 2 * pad) * dpr)
+    const layerCtx = canvas.getContext('2d')
+    if (!layerCtx) return
+    layerCtx.setTransform(dpr, 0, 0, dpr, pad * dpr, pad * dpr)
+    strokeStatic2DPaths(layerCtx, paths, t, showRapids, hiddenTools)
+    static2DLayerRef.current = { paths, canvas, ox: t.ox, oy: t.oy, scale: t.scale, w, h, dpr, pad, showRapids, hiddenTools, settled: false }
+    ctx.drawImage(canvas, -pad, -pad, w + 2 * pad, h + 2 * pad)
   }
 
   function ensureProgress2DPath(mdl: GCodeModel, progress: ToolpathProgress) {
@@ -1800,8 +1993,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     }
 
     for (let i = cached.lastCompletedSegment + 1; i <= lastCompletedSegment; i++) {
-      const seg = mdl.segments[i]
-      if (seg.moveType === 'feed' && (seg.tool == null || !hiddenToolsRef.current.has(seg.tool))) addSegmentToPath(cached.path, seg)
+      if (mdl.segments.moveCode(i) !== MOVE_FEED) continue
+      const tool = mdl.segments.tool(i)
+      if (tool == null || !hiddenToolsRef.current.has(tool)) addSegmentToPath(cached.path, mdl.segments.get(i))
     }
     cached.lastCompletedSegment = lastCompletedSegment
     return cached.path
@@ -1852,18 +2046,29 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const isJobRunning = senderPhase === 'streaming' || senderPhase === 'draining'
     || (status.state === 'Run' && senderPhase !== 'paused') || controllerJobStarting
   const isJobHeld = senderPhase === 'paused' || status.state === 'Hold'
+  const singleBlockEnabled = status.pinState.includes('Q')
+  const pendingBlock = useSingleBlockStore(s => s.pendingBlock)
+  const blockReady = useSingleBlockStore(s => s.ready)
+  const blockAdvancing = useSingleBlockStore(s => s.advancing)
+  const blockModePending = useSingleBlockStore(s => s.requestedMode !== null)
+  const resumeController = useSingleBlockStore(s => s.resume)
+  const isStepHold = !senderActive && singleBlockEnabled && (!!pendingBlock || blockAdvancing)
+  const controllerResumeDisabled = !connected || controllerResetPending || blockModePending
+    || blockAdvancing || status.holdComplete === false || (status.state === 'Hold' && !!pendingBlock && !blockReady)
   const isLargeProgressOverlayDisabled = !!model && isRunning && model.segments.length > LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
   const cancelAndStartJob = useGCodeStore(s => s.cancelAndStartJob)
   const cancelLoad = useGCodeStore(s => s.clear)
   const handleStartWithoutPreview = useCallback(() => {
     const path = pendingPath
-    if (!path) return
+    if (!path || blockModePending) return
     if (cancelAndStartJob(path)) startTrackedJob('controller')
-  }, [pendingPath, cancelAndStartJob, startTrackedJob])
+  }, [pendingPath, blockModePending, cancelAndStartJob, startTrackedJob])
 
-  const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending
+  const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending || blockModePending
   const is3DToggleDisabled = pendingPath !== null || isProcessing2D || (!!model && !is3DReady)
   const [autoFollow, setAutoFollow] = useState(true)
+  const [followMode, setFollowMode] = useState<FollowMode>(() => getStoredFollowMode())
+  const [showFollowMenu, setShowFollowMenu] = useState(false)
   const [coolantState, setCoolantState] = useState<'off' | 'mist' | 'flood'>('off')
   const [showRestartFromLine, setShowRestartFromLine] = useState(false)
   const [showLocalSenderWarning, setShowLocalSenderWarning] = useState(false)
@@ -1913,11 +2118,14 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       ? {
           model,
           showRapids: storeGeometry3D.showRapids,
+          hiddenTools: null,
           vertices: storeGeometry3D.vertices,
           colors: storeGeometry3D.colors,
-          uploadedRenderer: null,
         }
       : null
+    filteredPathGeometryRef.current = null
+    static2DLayerRef.current = null
+    renderLinesRef.current = model ? storeRenderLines : null
     markerGeometryRef.current = null
     pathXYLengthsRef.current = null
     if (modelChanged) {
@@ -1933,7 +2141,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       }
     }
     scheduleRender()
-  }, [model, storePaths2D, storeGeometry3D, is3D])
+  }, [model, storePaths2D, storeGeometry3D, storeRenderLines, is3D])
+
+  useEffect(() => () => window.clearTimeout(static2DSettleTimerRef.current), [])
 
   function canvasLogicalSize() {
     const container = containerRef.current
@@ -2060,11 +2270,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     const clampedElapsed = Math.max(0, Math.min(elapsedSeconds, timing.totalSeconds))
     progressRef.current = progress
     simulationElapsedAtPauseRef.current = clampedElapsed
-    simulationToolPosRef.current = mdl && progress
-      ? getSegmentPoint(mdl.segments[progress.segmentIndex], progress.fraction)
+    const progressSegment = mdl && progress ? segmentAt(mdl.segments, progress.segmentIndex) : undefined
+    simulationToolPosRef.current = progressSegment && progress
+      ? getSegmentPoint(progressSegment, progress.fraction)
       : null
 
-    const sourceLine = mdl && progress ? mdl.segments[progress.segmentIndex]?.sourceLine ?? null : null
+    const sourceLine = progressSegment?.sourceLine ?? null
     const wallElapsed = phase === 'paused'
       ? simulationWallElapsedAtPauseRef.current
       : getCurrentSimulationWallElapsed()
@@ -2260,7 +2471,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         }
         clearStaticPathGeometryUpload()
         const toolGeometry = wpos3d
-          ? createVertexData([], null, wpos3d)
+          ? createVertexData(null, null, wpos3d)
           : { vertices: EMPTY_FLOAT32, colors: EMPTY_FLOAT32, triangleVertices: EMPTY_FLOAT32, triangleColors: EMPTY_FLOAT32, toolVertexStart: 0 }
         const mergedVertices = mergeFloat32Arrays(bedGeometry?.vertices ?? EMPTY_FLOAT32, toolGeometry.vertices)
         const mergedColors = mergeFloat32Arrays(bedGeometry?.colors ?? EMPTY_FLOAT32, toolGeometry.colors)
@@ -2270,13 +2481,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         return
       }
 
-      const hasHiddenTools3d = hiddenToolsRef.current.size > 0
-
-      if (!use3DProgressOverlay && !hasHiddenTools3d) {
+      if (!use3DProgressOverlay) {
         const staticGeometry = ensureStaticPathGeometry(mdl)
         if (!staticGeometry) return
         const toolGeometry = wpos3d
-          ? createVertexData([], null, wpos3d)
+          ? createVertexData(null, null, wpos3d)
           : { vertices: EMPTY_FLOAT32, colors: EMPTY_FLOAT32, triangleVertices: EMPTY_FLOAT32, triangleColors: EMPTY_FLOAT32, toolVertexStart: 0 }
         const mergedVertices = mergeFloat32Arrays(bedGeometry?.vertices ?? EMPTY_FLOAT32, markerGeometry.vertices, toolGeometry.vertices)
         const mergedColors = mergeFloat32Arrays(bedGeometry?.colors ?? EMPTY_FLOAT32, markerGeometry.colors, toolGeometry.colors)
@@ -2361,24 +2570,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       const { segments } = mdl
       const progress = running ? progressRef.current : null
 
+      // Null while a large job's paths are still being prepared.
       const staticPaths = ensureStatic2DPaths(mdl)
-
-      if (staticPaths.toolPaths?.length) {
-        for (const toolPaths of staticPaths.toolPaths) {
-          if (toolPaths.tool != null && hiddenToolsRef.current.has(toolPaths.tool)) continue
-          strokeModelPath(ctx, toolPaths.cutPath, t, toolPathColor(toolPaths.tool), 1)
-          if (showRapidsRef.current) {
-            strokeModelPath(ctx, toolPaths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
-            strokeModelPath(ctx, toolPaths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
-          }
-        }
-      } else {
-        strokeModelPath(ctx, staticPaths.cutPath, t, CUT_COLOR_FG, 1)
-        if (showRapidsRef.current) {
-          strokeModelPath(ctx, staticPaths.traversePath, t, TRAVERSE_COLOR, 0.5, [2, 2])
-          strokeModelPath(ctx, staticPaths.rapidPath, t, RAPID_COLOR, 0.5, [4, 3])
-        }
-      }
+      if (staticPaths) drawStatic2DLayer(ctx, staticPaths, t, w, h, renderLinesRef.current?.count ?? mdl.segments.length)
 
       const use2DProgressOverlay = progress !== null && mdl.segments.length <= LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
 
@@ -2386,7 +2580,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         const completedPath = ensureProgress2DPath(mdl, progress)
         strokeModelPath(ctx, completedPath, t, CUT_DONE, 1.5)
 
-        const currentSegment = segments[progress.segmentIndex]
+        const currentSegment = segmentAt(segments, progress.segmentIndex)
         if (currentSegment?.moveType === 'feed' && (currentSegment.tool == null || !hiddenToolsRef.current.has(currentSegment.tool))) {
           ctx.strokeStyle = CUT_DONE
           ctx.lineWidth = 1.5
@@ -2405,21 +2599,63 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
   renderRef.current = render
 
+  /**
+   * The segment near FluidNC's file read position (SD: percent of bytes), when
+   * the running file is the loaded one. It tells repeated passes over the same
+   * path apart when the tracker has to search the whole job.
+   */
+  function getFileProgressHint(mdl: GCodeModel): number | null {
+    const { sdFilename, sdPercent } = status
+    if (!sourceText || !sdFilename || sdPercent == null || !(sdPercent > 0)) return null
+    if (sdFilename.slice(sdFilename.lastIndexOf('/') + 1) !== fileName) return null
+
+    let cached = sourceLineStartsRef.current
+    if (!cached || cached.text !== sourceText) {
+      cached = { text: sourceText, starts: buildLineStarts(sourceText) }
+      sourceLineStartsRef.current = cached
+    }
+    const offset = sourceText.length * Math.min(sdPercent, 100) / 100
+    const { starts } = cached
+    let low = 0
+    let high = starts.length - 1
+    while (low < high) {
+      const middle = (low + high + 1) >> 1
+      if (starts[middle] <= offset) low = middle
+      else high = middle - 1
+    }
+    return Math.max(0, findLastSegmentAtOrBeforeSourceLine(mdl.segments, low + 1))
+  }
+
+  function centerViewOn(wx: number, wy: number) {
+    const { w, h } = canvasLogicalSize()
+    const t = transformRef.current
+    t.ox = w / 2 - wx * t.scale
+    t.oy = h / 2 + wy * t.scale
+  }
+
+  function centerOnRunningTool() {
+    if (!isRunning || !showTool) return
+    centerViewOn(status.wpos.x, status.wpos.y)
+    scheduleRender()
+  }
+
+  function chooseFollowMode(mode: FollowMode) {
+    setFollowMode(mode)
+    localStorage.setItem(FOLLOW_MODE_KEY, mode)
+    setShowFollowMenu(false)
+    setAutoFollow(true)
+    centerOnRunningTool()
+  }
+
   function ensureToolVisible(wx: number, wy: number) {
     const { w, h } = canvasLogicalSize()
     const t = transformRef.current
     const sx = t.ox + wx * t.scale
     const sy = t.oy - wy * t.scale
-    const margin = 40
-    let dx = 0, dy = 0
-    if (sx < margin) dx = margin - sx
-    else if (sx > w - margin) dx = (w - margin) - sx
-    if (sy < margin) dy = margin - sy
-    else if (sy > h - margin) dy = (h - margin) - sy
-    if (dx !== 0 || dy !== 0) {
-      t.ox += dx
-      t.oy += dy
-    }
+    // Once the tool nears an edge, bring it back to the middle so the path
+    // ahead stays in view, instead of keeping it pinned to that edge.
+    const margin = Math.max(FOLLOW_EDGE_MARGIN_PX, Math.min(w, h) * FOLLOW_EDGE_MARGIN_RATIO)
+    if (sx < margin || sx > w - margin || sy < margin || sy > h - margin) centerViewOn(wx, wy)
   }
 
   useEffect(() => {
@@ -2449,12 +2685,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     }
 
     if (isRunning && modelRef.current) {
-      const progressOverlayEnabled = modelRef.current.segments.length <= LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
-
+      // Tracking is cheap at any size; only drawing the completed path is
+      // limited to smaller jobs. Program Execution follows this position.
       const freshStart = !prevIsRunningRef.current || model !== prevModelRef.current
-      if (!progressOverlayEnabled) {
-        progressRef.current = null
-      } else if (senderActive) {
+      const trackingZ = getTrackingZ(modelRef.current, status.wpos.z)
+      if (senderActive) {
         const acceptedSegmentIndex = senderAcceptedLine == null
           ? -1
           : findLastSegmentAtOrBeforeSourceLine(modelRef.current.segments, senderAcceptedLine)
@@ -2463,23 +2698,30 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           ensureCumulativeXYLengths(modelRef.current),
           status.wpos.x,
           status.wpos.y,
-          status.wpos.z,
+          trackingZ,
           progressRef.current,
           getLookaheadDistanceMm(status.feed),
           acceptedSegmentIndex,
+          // The controller executes just behind the last accepted line, so a
+          // relock prefers that pass of a repeated cell over an earlier one.
+          acceptedSegmentIndex >= 0 ? acceptedSegmentIndex : null,
         )
-      } else if (freshStart) {
-        progressRef.current = { segmentIndex: 0, fraction: 0 }
       } else {
-        progressRef.current = findToolpathProgress(
+        // On a fresh start the job may already be under way (the page was
+        // opened mid-job), so look for the tool anywhere first; fall back to
+        // the first move while it is still travelling to the toolpath.
+        const progress = findToolpathProgress(
           modelRef.current.segments,
           ensureCumulativeXYLengths(modelRef.current),
           status.wpos.x,
           status.wpos.y,
-          status.wpos.z,
-          progressRef.current,
+          trackingZ,
+          freshStart ? null : progressRef.current,
           getLookaheadDistanceMm(status.feed),
+          modelRef.current.segments.length - 1,
+          getFileProgressHint(modelRef.current),
         )
+        progressRef.current = progress ?? (freshStart ? { segmentIndex: 0, fraction: 0 } : null)
       }
     } else {
       progressRef.current = null
@@ -2490,7 +2732,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       if (trackedProgress && trackedModel) {
         const cumulative = ensureCumulativeXYLengths(trackedModel)
         const totalLength = cumulative[cumulative.length - 1]
-        const segment = trackedModel.segments[trackedProgress.segmentIndex]
+        const segment = segmentAt(trackedModel.segments, trackedProgress.segmentIndex)
         const completedLength = cumulative[trackedProgress.segmentIndex]
           + (segment ? segmentXYLength(segment) * trackedProgress.fraction : 0)
         setSenderExecutionProgressPercent(totalLength > 0 ? clamp01(completedLength / totalLength) * 100 : 0)
@@ -2502,14 +2744,15 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     }
     setActiveSourceLine(
       trackedProgress && trackedModel
-        ? trackedModel.segments[trackedProgress.segmentIndex]?.sourceLine ?? null
+        ? segmentAt(trackedModel.segments, trackedProgress.segmentIndex)?.sourceLine ?? null
         : null,
     )
     prevIsRunningRef.current = isRunning
     prevModelRef.current = model
 
     if (isRunning && autoFollow && showTool) {
-      ensureToolVisible(status.wpos.x, status.wpos.y)
+      if (followMode === 'center') centerViewOn(status.wpos.x, status.wpos.y)
+      else ensureToolVisible(status.wpos.x, status.wpos.y)
     }
     scheduleRender()
   }, [
@@ -2522,6 +2765,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     senderActive,
     senderAcceptedLine,
     autoFollow,
+    followMode,
     status.wpos.x,
     status.wpos.y,
     status.wpos.z,
@@ -2922,6 +3166,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
             <span className="text-text-dim text-sm whitespace-nowrap">No file loaded</span>
           )}
           {isLocalFile && <span className="tag border-info/30 bg-info/10 text-info normal-case tracking-normal">Local</span>}
+          {restoredFromCache && <span className="tag normal-case tracking-normal" title="Preview restored from this browser's saved copy">Cached</span>}
           {restartSource && (
             <span className="px-1.5 py-0.5 rounded text-xs font-semibold text-accent bg-accent/10 border border-accent/25 shrink-0" title={`Prepared from ${restartSource.fileName}, requested line ${restartSource.requestedLine}`}>
               Restart L{restartSource.resumeLine}
@@ -3017,14 +3262,47 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
             <span>Tool</span>
           </button>
           {!is3D && (
-            <button
-              className={`${btnCls} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
-              onClick={() => setAutoFollow(v => !v)}
-              title="Pan canvas to keep tool in view while running"
-            >
-              <Navigation size={iconSize} />
-              <span>Follow</span>
-            </button>
+            <div className="relative flex items-center">
+              <button
+                className={`${btnCls} rounded-r-none ${isTablet ? 'pr-1' : 'pr-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
+                onClick={() => {
+                  const follow = !autoFollow
+                  setAutoFollow(follow)
+                  if (follow) centerOnRunningTool()
+                }}
+                title={`Keep the tool in view while running (${FOLLOW_MODE_OPTIONS.find(option => option.mode === followMode)?.label})`}
+              >
+                <Navigation size={iconSize} />
+                <span>Follow</span>
+              </button>
+              <button
+                className={`flex items-center self-stretch rounded rounded-l-none transition-colors ${isTablet ? 'px-1' : 'px-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
+                onClick={() => setShowFollowMenu(open => !open)}
+                title="Choose how Follow moves the view"
+                aria-expanded={showFollowMenu}
+              >
+                <ChevronDown size={isTablet ? 12 : 10} className={`transition-transform ${showFollowMenu ? 'rotate-180' : ''}`} />
+              </button>
+              {showFollowMenu && (
+                <div className="absolute right-0 top-full z-30 mt-1 flex w-56 flex-col gap-1 rounded border border-border bg-surface p-1 shadow-lg">
+                  {FOLLOW_MODE_OPTIONS.map(option => (
+                    <button
+                      key={option.mode}
+                      type="button"
+                      className={`w-full rounded border px-2 py-1.5 text-left text-xs transition-colors ${
+                        followMode === option.mode
+                          ? 'border-info/60 bg-info/10 text-info'
+                          : 'border-border/80 bg-surface text-text-primary hover:border-info/60'
+                      }`}
+                      onClick={() => chooseFollowMode(option.mode)}
+                    >
+                      <span className="block font-semibold">{option.label}</span>
+                      <span className="block text-text-muted">{option.detail}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
           <button
             className={`${btnCls} text-text-muted hover:text-text-primary hover:bg-elevated`}
@@ -3097,7 +3375,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               </div>
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-base text-text-dim uppercase tracking-wide">
-                  <span>{pendingPath ? 'Download from controller' : 'Read local file'}</span>
+                  <span>{restoredFromCache ? 'Read cached file' : pendingPath ? 'Download from controller' : 'Read local file'}</span>
                   <span>{downloadProgress == null ? 'Streaming' : `${downloadProgress}%`}</span>
                 </div>
                 <div className="h-1.5 bg-elevated rounded-full overflow-hidden">
@@ -3130,6 +3408,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                   <button
                     className="btn btn-warn gap-2 justify-center text-sm flex-1"
                     onClick={handleStartWithoutPreview}
+                    disabled={blockModePending}
                     title="Cancel the preview download and start the job immediately"
                   >
                     <Zap size={12} />
@@ -3462,10 +3741,15 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                     Motion {Math.round(displayedProgressPercent)}%
                   </span>
                 )}
+                {!simulationActive && !senderActive && runtime.source === 'sd' && (
+                  <span className="text-[11px] font-mono text-text-muted tabular-nums" title="File progress reported by FluidNC">
+                    File {formatJobProgress(displayedProgressPercent, runtime.source)}
+                  </span>
+                )}
               </div>
             )}
             {showDisplayedTiming && (
-              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-text-muted tabular-nums">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm font-mono text-text-muted tabular-nums">
                 <div className="flex items-center justify-between gap-3 min-w-[220px] flex-1">
                   <span>Elapsed {formatRuntime(displayedElapsedSeconds)}</span>
                   <span>Remain {formatRuntime(displayedRemainingSeconds)}</span>
@@ -3554,22 +3838,22 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         {!simulationActive && (controllerSettings.hasMist || controllerSettings.hasFlood) && <>
           <div className="flex gap-1.5 sm:flex-[6]">
             {controllerSettings.hasMist && <button
-              onClick={() => { sendRealtime(0xA0); setCoolantState('mist') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'mist' ? 'border-accent/50 text-accent' : 'btn-ghost'}`}
+              onClick={() => { sendRealtime(0xA1); setCoolantState('mist') }}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'mist' ? 'border-accent/50 text-accent' : 'btn-ghost'}`}
             >
               <CloudDrizzle size={isTablet ? 18 : 13} />
               Mist
             </button>}
             {controllerSettings.hasFlood && <button
-              onClick={() => { sendRealtime(0xA1); setCoolantState('flood') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'flood' ? 'border-info/50 text-info' : 'btn-ghost'}`}
+              onClick={() => { sendRealtime(0xA0); setCoolantState('flood') }}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'flood' ? 'border-info/50 text-info' : 'btn-ghost'}`}
             >
               <Waves size={isTablet ? 18 : 13} />
               Flood
             </button>}
             <button
               onClick={() => { if (sendRaw('M9')) setCoolantState('off') }}
-              className={`btn gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-lg'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
+              className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
             >
               <PowerOff size={isTablet ? 18 : 13} />
               Off
@@ -3578,10 +3862,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="hidden sm:block w-px bg-border self-stretch" />
         </>}
 
-        <div className={`flex gap-1.5 ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
+        <div className={`flex flex-wrap items-center gap-1.5 ${(controllerSettings.hasMist || controllerSettings.hasFlood) ? 'sm:flex-[3]' : 'sm:ml-auto'}`}>
+          <SingleBlockToggle isTablet={isTablet} unavailable={senderActive || simulationActive || (isLocalFile && !machineJobActive)} />
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ghost justify-center shrink-0 ${isTablet ? 'px-3 py-3' : 'px-2'}`}
+              className={`btn btn-ghost justify-center shrink-0 job-action px-2`}
               onClick={() => localFileInputRef.current?.click()}
               disabled={isRunning}
               title="Open a G-code file from this device"
@@ -3592,7 +3877,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && restartSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${isTablet ? 'text-xl py-3' : 'text-sm'}`}
+              className={`btn btn-ghost gap-1.5 justify-center job-action ${isTablet ? 'text-base' : 'text-sm'}`}
               onClick={() => restartSource.path
                 ? loadFile(restartSource.path)
                 : restartSource.sourceText && loadFromText(restartSource.sourceText, restartSource.fileName)}
@@ -3605,10 +3890,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && !restartSource && hasLoadedSource && (
             <button
-              className={`btn btn-ghost gap-1.5 justify-center ${isTablet ? 'text-xl py-3' : 'text-sm'}`}
+              className={`btn btn-ghost gap-1.5 justify-center job-action ${isTablet ? 'text-base' : 'text-sm'}`}
               onClick={() => { setRestartInitialLine(null); setShowRestartFromLine(true) }}
               disabled={isViewerStartBlocked}
-              title={isLocalFile ? 'Prepare a safe local stream that resumes from a file line' : 'Prepare a reviewable SD-card program that restarts from a file line'}
+              title={isLocalFile ? 'Prepare a safe local stream that resumes from a file line' : 'Prepare a reviewable controller program that restarts from a file line'}
             >
               <ListStart size={isTablet ? 18 : 14} />
               From line
@@ -3616,15 +3901,17 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {!isJobRunning && !isJobHeld && !simulationActive && (
             <button
-              className={`btn btn-ok-solid gap-2 justify-center font-bold ${isTablet ? 'text-xl py-3' : 'text-base'} flex-1`}
+              className={`btn btn-ok-solid gap-2 justify-center font-bold job-action ${isTablet ? 'text-base' : 'text-sm'} flex-1`}
               onClick={() => {
                 if (isLocalFile) startLocalSenderWithWarning()
-                else if (loadedPath && sendRaw(`$SD/Run=${loadedPath}`)) startTrackedJob('controller')
+                else if (loadedPath && sendRaw(controllerRunCommand(loadedPath))) startTrackedJob('controller')
               }}
               disabled={(!loadedPath && !isLocalFile) || !connected || status.state !== 'Idle' || isViewerStartBlocked}
               title={isViewerStartBlocked
                 ? controllerResetPending
                   ? 'Controller is resetting after the abort'
+                  : blockModePending
+                    ? 'Waiting for FluidNC to confirm single block mode'
                   : sdUploadPath
                     ? 'Wait for the SD-card upload to finish before starting the job'
                     : 'Wait for file processing to finish before starting the job'
@@ -3636,7 +3923,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobRunning && (
             <button
-              className={`btn btn-warn-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
+              className={`btn btn-warn-solid job-cycle-action gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
               onClick={() => senderActive ? pauseSender() : sendRealtime(0x21)}
               title={controllerJobStarting ? 'Request a feed hold while the job starts' : undefined}
             >
@@ -3646,22 +3933,24 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
           {isJobHeld && (
             <button
-              className={`btn btn-ok-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
-              onClick={() => senderPhase === 'paused' ? resumeSender() : sendRealtime(0x7e)}
-              disabled={senderPhase === 'paused' && status.state === 'Door'}
-              title={senderPhase === 'paused' && status.state === 'Door' ? 'Close the safety door before resuming' : undefined}
+              className={`btn ${isStepHold ? 'btn-step' : 'btn-ok-solid'} job-cycle-action gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
+              onClick={() => senderPhase === 'paused' ? resumeSender() : resumeController()}
+              disabled={senderActive ? status.state === 'Door' : controllerResumeDisabled}
+              title={senderPhase === 'paused' && status.state === 'Door'
+                ? 'Close the safety door before resuming'
+                : isStepHold ? 'Run one line. Spindle and coolant stay on.' : undefined}
             >
-              <Play size={isTablet ? 18 : 13} />
-              Resume
+              {isStepHold ? <StepForward size={isTablet ? 18 : 13} /> : <Play size={isTablet ? 18 : 13} />}
+              {isStepHold ? 'Next block' : 'Resume'}
             </button>
           )}
           {(isJobRunning || isJobHeld) && (
             <button
-              className={`btn btn-danger-solid gap-1.5 ${isTablet ? 'text-xl py-3' : 'text-sm'} justify-center flex-1`}
+              className={`btn btn-danger-solid gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1`}
               onClick={() => {
                 if (senderActive) abortSender()
                 else {
-                  if (sendRealtime(0x18)) cancelTrackedJob('controller')
+                  if (sendRealtimeNow(0x18)) cancelTrackedJob('controller')
                 }
               }}
             >
@@ -3671,6 +3960,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           )}
         </div>
         </div>
+        <SingleBlockNotice unavailable={senderActive || (isLocalFile && !machineJobActive)} />
         {isTablet && (
           <div className="flex items-center gap-2 min-w-0 pt-1 border-t border-border">
             {fileName ? (
@@ -3678,6 +3968,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 <span className="text-text-primary font-mono normal-case tracking-normal font-normal truncate text-base">
                   {fileName}
                 </span>
+                {restoredFromCache && <span className="tag normal-case tracking-normal" title="Preview restored from this browser's saved copy">Cached</span>}
                 {restartSource && (
                   <span className="px-1.5 py-0.5 rounded text-sm font-semibold text-accent bg-accent/10 border border-accent/25 shrink-0">
                     Restart L{restartSource.resumeLine}

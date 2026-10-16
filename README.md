@@ -24,6 +24,7 @@ A modern web-based interface built with React & Typescript for [FluidNC](https:/
   - [Responsive Layouts](#responsive-layouts)
 - [Plugin API](#plugin-api)
 - [Deployment](#deployment)
+- [Contributing](#contributing)
 - [Tech Stack](#tech-stack)
 - [License](#license)
 
@@ -45,6 +46,7 @@ The DRO displays live axis positions in both work coordinates (WPos) and machine
 
 - Zero any axis independently or all at once
 - "Go to zero" buttons for each axis
+- Tap an axis readout to enter a coordinate using your device’s keyboard, or the compact numpad in tablet mode. **Set** assigns the current position that work coordinate; **Go** moves the axis at its jog feed rate.
 - Home all axes or individual axes
 - Live feed rate and spindle RPM display
 
@@ -64,6 +66,8 @@ Keyboard jogging is supported: arrow keys for X/Y, `+`/`-` for Z. Feed rates for
 ### G-Code Viewer
 
 A 3D toolpath viewer renders the loaded G-code file using WebGL. It provides a spatial overview of the job before and during execution.
+
+Controller file previews and their work offsets are saved in IndexedDB. Reloading during a running or held job restores the matching preview from this browser without reading the file from the controller. The cache keeps the last prepared and last running file for each controller; successful uploads are included. Restored previews show a **Cached** label. Use the same browser and controller address, and prepare the file at least once before running it. Edits, replacements, renames, and deletions through FigUI invalidate saved copies; changes made elsewhere cannot be verified during a job.
 
 > [!Info]
 > For very large G-code files, toolhead progress tracking is intentionally disabled. Rendering a live toolhead position on a dense toolpath is expensive and may degrade responsiveness.
@@ -104,6 +108,8 @@ The file manager gives access to both the SD card and the ESP32 internal filesys
 ### Code Editor
 
 Text files stored on the controller can be opened and edited directly in the browser. The editor includes syntax highlighting and saves changes back to the controller filesystem.
+
+Config Studio, the visual YAML editor, is available on desktops and tablets; phones use YAML view. Open it from Settings → Machine Config to choose a YAML file from Internal storage. It downloads from GitHub Pages when first opened. After a successful download, the browser caches that Studio build for offline use on the same controller address. Clearing browser storage, changing browsers or controller addresses, or installing firmware that needs a different Studio build requires another download. Code view and config validation remain part of the controller UI.
 
 ---
 
@@ -154,6 +160,10 @@ The selected theme persists to local storage.
 
 ### Responsive Layouts
 
+FigUI switches between **mobile**, **tablet**, and **desktop** from viewport width and pointer type (`auto`, or a forced layout in Settings).
+
+On **short landscape tablets** (visible height under 640px), the tablet UI stacks POSITION and JOG side by side and puts Viewer/Files/Macros in a full-width tab strip, with page scroll so jog targets stay usable. Taller tablets keep the two-column landscape layout.
+
 Tablet Layout
 ![Tablet](docs/screenshots/figUI-tablet.png)
 
@@ -180,6 +190,37 @@ npm run build:esp32
 ```
 
 The `dist/` directory contains the static index.html.gz file you can upload to the internal filesystem of the ESP32. Simply refresh the page to show changes.
+
+Config Studio is built separately with `npm run build:studio`. Production UI builds reference an exact Studio build under `config-studio/<build-id>/` on GitHub Pages; deploy those assets before distributing a custom firmware build. Both Pages workflows build Studio and restore previously published versions through `scripts/prepare-config-studio-pages.mjs`, so older controllers continue to work. The archive is retained as `config-studio/archive.json.gz`; restoration failures stop deployment instead of silently deleting old builds. Keep the build input list in `scripts/config-studio-build-id.mjs` current when adding Studio dependencies.
+
+For local development, `npm run dev` loads Studio from the local source when opened. Run `npm run test:config` and `npm run test:studio` to check config compatibility, remote loading, offline caching, retries, and asset preservation.
+
+---
+
+## Contributing
+
+### Prioritize bundle size
+
+FigUI lives on the ESP32's internal filesystem alongside macros and configuration files. **Bundle size is a primary design constraint for every contribution.** Each increase reduces space available to users and room for future features. Keep changes focused and justify the storage cost of additions to the core UI.
+
+Before submitting a PR, build both the target branch and your changes using the same Node/npm versions and each revision's lockfile:
+
+```bash
+npm ci
+npm run build:esp32
+```
+
+Compare the final **`dist/index.html.gz`** files. Include the before/after sizes in bytes, the increase or decrease, and a brief explanation of any growth in your PR description.
+
+### Keep the bundle small
+
+- **Reuse existing code and UI.** Share repeated controls, parameter rows, probe symbols, SVG definitions, and common logic where doing so reduces the output. Measure the result; extra abstraction can also add bytes.
+- **Choose dependencies carefully.** Prefer existing utilities and browser APIs when they meet the need. Check the actual production cost of a new package, use imports that allow unused code to be removed, and avoid pulling in a general-purpose library for a small helper. Use the existing generated icon system.
+- **Keep specialized features optional.** Consider a [plugin](plugins/PLUGIN_GUIDE.md) for advanced workflows.
+- **Account for the single-file build.** The ESP32 build inlines dynamic imports and assets. Moving code into another file or using `import()` alone does not reduce controller storage.
+- **Preserve safety and readability.** The build already minifies, mangles CSS classes, packs JavaScript, and compresses with Zopfli. Focus on scope, duplication, dependencies, and assets. Keep necessary validation and machine-control safeguards, and let the build tools minify readable source.
+
+Contributions with unexplained or disproportionate bundle growth may need to be reduced or moved out of the core UI before merging.
 
 ---
 

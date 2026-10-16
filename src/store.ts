@@ -148,6 +148,11 @@ function getFluidNCAxisRange(settings: FluidNCSetting[], axis: 'x' | 'y' | 'z') 
 
 function deriveControllerSettingsFromFluidNCSettings(settings: FluidNCSetting[]): Partial<ControllerSettings> {
   const derived: Partial<ControllerSettings> = {}
+  for (const axis of ['X', 'Y', 'Z', 'A', 'B', 'C'] as const) {
+    const maxRate = getSettingNumber(settings, `axes/${axis}/max_rate_mm_per_min`)
+      ?? getSettingNumber(settings, `Grbl/MaxRate/${axis}`)
+    if (maxRate !== undefined) derived[`maxRate${axis}`] = maxRate
+  }
   const reportInches = getSettingBoolean(settings, 'report_inches')
     ?? getSettingBoolean(settings, 'report/inches')
   if (reportInches !== undefined) derived.reportInches = reportInches
@@ -228,6 +233,7 @@ const DEFAULT_WATCHDOG_STATE: WatchdogState = {
 
 interface Store {
   connected: boolean
+  statusReceived: boolean
   restarting: boolean
   controllerResetPending: boolean
   startupPending: boolean
@@ -255,6 +261,7 @@ interface Store {
   } | null
 
   setConnected: (v: boolean) => void
+  setStatusReceived: (v: boolean) => void
   setRestarting: (v: boolean) => void
   setControllerResetPending: (v: boolean) => void
   setStartupPending: (v: boolean) => void
@@ -281,6 +288,7 @@ interface Store {
 
 export const useMachineStore = create<Store>((set) => ({
   connected: false,
+  statusReceived: false,
   restarting: false,
   controllerResetPending: false,
   startupPending: false,
@@ -306,7 +314,13 @@ export const useMachineStore = create<Store>((set) => ({
   activeStepJog: null,
   pendingUpdateVersion: null,
 
-  setConnected: (connected) => set({ connected }),
+  setConnected: (connected) => set(state => ({
+    connected,
+    statusReceived: false,
+    // A new socket has not yet confirmed the controller's current state.
+    ...(connected ? { status: { ...state.status, state: 'Unknown' as const } } : {}),
+  })),
+  setStatusReceived: (statusReceived) => set({ statusReceived }),
   setRestarting: (restarting) => set({ restarting }),
   setControllerResetPending: (controllerResetPending) => set({ controllerResetPending }),
   setStartupPending: (startupPending) => set({ startupPending }),

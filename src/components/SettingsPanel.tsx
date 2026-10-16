@@ -17,7 +17,6 @@ import {
   Radio,
   Trash2,
   Square,
-  AlertTriangle,
   Target,
   FileCode2,
 } from "lucide-react";
@@ -32,8 +31,12 @@ import {
 import { useMachineStore } from "../store";
 import type { Theme } from "../store";
 import type { FluidNCSetting } from "../types";
-import { loadControllerConfigSettings } from "../lib/controllerConfig";
+import {
+  loadControllerConfigSettings,
+  updateControllerConfigSetting,
+} from "../lib/controllerConfig";
 import { LimitsTab } from "./LimitsTab";
+import { useViewportMetrics } from "../lib/viewport";
 
 type Setting = FluidNCSetting;
 
@@ -1433,38 +1436,6 @@ function ESPNowPendantsTab() {
 
   return (
     <div>
-      <div
-        className="flex items-start gap-2.5 mx-4 my-4 px-3 py-2.5 rounded
-                      bg-warn/10 border border-warn/30 text-sm text-text-muted"
-      >
-        <AlertTriangle size={15} className="text-warn shrink-0 mt-0.5" />
-        <div className="min-w-0 leading-relaxed">
-          <span className="font-medium text-text-primary">
-            Experimental feature.
-          </span>{" "}
-          Until ESP-NOW support is merged into FluidNC, both the pendant and
-          FluidNC machine must use the ESP-NOW fork available through the{" "}
-          <a
-            href="https://figamore.github.io/FluidDial/"
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 text-accent hover:underline"
-          >
-            preview installer
-          </a>
-          . See the{" "}
-          <a
-            href="https://github.com/figamore/FluidDial/blob/main/docs/ESP-NOW.md"
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 text-accent hover:underline"
-          >
-            ESP-NOW documentation
-          </a>{" "}
-          for setup details.
-        </div>
-      </div>
-
       <div className="flex flex-wrap items-center gap-2 px-5 py-3.5 border-b border-border">
         {secondsLeft > 0 ? (
           <>
@@ -1596,6 +1567,7 @@ export function SettingsPanel({
   onClose,
   onRequestCloseReady,
 }: SettingsPanelProps) {
+  const isMobile = useViewportMetrics().innerWidth < 768;
   const espInfo = useMachineStore((s) => s.espInfo);
   const units = useMachineStore((s) => s.units);
   const setUnits = useMachineStore((s) => s.setUnits);
@@ -1616,6 +1588,7 @@ export function SettingsPanel({
   const [filter, setFilter] = useState("");
   const [category, setCategory] = useState("workspace");
   const [subKey, setSubKey] = useState("");
+  const [configSublistExpanded, setConfigSublistExpanded] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [pendingConfigChanges, setPendingConfigChanges] = useState<
     Record<string, PendingConfigChange>
@@ -1623,10 +1596,14 @@ export function SettingsPanel({
   const [savingConfigFile, setSavingConfigFile] = useState(false);
 
   async function openConfigStudio() {
+    if (window.innerWidth < 768) return;
     const closed = await requestClose();
     if (!closed) return;
     setTimeout(
-      () => window.dispatchEvent(new CustomEvent("config:open-studio")),
+      () =>
+        window.dispatchEvent(
+          new CustomEvent("config:show-studio"),
+        ),
       0,
     );
   }
@@ -1672,11 +1649,15 @@ export function SettingsPanel({
 
   async function saveSetting(p: string, t: string, v: string) {
     // Always update runtime configuration first
-    await sendCommand(`[ESP401]P=${p} T=${t} V=${v}`);
+    // FluidNC's V= parser stops at an unescaped space and treats backslash as an escape
+    const escaped = v.replace(/\\/g, "\\\\").replace(/ /g, "\\ ");
+    await sendCommand(`[ESP401]P=${p} T=${t} V=${escaped}`);
 
     const setting = settings.find((s) => s.P === p);
-    const updatedSettings = settings.map((s) =>
-      s.P === p ? { ...s, V: v } : s,
+    const updatedSettings = updateControllerConfigSetting(
+      useMachineStore.getState().controllerConfigSettings ?? settings,
+      p,
+      v,
     );
     setSettings(updatedSettings);
     useMachineStore.getState().setControllerConfigSettings(updatedSettings);
@@ -1823,9 +1804,15 @@ export function SettingsPanel({
   const activeCat = CAT_DEFS[category];
 
   function selectCategory(id: string) {
+    if (id === "config" && category === "config" && !filter.trim()) {
+      setConfigSublistExpanded((expanded) => !expanded);
+      return;
+    }
+
     setCategory(id);
     setSubKey("");
     setFilter("");
+    setConfigSublistExpanded(id === "config");
   }
 
   return (
@@ -1948,22 +1935,55 @@ export function SettingsPanel({
             {categories.map((cat) => {
               const Icon = cat.icon;
               const active = !isSearching && category === cat.id;
+              const showConfigSublist =
+                cat.id === "config" &&
+                active &&
+                configSublistExpanded &&
+                subKeys.length > 1;
+
               return (
-                <button
-                  key={cat.id}
-                  onClick={() => selectCategory(cat.id)}
-                  className={`flex items-center gap-1.5 sm:gap-2.5 sm:w-full
-                              px-2.5 sm:px-3 py-1.5 sm:py-2 rounded
-                              text-sm sm:text-base whitespace-nowrap
-                              transition-all text-left ${
-                                active
-                                  ? "bg-accent/[0.12] text-accent font-medium"
-                                  : "text-text-muted hover:text-text-primary hover:bg-elevated"
-                              }`}
-                >
-                  <Icon size={14} className="shrink-0" />
-                  {cat.label}
-                </button>
+                <div key={cat.id} className="shrink-0 sm:w-full">
+                  <button
+                    onClick={() => selectCategory(cat.id)}
+                    aria-expanded={
+                      cat.id === "config" ? showConfigSublist : undefined
+                    }
+                    className={`flex items-center gap-1.5 sm:gap-2.5 sm:w-full
+                                px-2.5 sm:px-3 py-1.5 sm:py-2 rounded
+                                text-sm sm:text-base whitespace-nowrap
+                                transition-all text-left ${
+                                  active
+                                    ? "bg-accent/[0.12] text-accent font-medium"
+                                    : "text-text-muted hover:text-text-primary hover:bg-elevated"
+                                }`}
+                  >
+                    <Icon size={14} className="shrink-0" />
+                    {cat.label}
+                  </button>
+
+                  {showConfigSublist && (
+                    <div
+                      className="hidden sm:flex sm:flex-col gap-1 mt-1 sm:ml-3 sm:pl-2 sm:border-l sm:border-border"
+                      role="group"
+                      aria-label="Machine Config sections"
+                    >
+                      {subKeys.map((k) => (
+                        <button
+                          key={k}
+                          onClick={() => setSubKey(k)}
+                          aria-current={subKey === k ? "page" : undefined}
+                          className={`px-2.5 py-1 text-sm text-left whitespace-nowrap rounded transition-colors ${
+                            subKey === k
+                              ? "bg-accent/[0.12] text-accent font-medium"
+                              : "text-text-muted hover:text-text-primary hover:bg-elevated"
+                          }`}
+                        >
+                          {k}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
               );
             })}
           </nav>
@@ -1975,20 +1995,49 @@ export function SettingsPanel({
               <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-border">
                 <h3 className="min-w-0 text-base font-semibold text-text-primary flex items-center gap-2">
                   <activeCat.icon size={14} className="text-accent shrink-0" />
-                  <span className="truncate">{activeCat.label}</span>
+                  <span className="truncate">
+                    {activeCat.label}
+                    {category === "config" && subKey && ` › ${subKey}`}
+                  </span>
                 </h3>
                 {category === "config" && (
                   <button
                     className="btn btn-primary shrink-0 px-3 py-1.5 text-sm"
                     onClick={openConfigStudio}
+                    disabled={isMobile}
+                    title={isMobile ? "Config Studio is available on tablets and desktops" : undefined}
                   >
-                    <FileCode2 size={14} /> Open Config Studio
+                    <FileCode2 size={14} />
+                    <span className="sm:hidden">Config Studio</span>
+                    <span className="hidden sm:inline">Open Config Studio</span>
                   </button>
                 )}
               </div>
 
-              {(category === "machine" || category === "config") &&
-                subKeys.length > 1 && (
+              {category === "config" && subKeys.length > 1 && (
+                <div className="sm:hidden flex items-center gap-3 px-4 py-2 border-b border-border">
+                  <label
+                    htmlFor="machine-config-section"
+                    className="shrink-0 text-sm font-medium text-text-muted"
+                  >
+                    Section
+                  </label>
+                  <select
+                    id="machine-config-section"
+                    value={subKey}
+                    onChange={(e) => setSubKey(e.target.value)}
+                    className="input-field flex-1 py-1.5 text-sm"
+                  >
+                    {subKeys.map((k) => (
+                      <option key={k} value={k}>
+                        {k}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {category === "machine" && subKeys.length > 1 && (
                   <div
                     className="flex border-b border-border overflow-x-auto px-2"
                     style={{ scrollbarWidth: "none" }}

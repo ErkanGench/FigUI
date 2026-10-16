@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import { viteSingleFile } from 'vite-plugin-singlefile'
 import tailwindMangle from 'unplugin-tailwindcss-mangle/vite'
 import { fileURLToPath } from 'url'
+import { configStudioBuildId } from './scripts/config-studio-build-id.mjs'
 
 const mangleReservedPrefixes = [
   'btn-',
@@ -24,6 +25,7 @@ const shouldMangleClass = (className: string) =>
   !mangleReservedPrefixes.some((prefix) => className.startsWith(prefix))
 
 export default defineConfig(({ mode }) => ({
+  define: { __CONFIG_STUDIO_BUILD__: JSON.stringify(configStudioBuildId()) },
   resolve: {
     alias: {
       'react':             'preact/compat',
@@ -55,6 +57,10 @@ export default defineConfig(({ mode }) => ({
       // Favor transfer size over minifier speed for the firmware artifact.
       minify: 'terser',
       cssMinify: 'lightningcss',
+      // Without a browser target LightningCSS assumes the newest engine and rewrites
+      // `background-color: transparent` as `#0000`, which the tablet WebView drops —
+      // bare buttons then fall back to the light UA ButtonFace.
+      cssTarget: 'chrome61',
       modulePreload: { polyfill: false },
       terserOptions: {
         ecma: 2022,

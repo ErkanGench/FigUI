@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { canLoadControllerResources, useControllerResourcesReady } from "../lib/controllerResources";
 import {
   Folder,
   File,
@@ -37,6 +38,14 @@ import { isGCodeFileName } from "../lib/gcodeFiles";
 
 type Filesystem = "sd" | "local";
 type UploadTarget = { fs: Filesystem; path: string; name: string };
+type EditingFile = {
+  fs: Filesystem;
+  path: string;
+  filename: string;
+  content: string;
+  openStudio?: boolean;
+  restoreFromHistory?: boolean;
+};
 
 const isGcode = isGCodeFileName;
 const isYamlFile = (name: string) => /\.ya?ml$/i.test(name);
@@ -204,7 +213,7 @@ function FileRow({
           />
         ) : isTablet ? (
           <button
-            className={`flex-1 text-left text-2xl truncate ${
+            className={`flex-1 min-w-0 text-left text-2xl truncate ${
               entry.isDir
                 ? "text-text-primary"
                 : isGcode(entry.name)
@@ -244,6 +253,12 @@ function FileRow({
         ) : (
           <span className={`flex-1 text-xl text-text-primary truncate`}>
             {entry.name}
+          </span>
+        )}
+
+        {!renaming && isTablet && !entry.isDir && (
+          <span className="shrink-0 text-base text-text-dim font-mono text-right whitespace-nowrap">
+            {fmtSize(entry.size)}
           </span>
         )}
 
@@ -426,6 +441,7 @@ export function prefetchInternalFiles() {
 }
 
 export function FileManager({ isTablet }: { isTablet?: boolean }) {
+  const resourcesReady = useControllerResourcesReady();
   const espInfo = useMachineStore((s) => s.espInfo);
   const machineState = useMachineStore((s) => s.status.state);
   const loadGCodeFromText = useGCodeStore((s) => s.loadFromText);
@@ -436,7 +452,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   const canLoadGcode = machineState !== "Run" && machineState !== "Hold";
 
   const [fs, setFs] = useState<Filesystem>(_fmLastFs);
-  const [path, setPath] = useState(_fmCache.get(_fmLastFs)?.path ?? primarySd);
+  const [path, setPath] = useState(_fmCache.get(_fmLastFs)?.path ?? (_fmLastFs === "sd" ? primarySd : "/"));
   const [result, setResult] = useState<FileListResult | null>(
     _fmCache.get(_fmLastFs)?.result ?? null,
   );
@@ -455,13 +471,8 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   const [showNewDir, setShowNewDir] = useState(false);
   const [newFileName, setNewFileName] = useState("");
   const [showNewFile, setShowNewFile] = useState(false);
-  const [editing, setEditing] = useState<{
-    fs: Filesystem;
-    path: string;
-    filename: string;
-    content: string;
-    openStudio?: boolean;
-  } | null>(null);
+  const [editing, setEditing] = useState<EditingFile | null>(null);
+  const editorHistoryRef = useRef<EditingFile | null>(null);
   const [editLoading, setEditLoading] = useState<string | null>(null);
   const [configChoices, setConfigChoices] = useState<FileEntry[] | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -478,27 +489,89 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   const sdRoot = primarySd;
   const localRoot = "/";
+  const pendingListing = useRef<{ path: string; fs: Filesystem } | null>(null);
+  const activeListing = useRef<{ path: string; fs: Filesystem } | null>(null);
+  const listingGeneration = useRef(0);
 
   const load = useCallback(async (p: string, filesystem: Filesystem) => {
-    setLoading(true);
+    const generation = ++listingGeneration.current;
+    const request = { path: p, fs: filesystem };
+    pendingListing.current = request;
+    activeListing.current = null;
+    setFs(filesystem);
+    setPath(p);
+    setResult(null);
     setError("");
+    _fmLastFs = filesystem;
+    if (!canLoadControllerResources(useMachineStore.getState())) {
+      setLoading(false);
+      return;
+    }
+    pendingListing.current = null;
+    activeListing.current = request;
+    setLoading(true);
     try {
       const data = await listFiles(p, filesystem);
+      if (generation !== listingGeneration.current) return;
+      if (!canLoadControllerResources(useMachineStore.getState())) {
+        pendingListing.current = request;
+        return;
+      }
       setResult(data);
-      setPath(p);
       _fmCache.set(filesystem, { result: data, path: p });
-      _fmLastFs = filesystem;
     } catch (e) {
+      if (generation !== listingGeneration.current) return;
+      if (!canLoadControllerResources(useMachineStore.getState())) {
+        pendingListing.current = request;
+        return;
+      }
       setError(e instanceof Error ? e.message : "Failed to load");
     } finally {
-      setLoading(false);
+      if (generation === listingGeneration.current) {
+        activeListing.current = null;
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    if (_fmCache.has("sd")) return;
-    load(sdRoot, "sd");
-  }, [load, sdRoot]);
+    if (!resourcesReady) return;
+    const pending = pendingListing.current;
+    if (pending) {
+      load(pending.path, pending.fs);
+      return;
+    }
+    if (activeListing.current?.fs === fs && activeListing.current.path === path) return;
+    if (_fmCache.get(fs)?.path === path) return;
+    load(path, fs);
+  }, [load, fs, path, resourcesReady]);
+
+  useEffect(() => () => { listingGeneration.current++; }, []);
+
+  useEffect(() => {
+    if (editing) editorHistoryRef.current = editing;
+  }, [editing]);
+
+  useEffect(() => {
+    const restoreEditor = (event: PopStateEvent) => {
+      const state = event.state as {
+        figuiCodeEditor?: { filename?: unknown };
+      } | null;
+      const filename = state?.figuiCodeEditor?.filename;
+      const previousEditor = editorHistoryRef.current;
+      if (
+        typeof filename !== "string" ||
+        !previousEditor ||
+        previousEditor.filename !== filename
+      )
+        return;
+
+      setEditing({ ...previousEditor, restoreFromHistory: true });
+    };
+
+    window.addEventListener("popstate", restoreEditor);
+    return () => window.removeEventListener("popstate", restoreEditor);
+  }, []);
 
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -512,7 +585,13 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   useEffect(() => {
     window.addEventListener("files:changed", scheduleRefresh);
-    return () => window.removeEventListener("files:changed", scheduleRefresh);
+    return () => {
+      window.removeEventListener("files:changed", scheduleRefresh);
+      if (refreshTimerRef.current !== null) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
   }, [scheduleRefresh]);
 
   const openStudioFile = useCallback(async (filename: string) => {
@@ -535,6 +614,32 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
       setEditLoading(null);
     }
   }, []);
+
+  const openConfigEditor = useCallback(async () => {
+    setEditLoading("config.yaml");
+    try {
+      const content = await fetchFileContent("/config.yaml", "local");
+      setEditing({
+        fs: "local",
+        path: "/",
+        filename: "config.yaml",
+        content,
+      });
+    } catch (e) {
+      alert(
+        `Failed to open config.yaml: ${e instanceof Error ? e.message : "Unknown error"}`,
+      );
+    } finally {
+      setEditLoading(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("files:open-config-editor", openConfigEditor);
+    return () => {
+      window.removeEventListener("files:open-config-editor", openConfigEditor);
+    };
+  }, [openConfigEditor]);
 
   useEffect(() => {
     const openStudio = async () => {
@@ -622,6 +727,11 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   }, [fs, highlightedUpload, path, result]);
 
   function switchFs(newFs: Filesystem) {
+    listingGeneration.current++;
+    pendingListing.current = null;
+    activeListing.current = null;
+    setLoading(false);
+    setError("");
     _fmLastFs = newFs;
     setHighlightedUpload(null);
     setSelectionMode(false);
@@ -698,7 +808,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
             setUploadPhase,
           );
           await previewLoad;
-          if (previewPath) completeSdUpload(previewPath);
+          if (previewPath) await completeSdUpload(previewPath);
         } catch (e) {
           // Let the preview request settle before removing it, so it cannot
           // finish later and re-enable Start for an incomplete SD file.
@@ -1181,6 +1291,12 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
           </div>
         )}
 
+        {!resourcesReady && !result && (
+          <div className="p-4 text-text-muted text-sm">
+            Files will load when the controller is idle.
+          </div>
+        )}
+
         {loading && !result && (
           <div className="flex items-center justify-center h-24 text-text-muted text-base">
             <RefreshCw size={14} className="animate-spin mr-2" /> Loading…
@@ -1345,6 +1461,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
           onSave={handleSaveFile}
           onClose={() => setEditing(null)}
           initialView={editing.openStudio ? "studio" : "code"}
+          restoreFromHistory={editing.restoreFromHistory}
         />
       )}
     </div>

@@ -4,16 +4,17 @@ import { useGCodeStore } from './store/gcode'
 import { useGCodeSenderStore } from './store/gcodeSender'
 import { useTerminalStore } from './store/terminal'
 import { connect, isSocketOpen, onLine, sendStartupQueries } from './lib/ws'
-import { setBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg } from './lib/http'
+import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, WebUIBlockedError } from './lib/http'
+import { isWasmBridgeActive, WASM_BRIDGE_BASE } from './wasmBridge/shimTransport'
 import { parseESP800 } from './lib/parser'
-import { prefetchControllerConfigSettings } from './lib/controllerConfig'
+import { loadControllerConfigSettings } from './lib/controllerConfig'
+import { scheduleControllerStartup } from './lib/controllerResources'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from './lib/updateCheck'
 import { startWatchdog, stopWatchdog } from './lib/jogWatchdog'
 import { Header } from './components/Header'
 import { DRO } from './components/DRO'
 import { TabletJogPad } from './components/JogPad'
 import { ProbeOrProgramPanel } from './components/ProgramExecutionPanel'
-import { TabletAccordion } from './components/TabletAccordion'
 
 import { GCodeViewer } from './components/GCodeViewer'
 import { FileManager, prefetchInternalFiles } from './components/FileManager'
@@ -22,6 +23,7 @@ import { Macros } from './components/Macros'
 import { SettingsPanel } from './components/SettingsPanel'
 import { AboutModal } from './components/AboutModal'
 import { JobControl } from './components/JobControl'
+import { WebUIBlocked } from './components/WebUIBlocked'
 import { PluginLauncher } from './components/PluginLauncher'
 import { WifiOff, RefreshCw, Crosshair, Monitor, FolderOpen, TerminalSquare, AlertTriangle } from 'lucide-react'
 import type { Plugin, SidebarTab, ActiveLayout } from './types'
@@ -29,6 +31,10 @@ import { getEffectiveLayout } from './types'
 import { PluginFrame } from './components/PluginFrame'
 import { DesktopLayout } from './components/DesktopLayout'
 import { ManualATCPrompt } from './components/ManualATCPrompt'
+import { HoldPrompt } from './components/HoldPrompt'
+import { TabletMainShell } from './components/TabletMainShell'
+import { ViewportProvider, useViewportMetrics } from './lib/viewport'
+import type { TabletTabId } from './lib/tabletTabs'
 
 const SIDEBAR_TABS: { id: SidebarTab; label: string }[] = [
   { id: 'files',   label: 'Files'   },
@@ -37,22 +43,14 @@ const SIDEBAR_TABS: { id: SidebarTab; label: string }[] = [
 ]
 
 type MobilePanel = 'control' | 'viewer' | 'right' | 'terminal'
-type TabletRightTab = 'viewer' | 'files' | 'macros' | 'terminal'
 
 type Phase = 'connecting' | 'error' | 'ready'
 
 function useActiveLayout(layoutMode: 'auto' | 'tablet' | 'desktop'): ActiveLayout {
-  const [width, setWidth] = useState(() =>
-    typeof window === 'undefined' ? 1270 : window.innerWidth,
-  )
+  const { innerWidth: width } = useViewportMetrics()
   const [isCoarsePointer, setIsCoarsePointer] = useState(() =>
     typeof window === 'undefined' ? false : window.matchMedia('(pointer: coarse)').matches,
   )
-  useEffect(() => {
-    const onResize = () => setWidth(window.innerWidth)
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
   useEffect(() => {
     const mq = window.matchMedia('(pointer: coarse)')
     const onChange = (e: MediaQueryListEvent) => setIsCoarsePointer(e.matches)
@@ -69,7 +67,17 @@ function useActiveLayout(layoutMode: 'auto' | 'tablet' | 'desktop'): ActiveLayou
 }
 
 export function App() {
+  return (
+    <ViewportProvider>
+      <AppContent />
+    </ViewportProvider>
+  )
+}
+
+function AppContent() {
   const connected = useMachineStore(s => s.connected)
+  const statusReceived = useMachineStore(s => s.statusReceived)
+  const runningFile = useMachineStore(s => s.status.sdFilename)
   const restarting = useMachineStore(s => s.restarting)
   const sidebarTab = useMachineStore(s => s.sidebarTab)
   const layoutMode = useMachineStore(s => s.layoutMode)
@@ -84,7 +92,10 @@ export function App() {
   const spindleSpeed = useMachineStore(s => s.status.spindle)
   const spindleSpinupMs = useMachineStore(s => s.controllerSettings.spindleSpinupMs ?? 0)
   const activeLayout = useActiveLayout(layoutMode)
+  const { isCompactLandscape } = useViewportMetrics()
+  const compactLandscapeScroll = isCompactLandscape && activeLayout === 'tablet'
   const loadGCodeFile = useGCodeStore(s => s.loadFile)
+  const restoreRunningFile = useGCodeStore(s => s.restoreRunningFile)
   const senderPhase = useGCodeSenderStore(s => s.phase)
   const senderFileName = useGCodeSenderStore(s => s.fileName)
   const senderError = useGCodeSenderStore(s => s.error)
@@ -96,6 +107,7 @@ export function App() {
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const [phase, setPhase]   = useState<Phase>('connecting')
   const [errMsg, setErrMsg] = useState('')
+  const [webUIBlocked, setWebUIBlocked] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const requestSettingsCloseRef = useRef<(() => void) | null>(null)
   const requestSettingsClose = useCallback(() => {
@@ -103,11 +115,44 @@ export function App() {
   }, [])
   const [aboutOpen, setAboutOpen] = useState(false)
   const [mobilePanel, setMobilePanel]     = useState<MobilePanel>('control')
-  const [tabletTab,   setTabletTab]       = useState<TabletRightTab>('viewer')
+  const [tabletTab,   setTabletTab]       = useState<TabletTabId>('viewer')
   const [workspacePlugin, setWorkspacePlugin] = useState<Plugin | null>(null)
   const [controlsPlugin,  setControlsPlugin]  = useState<Plugin | null>(null)
   const [fullPlugin,      setFullPlugin]      = useState<Plugin | null>(null)
   const [jogPlugin,       setJogPlugin]       = useState<Plugin | null>(null)
+
+  useEffect(() => {
+    let firstFrame: number | null = null
+    let secondFrame: number | null = null
+
+    const showConfigEditor = (event: Event) => {
+      const studio = event.type === 'config:show-studio'
+      if (studio && window.innerWidth < 768) return
+      setFullPlugin(null)
+      setWorkspacePlugin(null)
+      setControlsPlugin(null)
+      setSidebarTab('files')
+      setMobilePanel('right')
+      setTabletTab('files')
+
+      // FileManager only exists while the Files panel is visible.
+      // Dispatch once it has mounted and installed its event listener.
+      firstFrame = requestAnimationFrame(() => {
+        secondFrame = requestAnimationFrame(() => {
+          window.dispatchEvent(new CustomEvent(studio ? 'config:open-studio' : 'files:open-config-editor'))
+        })
+      })
+    }
+
+    window.addEventListener('files:show-config-editor', showConfigEditor)
+    window.addEventListener('config:show-studio', showConfigEditor)
+    return () => {
+      window.removeEventListener('files:show-config-editor', showConfigEditor)
+      window.removeEventListener('config:show-studio', showConfigEditor)
+      if (firstFrame !== null) cancelAnimationFrame(firstFrame)
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame)
+    }
+  }, [setSidebarTab])
 
   const handleLaunchPanel = useCallback((plugin: Plugin) => {
     const layout = getEffectiveLayout(plugin.manifest, activeLayout)
@@ -208,28 +253,29 @@ export function App() {
       ? await getDeviceInfoFast()
       : await getDeviceInfo()
     const info = parseESP800(raw)
-    const wsComm = info['webcommunication']?.trim() ?? ''
-    const parts  = wsComm.split(':')
-    const asyncMode = parts[0]?.trim() === 'Async'
-    const wsPort = parts[1]?.trim() ?? '80'
-    const wsIp   = parts[2]?.trim() ?? httpHost.split(':')[0]
+    const asyncMode = info['WebCommunication']?.trim() === 'Asynchronous'
+    const wsPort = info['WebSocketPort']?.trim() || '80'
+    const wsIp   = info['WebSocketIP']?.trim() || httpHost.split(':')[0]
     const wsHost = asyncMode
       ? `${httpHost}/ws`
       : wsPort === '80' ? wsIp : `${wsIp}:${wsPort}`
     cachedWsHost.current = wsHost
     cachedHostFailures.current = 0
     // Only refresh ESP info on a fresh probe.
-    const axes = parseInt(info['axis'] ?? '3', 10)
+    const axes = (info['Axisletters'] ?? '').length
     setEspInfo({
-      version:        info['FW version']?.trim()     ?? '',
-      hostname:       info['hostname']?.trim()        ?? httpHost,
-      authentication: info['authentication']?.trim()  === 'yes',
+      version:        info['FWVersion']?.trim()       ?? '',
+      hostname:       info['HostName']?.trim()         ?? httpHost,
+      authentication: info['Authentication']?.trim()   === 'Enabled',
       asyncMode,
       wsPort:         parseInt(wsPort, 10),
       wsIp,
-      axes:           isNaN(axes) ? 3 : axes,
-      primarySd:      info['primary sd']?.trim()     ?? '/sd/',
-      secondarySd:    info['secondary sd']?.trim()   ?? '/ext/',
+      axes:           axes || 3,
+      // No JSON equivalent for these (the legacy plain-text response's
+      // "primary sd"/"secondary sd" fields) -- same defaults the old
+      // parse already fell back to whenever they were absent/unparseable.
+      primarySd:      '/sd/',
+      secondarySd:    '/ext/',
     })
     return { wsHost, info }
   }
@@ -239,7 +285,9 @@ export function App() {
     const p = (async () => {
       try {
         const httpHost = window.location.host
-        setBase(`http://${httpHost}`)
+        // The page's own origin, so an https page (e.g. the wasm demo) does
+        // not make http requests, which the browser blocks as mixed content
+        setBase(isWasmBridgeActive() ? WASM_BRIDGE_BASE : window.location.origin)
         const { wsHost } = await resolveWsHost(httpHost)
         await connect(wsHost)
         cachedHostFailures.current = 0
@@ -249,6 +297,7 @@ export function App() {
         if (cachedHostFailures.current >= 3) cachedWsHost.current = null
         if (phase !== 'ready') {
           setErrMsg(e instanceof Error ? e.message : 'Connection failed')
+          setWebUIBlocked(e instanceof WebUIBlockedError)
         }
         return false
       } finally {
@@ -296,13 +345,6 @@ export function App() {
         reconnectTimer.current = null
       }
       backoffMs.current = 0
-      setStartupPending(true)
-      sendStartupQueries()
-        .finally(() => {
-          setStartupPending(false)
-          prefetchControllerConfigSettings()
-          window.setTimeout(() => prefetchInternalFiles(), 1000)
-        })
     } else {
       setStartupPending(false)
       if (!reconnectTimer.current) {
@@ -317,6 +359,25 @@ export function App() {
       }
     }
   }, [connected, phase])
+
+  const macrosLoaded = useRef(false)
+  useEffect(() => {
+    if (phase !== 'ready' || !connected) return
+    return scheduleControllerStartup(async canContinue => {
+      if (!await sendStartupQueries(canContinue)) return false
+      await loadControllerConfigSettings().catch(() => {})
+      if (!canContinue()) return false
+      if (!macrosLoaded.current) {
+        const data = await loadMacroCfg()
+        if (!canContinue()) return false
+        if (data.length > 0) setMacros(data)
+        macrosLoaded.current = true
+      }
+      if (!canContinue()) return false
+      await prefetchInternalFiles()
+      return canContinue()
+    }, setStartupPending)
+  }, [connected, phase, setMacros, setStartupPending])
 
   useEffect(() => {
     if (!restarting) {
@@ -340,47 +401,33 @@ export function App() {
 
   useEffect(() => {
     if (!connected) return
-    const errors: string[] = []
-    let done = false
-    let fallbackTimer: ReturnType<typeof setTimeout>
+    let errors: string[] = []
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
 
     const finish = () => {
-      if (done) return
-      done = true
-      unsub()
-      clearTimeout(fallbackTimer)
+      if (fallbackTimer !== null) clearTimeout(fallbackTimer)
+      fallbackTimer = null
       if (errors.length > 0) {
         setStartupErrors(errors)
         setStartupErrorsOpen(true)
+        errors = []
       }
     }
 
     const unsub = onLine((line: string) => {
-      if (done) return
       if (line.includes('[MSG:ERR:') && line.includes('Configuration error')) {
         errors.push(line)
+        if (fallbackTimer === null) fallbackTimer = setTimeout(finish, 5000)
       } else if (line === 'ok' || line.startsWith('error:')) {
         finish()
       }
     })
 
-    fallbackTimer = setTimeout(finish, 5000)
-
     return () => {
-      done = true
       unsub()
-      clearTimeout(fallbackTimer)
+      if (fallbackTimer !== null) clearTimeout(fallbackTimer)
     }
   }, [connected])
-
-  const macrosLoaded = useRef(false)
-  useEffect(() => {
-    if (!connected || macrosLoaded.current) return
-    macrosLoaded.current = true
-    loadMacroCfg()
-      .then(data => { if (data.length > 0) setMacros(data) })
-      .catch(() => { macrosLoaded.current = false })
-  }, [connected]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Debounce the "Reconnecting…" overlay so transient drops don't flash it.
   useEffect(() => {
@@ -424,6 +471,7 @@ export function App() {
   async function retryFromError() {
     setPhase('connecting')
     setErrMsg('')
+    setWebUIBlocked(false)
     backoffMs.current = 0
     cachedWsHost.current = null
     cachedHostFailures.current = 0
@@ -449,6 +497,10 @@ export function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [settingsOpen, requestSettingsClose])
+
+  useEffect(() => {
+    if (connected && statusReceived && runningFile) void restoreRunningFile(runningFile)
+  }, [connected, statusReceived, runningFile, restoreRunningFile])
 
   // On mobile/tablet, switch to the viewer when a file is selected; also kick off
   // the single shared download via the gcode store.
@@ -483,6 +535,9 @@ export function App() {
   }
 
   if (phase === 'error') {
+    if (webUIBlocked) {
+      return <WebUIBlocked base={getBase()} onReload={retryFromError} />
+    }
     return (
       <div className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-[var(--bg)]">
         <WifiOff size={28} className="text-danger" />
@@ -539,7 +594,11 @@ export function App() {
   ) : null
 
   return (
-    <div className="flex flex-col min-h-[100svh] md:h-[100svh] landscape:h-[100svh] md:overflow-hidden landscape:overflow-hidden bg-[var(--bg)] relative">
+    <div className={`flex flex-col min-h-[100svh] md:h-[100svh] md:overflow-hidden bg-[var(--bg)] relative ${
+      compactLandscapeScroll
+        ? 'landscape:h-auto landscape:min-h-[100svh] landscape:overflow-y-auto'
+        : 'landscape:h-[100svh] landscape:overflow-hidden'
+    }`}>
       {restarting ? (
         <div className="fixed md:absolute inset-0 z-[120] bg-[var(--bg)]/80 backdrop-blur-sm
                         flex flex-col items-center justify-center gap-3">
@@ -560,9 +619,11 @@ export function App() {
       <Header
         onSettingsClick={() => setSettingsOpen(true)}
         onAboutClick={() => setAboutOpen(true)}
+        sticky={compactLandscapeScroll}
       />
 
       <ManualATCPrompt />
+      <HoldPrompt />
 
       {fullPlugin && (
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden p-3">
@@ -636,47 +697,18 @@ export function App() {
       </nav>}
 
 
-      {!fullPlugin && activeLayout === 'tablet' && !workspacePlugin && !controlsPlugin && (
-        <div className="flex-1 min-h-[0px] flex portrait:flex-col landscape:flex landscape:flex-row gap-3 p-3 overflow-y-auto landscape:overflow-hidden">
-          <div className="flex flex-col gap-1 portrait:shrink-0 landscape:flex-1 landscape:basis-1/2 landscape:min-h-0 landscape:overflow-hidden">
-            <DRO isTablet />
-            {jogPlugin ? (
-              <div className="panel flex flex-col flex-1 min-h-0 overflow-hidden">
-                <PluginFrame plugin={jogPlugin} onClose={() => setJogPlugin(null)} inline />
-              </div>
-            ) : (
-              <TabletJogPad />
-            )}
-          </div>
-          <TabletAccordion tabletTab={tabletTab} setTabletTab={setTabletTab} onLaunchPanel={handleLaunchPanel} />
-        </div>
-      )}
-
-      {!fullPlugin && activeLayout === 'tablet' && workspacePlugin && (
-        <div className="flex-1 min-h-[0px] flex portrait:flex-col landscape:flex-row gap-3 p-3 overflow-y-auto landscape:overflow-hidden">
-          <div className="flex flex-col gap-1 portrait:shrink-0 landscape:flex-1 landscape:basis-1/2 landscape:min-h-0 landscape:overflow-hidden">
-            <DRO isTablet />
-            {jogPlugin ? (
-              <div className="panel flex flex-col flex-1 min-h-0 overflow-hidden">
-                <PluginFrame plugin={jogPlugin} onClose={() => setJogPlugin(null)} inline />
-              </div>
-            ) : (
-              <TabletJogPad />
-            )}
-          </div>
-          <div className="panel flex flex-col landscape:flex-1 landscape:basis-1/2 landscape:min-h-0 portrait:min-h-[55vh] landscape:overflow-hidden">
-            <PluginFrame plugin={workspacePlugin} onClose={() => setWorkspacePlugin(null)} inline />
-          </div>
-        </div>
-      )}
-
-      {!fullPlugin && activeLayout === 'tablet' && controlsPlugin && (
-        <div className="flex-1 min-h-[0px] flex portrait:flex-col landscape:flex-row gap-3 p-3 overflow-y-auto landscape:overflow-hidden">
-          <div className="panel flex flex-col portrait:shrink-0 landscape:flex-1 landscape:basis-1/2 landscape:min-h-0 portrait:min-h-[55vh] landscape:overflow-hidden">
-            <PluginFrame plugin={controlsPlugin} onClose={() => setControlsPlugin(null)} inline />
-          </div>
-          <TabletAccordion tabletTab={tabletTab} setTabletTab={setTabletTab} onLaunchPanel={handleLaunchPanel} />
-        </div>
+      {!fullPlugin && activeLayout === 'tablet' && (
+        <TabletMainShell
+          tabletTab={tabletTab}
+          setTabletTab={setTabletTab}
+          onLaunchPanel={handleLaunchPanel}
+          jogPlugin={jogPlugin}
+          onCloseJogPlugin={() => setJogPlugin(null)}
+          workspacePlugin={workspacePlugin}
+          onCloseWorkspacePlugin={() => setWorkspacePlugin(null)}
+          controlsPlugin={controlsPlugin}
+          onCloseControlsPlugin={() => setControlsPlugin(null)}
+        />
       )}
 
       {!fullPlugin && activeLayout === 'desktop' && (

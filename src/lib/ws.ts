@@ -248,7 +248,8 @@ export function connect(host: string): Promise<void> {
     const myGen = generation
 
     let ws: WebSocket
-    const url = new URL(host.includes('/') ? `ws://${host}` : `ws://${host}/`)
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'  // ws: from https is mixed content
+    const url = new URL(host.includes('/') ? `${scheme}://${host}` : `${scheme}://${host}/`)
     url.searchParams.set('independent_session', '1')
     try {
       ws = new WebSocket(url.toString(), 'arduino')
@@ -520,7 +521,10 @@ function handleLine(line: string) {
     const parsed = parseStatusReport(line, {
       reportInches: useMachineStore.getState().controllerSettings.reportInches,
     })
-    if (parsed) useMachineStore.getState().updateStatus(parsed)
+    if (parsed) {
+      useMachineStore.getState().updateStatus(parsed)
+      useMachineStore.getState().setStatusReceived(true)
+    }
     lineHandlers.forEach(fn => fn(line))
     return
   }
@@ -737,9 +741,11 @@ export function resumeResponseTraffic() {
 }
 
 
-export async function sendStartupQueries() {
+export async function sendStartupQueries(canContinue: () => boolean = () => true): Promise<boolean> {
+  if (!canContinue()) return false
   try {
     const ssText = await sendCommand('$SS')
+    if (!canContinue()) return false
     const hasMist  = /\[MSG:INFO:\s*Mist coolant/i.test(ssText)
     const hasFlood = /\[MSG:INFO:\s*Flood coolant/i.test(ssText)
     const hasManualATC = ssText.split('\n').some(raw => isManualATCCapabilityLine(raw.trim()))
@@ -758,8 +764,10 @@ export async function sendStartupQueries() {
     })
   } catch { /* noop */ }
 
+  if (!canContinue()) return false
   try {
     const settingsText = await sendCommand('$$')
+    if (!canContinue()) return false
     settingsText.split('\n').forEach(raw => {
       const line = raw.trim()
       if (!line) return
@@ -769,6 +777,7 @@ export async function sendStartupQueries() {
       }
     })
   } catch { /* noop */ }
+  return canContinue()
 }
 
 export function sendRealtime(byte: number) {

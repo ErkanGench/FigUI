@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Washdown</title>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg,#181818);color:var(--text-primary,#eee);font:15px system-ui,sans-serif}main{max-width:420px;margin:auto}h1{font-size:22px;margin:0 0 20px}#state{font-size:32px;font-weight:700;margin:0 0 18px}button{width:100%;padding:15px;margin:5px 0;border:1px solid var(--border,#555);border-radius:8px;background:var(--elevated,#333);color:inherit;font:inherit;cursor:pointer}#toggle{background:var(--accent,#e49b36);color:#111;font-weight:700;font-size:18px}button:disabled{opacity:.45;cursor:default}#message{color:var(--text-muted,#aaa);font-size:13px;line-height:1.5;min-height:40px}
+</style></head><body><main><h1><img src="icon.png" alt="" style="width:24px;height:24px;vertical-align:middle;margin-right:8px">Washdown</h1><div id="state" role="status">Unknown</div><button id="toggle" disabled>Checking…</button><button id="refresh">Refresh state</button><p id="message">Reading controller…</p></main>
+<script>
+let sequence=0,reading=null,busy=false,machineState='',lastStatusAt=0,sample=null,config=null,generation=0,refreshQueued=false;
+const session=Date.now().toString(36).toUpperCase();
+const pending=new Map();
+const ui=Object.fromEntries(['state','toggle','refresh','message'].map(id=>[id,document.getElementById(id)]));
+function render(){
+ ui.state.textContent=reading===null?'Unknown':reading?'ON':'OFF';
+ ui.state.style.color=reading===true?'var(--ok,#61bd75)':'var(--text-primary,#eee)';
+ ui.toggle.style.background=reading===true?'var(--ok,#61bd75)':'var(--accent,#e49b36)';
+ ui.toggle.textContent=reading===null?'State unavailable':reading?'Turn washdown OFF':'Turn washdown ON';
+ ui.toggle.disabled=busy||reading===null||machineState!=='Idle';
+ ui.refresh.disabled=busy||!config||machineState!=='Idle';
+}
+function invalidate(message){generation++;reading=null;ui.message.textContent=message;render()}
+function call(method,params={}){return new Promise((resolve,reject)=>{
+ const id=String(++sequence),timer=setTimeout(()=>{pending.delete(id);reject(new Error('No response from FigUI.'))},5000);
+ pending.set(id,{resolve,reject,timer});window.parent.postMessage({type:'fluid-request',id,method,params},'*');
+})}
+function updateStatus(status,autoRefresh=true){
+ const previous=machineState;machineState=String(status?.state??'');lastStatusAt=Date.now();
+ if(machineState!=='Idle'){
+  refreshQueued=false;
+  if(sample)sample.reject(new Error('Machine is not idle.'));
+  invalidate('State checks pause while the machine is not idle.');
+ }else if(autoRefresh&&previous!=='Idle'&&config){
+  if(busy)refreshQueued=true;else refresh();
+ }
+ render();
+}
+window.addEventListener('message',event=>{
+ if(event.source!==window.parent)return;
+ const msg=event.data;
+ if(msg?.type==='fluid-response'){
+  const p=pending.get(msg.id);if(!p)return;clearTimeout(p.timer);pending.delete(msg.id);
+  msg.error?p.reject(new Error(msg.error)):p.resolve(msg.result);
+ }else if(msg?.type==='fluid-event'&&msg.event==='status'){updateStatus(msg.data)}
+ else if(msg?.type==='fluid-event'&&msg.event==='line'){
+  const line=String(msg.data??'');
+  if(/^(error:|ALARM:|Grbl)/i.test(line)){
+   refreshQueued=false;
+   if(sample)sample.reject(new Error(line));invalidate('Controller: '+line);return;
+  }
+  if(sample){
+   const match=line.match(/PRINT,WASHDOWN_([A-Z0-9_]+)=([01](?:\.0+)?)(?:\]|\s|$)/);
+   if(match&&match[1]===sample.token)sample.resolve(Number(match[2])===1);
+  }
+ }
+});
+async function readFeedback(runGeneration){
+ const token=session+'_'+(++sequence);
+ let timer;
+ const result=new Promise((resolve,reject)=>{
+  sample={token,resolve,reject};timer=setTimeout(()=>reject(new Error('No feedback received. Check Message/Level is Info.')),5000);
+ });
+ result.catch(()=>{});
+ try{
+  await call('sendCommand',{command:'M66 P'+config.inputIndex+' L0'});
+  if(runGeneration!==generation)throw new Error('Feedback operation invalidated.');
+  await call('sendCommand',{command:'(PRINT,WASHDOWN_'+token+'=%d#5399)'});
+  return await result;
+ }finally{clearTimeout(timer);sample=null}
+}
+async function run(target){
+ if(busy||!config)return;
+ busy=true;render();
+ const runGeneration=generation;
+ try{
+  const status=await call('getStatus');
+  if(runGeneration!==generation)return;
+  updateStatus(status,false);
+  if(machineState!=='Idle')throw new Error('Washdown controls are available while idle.');
+  if(target!==undefined){
+   reading=null;ui.message.textContent='Switching…';render();
+   await call('sendCommand',{command:(target?'M64 P':'M65 P')+config.outputIndex});
+   if(runGeneration!==generation)return;
+  }
+  const measured=await readFeedback(runGeneration);
+  if(runGeneration!==generation)return;
+  if(machineState!=='Idle')throw new Error('Machine is not idle.');
+  reading=measured;
+  ui.message.textContent=target!==undefined&&measured!==target?'Feedback does not match the requested state.':config.feedbackLabel+' feedback · '+(measured?'ON':'OFF');
+ }catch(error){if(runGeneration===generation)invalidate(error.message)}
+ finally{
+  const retry=refreshQueued&&machineState==='Idle'&&config;
+  refreshQueued=false;busy=false;render();
+  if(retry)refresh();
+ }
+}
+function refresh(){return run()}
+ui.toggle.addEventListener('click',()=>{if(reading!==null&&machineState==='Idle')run(!reading)});
+ui.refresh.addEventListener('click',refresh);
+setInterval(()=>{
+ if(lastStatusAt&&Date.now()-lastStatusAt>10000){machineState='';invalidate('Controller status is stale.');return}
+},2000);
+async function initialize(){
+ try{
+  const path=decodeURIComponent(new URL('plugin.json',document.baseURI).pathname);
+  const text=await call('readFile',{path,fs:path.startsWith('/sd/')?'sd':'local'});
+  const manifest=JSON.parse(text.replace(/^\uFEFF/,'')),c=manifest.config;
+  if(!c||!Number.isInteger(c.outputIndex)||c.outputIndex<0||c.outputIndex>7||
+     !Number.isInteger(c.inputIndex)||c.inputIndex<0||c.inputIndex>7||
+     typeof c.feedbackLabel!=='string'||!c.feedbackLabel.trim()){
+   throw new Error('plugin.json needs config: outputIndex and inputIndex (0–7), plus feedbackLabel.');
+  }
+  config={outputIndex:c.outputIndex,inputIndex:c.inputIndex,feedbackLabel:c.feedbackLabel.trim()};
+ }catch(error){invalidate('Configuration: '+error.message);return}
+ try{
+  await Promise.all([call('subscribe',{event:'status'}),call('subscribe',{event:'line'})]);
+  await refresh();
+ }catch(error){invalidate(error.message)}
+}
+initialize();
+render();
+</script></body></html>

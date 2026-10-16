@@ -7,6 +7,12 @@ import { clearMachineAlarm } from '../lib/alarm'
 import { droFeedUnitLabel, formatAxisCoord, formatFeedRate } from '../lib/units'
 import { useControllerJobStarting } from '../lib/jobState'
 import { useManualAtcStore } from '../store/manualAtc'
+import { useGCodeStore } from '../store/gcode'
+import { useGCodeSenderStore } from '../store/gcodeSender'
+import { sendAxisPosition, type AxisPositionAction, type AxisPositionMode } from '../lib/axisPosition'
+import { AxisPositionDialog } from './AxisPositionDialog'
+import type { Units } from '../types'
+import { useIsPortrait } from '../lib/viewport'
 
 const ALARM_MESSAGES: Record<number, string> = {
   1: 'Hard limit triggered',
@@ -41,7 +47,7 @@ const AXIS_COLOR: Record<string, string> = {
 }
 
 type PendingAxisAction = {
-  kind: 'go-to-zero' | 'home'
+  kind: 'move' | 'home'
   axis: string
 }
 
@@ -49,19 +55,6 @@ const MOTION_STATES = new Set(['Jog', 'Hold', 'Home'])
 const E_STOP_HIDE_DELAY_MS = 700
 const HOME_ALL_ACTION_AXIS = 'all'
 const WORK_ORIGINS = ['G54', 'G55', 'G56', 'G57', 'G58', 'G59'] as const
-
-function useIsPortrait() {
-  const [portrait, setPortrait] = useState(() =>
-    typeof window !== 'undefined' && window.matchMedia('(orientation: portrait)').matches
-  )
-  useEffect(() => {
-    const mq = window.matchMedia('(orientation: portrait)')
-    const handler = (e: MediaQueryListEvent) => setPortrait(e.matches)
-    mq.addEventListener('change', handler)
-    return () => mq.removeEventListener('change', handler)
-  }, [])
-  return portrait
-}
 
 function useMotionControlLock(jobActive: boolean) {
   const [locked, setLocked] = useState(jobActive)
@@ -79,8 +72,17 @@ function useMotionControlLock(jobActive: boolean) {
   return locked
 }
 
-export function DRO({ isTablet = false }: { isTablet?: boolean }) {
+export function DRO({
+  isTablet = false,
+  layout = 'default',
+}: {
+  isTablet?: boolean
+  /** Fit beside Jog in short-height landscape without internal scroll. */
+  layout?: 'default' | 'topBand'
+}) {
   const status = useMachineStore(s => s.status)
+  const connected = useMachineStore(s => s.connected)
+  const statusReceived = useMachineStore(s => s.statusReceived)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerJobStarting = useControllerJobStarting()
   const positionMode = useMachineStore(s => s.positionMode)
@@ -90,15 +92,57 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
   const hasManualATC = useMachineStore(s => s.controllerSettings.hasManualATC === true)
   const resetToolReference = useManualAtcStore(s => s.resetReference)
   const completeReferenceSetup = useManualAtcStore(s => s.completeReferenceSetup)
+  const atcBusy = useManualAtcStore(s => s.phase !== 'idle')
+  const trackedJob = useGCodeStore(s => s.trackedJob !== null)
+  const senderBusy = useGCodeSenderStore(s => ['streaming', 'paused', 'draining'].includes(s.phase))
+  const [axisEditor, setAxisEditor] = useState<{ axis: string; mode: AxisPositionMode; value: number; units: Units } | null>(null)
   const [pendingAxisAction, setPendingAxisAction] = useState<PendingAxisAction | null>(null)
   const [pendingAxisActionStarted, setPendingAxisActionStarted] = useState(false)
   const [workOriginOpen, setWorkOriginOpen] = useState(false)
   const workOriginRef = useRef<HTMLDivElement>(null)
   const pos = activePosition(status, positionMode)
   const isPortrait = useIsPortrait()
-  const tabletBtnSize = isTablet && isPortrait ? 'w-20 h-20' : isTablet ? 'w-14 h-14' : 'w-8 h-8'
-  const tabletIconSize = isTablet && isPortrait ? 22 : isTablet ? 16 : 11
-  const tabletHomeIconSize = isTablet && isPortrait ? 30 : isTablet ? 22 : 13
+  const topBandLayout = layout === 'topBand'
+  const tightLayout = topBandLayout
+  const tabletBtnSize = isTablet && isPortrait
+    ? 'w-20 h-20'
+    : topBandLayout
+      ? 'w-12 h-12'
+      : isTablet
+        ? 'w-14 h-14'
+        : 'w-8 h-8'
+  const tabletIconSize = isTablet && isPortrait ? 22 : topBandLayout ? 14 : isTablet ? 16 : 11
+  const tabletHomeIconSize = isTablet && isPortrait ? 30 : topBandLayout ? 18 : isTablet ? 22 : 13
+  const tabletCoordBothSize = topBandLayout
+    ? 'text-[1.45rem]'
+    : isTablet
+      ? 'text-[2.25rem]'
+      : 'text-[1.05rem]'
+  const tabletCoordSingleSize = topBandLayout
+    ? 'text-[1.75rem]'
+    : isTablet
+      ? 'text-[3rem]'
+      : 'text-[1.75rem]'
+  const tabletAxisLabelSize = topBandLayout ? 'text-xl' : isTablet ? 'text-2xl' : 'text-base'
+  const tabletActionBtnClass = isTablet && isPortrait
+    ? 'h-20 text-xl'
+    : topBandLayout
+      ? 'h-11 text-base'
+      : isTablet
+        ? 'h-14 text-lg'
+        : 'h-7 text-base'
+  const tabletStopBtnClass = isTablet && isPortrait
+    ? 'h-20 text-xl'
+    : topBandLayout
+      ? 'h-11 text-sm'
+      : isTablet
+        ? 'h-14 text-lg'
+        : 'h-7 text-sm'
+  const tabletFooterTextSize = topBandLayout
+    ? 'text-sm'
+    : isTablet
+      ? 'text-xl'
+      : 'text-base'
   const activeWorkOrigin = WORK_ORIGINS.includes(status.gcodeModes?.wcs as (typeof WORK_ORIGINS)[number])
     ? status.gcodeModes?.wcs as (typeof WORK_ORIGINS)[number]
     : null
@@ -123,6 +167,8 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
   const isHomeAllPending = pendingAxisAction?.kind === 'home' && pendingAxisAction.axis === HOME_ALL_ACTION_AXIS
   const shouldHideMotionControls = isJobActive && pendingAxisAction === null
   const areAxisButtonsDisabled = pendingAxisAction !== null
+  const axisEntryDisabled = !connected || !statusReceived || status.state !== 'Idle' || isJobActive
+    || controllerResetPending || !!status.sdFilename || areAxisButtonsDisabled || trackedJob || senderBusy || atcBusy
 
   // Auto-query alarm details when entering alarm state without a name
   useEffect(() => {
@@ -181,7 +227,7 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
   function goToZero(axis: string) {
     const [feedKey, fallbackFeed] = jogFeedKeyForAxis(axis)
     const feed = loadPersistedJogFeed(feedKey, fallbackFeed)
-    setPendingAxisAction({ kind: 'go-to-zero', axis })
+    setPendingAxisAction({ kind: 'move', axis })
     setPendingAxisActionStarted(false)
     sendRaw(`$J=G90 G21 F${feed} ${axis}0`)
   }
@@ -196,19 +242,35 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
     sendRaw('$H')
   }
   function cancelPendingAxisAction() {
-    if (pendingAxisAction?.kind === 'go-to-zero') {
+    if (pendingAxisAction?.kind === 'move') {
       sendRealtime(0x85)
       return
     }
     sendRealtime(0x18)
   }
 
+  function openAxisEditor(axis: string, mode: AxisPositionMode, value: number) {
+    if (!axisEntryDisabled) setAxisEditor({ axis, mode, value, units })
+  }
+
+  function applyAxisPosition(action: AxisPositionAction, input: string) {
+    if (!axisEditor || axisEntryDisabled) return false
+    const { axis, mode, units: entryUnits } = axisEditor
+    if (!sendAxisPosition(action, axis, mode, input, entryUnits)) return false
+    if (action === 'go') {
+      setPendingAxisAction({ kind: 'move', axis })
+      setPendingAxisActionStarted(false)
+    }
+    return true
+  }
+
   return (
-    <div className="panel flex flex-col">
-      <div className="panel-header justify-between">
-        <span className='text-lg font-bold'>Position</span>
-        <div className="flex items-center gap-1.5">
-          <div className="flex items-center gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
+    <div className={`panel flex flex-col ${topBandLayout ? 'h-full' : ''}`}>
+      <div className={`panel-header justify-between shrink-0 ${tightLayout ? 'flex-wrap gap-y-1 py-1.5' : ''}`}>
+        <span className={`font-bold ${tightLayout ? 'text-base' : 'text-lg'}`}>Position</span>
+        <div className={`flex items-center ${tightLayout ? 'flex-wrap justify-end' : ''}`}>
+          <div className={`grid grid-cols-2 items-stretch shrink-0 ${tightLayout ? 'gap-1 w-[13.5rem]' : 'gap-1.5 w-[14.5rem]'}`}>
+          <div className="flex min-w-0 overflow-hidden items-stretch gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
             {(['WPos', 'MPos'] as const).map(m => {
               const active = positionMode === m || positionMode === 'Both'
               return (
@@ -223,8 +285,8 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
                       setPositionMode(positionMode === 'Both' ? 'WPos' : 'Both')
                     }
                   }}
-                  className={`px-2.5 py-0.5 text-base rounded-sm transition-colors ${active
-                    ? 'bg-surface border border-border text-text-primary shadow-sm'
+                  className={`min-w-0 flex-1 text-center whitespace-nowrap rounded-sm transition-colors ${tightLayout ? 'px-1 py-0.5 text-sm' : 'px-2 py-0.5 text-base'} ${active
+                    ? 'bg-surface text-text-primary'
                     : 'text-text-muted hover:text-text-primary'
                   }`}
                 >
@@ -236,7 +298,7 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
           <div ref={workOriginRef} className="relative">
             <button
               onClick={() => setWorkOriginOpen(open => !open)}
-              className={`flex items-center gap-1 px-2.5 py-1 text-base rounded-sm border transition-colors ${
+              className={`flex h-full w-full items-center justify-center gap-1 whitespace-nowrap ${tightLayout ? 'px-1.5 py-0.5 text-sm' : 'px-2.5 py-0.5 text-base'} rounded-sm border transition-colors ${
                 workOriginOpen
                   ? 'bg-accent/10 border-accent/50 text-accent'
                   : 'bg-elevated border-border text-text-primary hover:border-border-strong'
@@ -275,11 +337,12 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
               </div>
             )}
           </div>
+          </div>
         </div>
       </div>
 
       {/* Axis rows – compact */}
-      <div className="px-3 py-2 space-y-1">
+      <div className={`px-3 shrink-0 ${topBandLayout ? 'space-y-0 py-0.5' : 'space-y-0.5 py-2'}`}>
         {positionMode === 'Both' && (
           <div className="flex items-center gap-2 pb-0.5">
             <span className="w-4 shrink-0" />
@@ -298,35 +361,50 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
           </div>
         )}
         {visibleAxes.map(ax => (
-          <div key={ax} className="flex items-center gap-2">
+          <div key={ax} className={`flex items-center ${topBandLayout ? 'gap-1' : 'gap-2'}`}>
             <span
-              className={`font-black uppercase tracking-widest w-4 shrink-0 select-none ${isTablet ? 'text-2xl' : 'text-base'}`}
+              className={`font-black uppercase tracking-widest w-4 shrink-0 select-none ${tabletAxisLabelSize}`}
               style={{ color: AXIS_COLOR[ax] ?? 'var(--text-muted)' }}
             >
               {ax}
             </span>
             {positionMode === 'Both' ? (
               <div className="flex-1 grid grid-cols-2 gap-2 min-w-0">
-                <span
-                  className={`text-right font-mono tabular-nums tracking-tight min-w-0 overflow-hidden ${isTablet ? 'text-[2.25rem]' : 'text-[1.05rem]'}`}
+                <button
+                  disabled={axisEntryDisabled}
+                  onClick={() => openAxisEditor(ax, 'WPos', wCoords[ax])}
+                  aria-label={`Edit ${ax} work position`}
+                  aria-haspopup="dialog"
+                  title={`Set or go to ${ax} work position`}
+                  className={`text-right font-mono tabular-nums tracking-tight min-w-0 overflow-hidden rounded-sm hover:bg-elevated disabled:hover:bg-transparent ${tabletCoordBothSize}`}
                   style={{ fontWeight: 300, lineHeight: 1.2, color: 'var(--text-primary)' }}
                 >
                   {formatAxisCoord(wCoords[ax], ax, units)}
-                </span>
-                <span
-                  className={`text-right font-mono tabular-nums tracking-tight min-w-0 overflow-hidden ${isTablet ? 'text-[2.25rem]' : 'text-[1.05rem]'}`}
+                </button>
+                <button
+                  disabled={axisEntryDisabled}
+                  onClick={() => openAxisEditor(ax, 'MPos', mCoords[ax])}
+                  aria-label={`Edit ${ax} machine position`}
+                  aria-haspopup="dialog"
+                  title={`Go to ${ax} machine position`}
+                  className={`text-right font-mono tabular-nums tracking-tight min-w-0 overflow-hidden rounded-sm hover:bg-elevated disabled:hover:bg-transparent ${tabletCoordBothSize}`}
                   style={{ fontWeight: 300, lineHeight: 1.2, color: 'var(--text-muted)' }}
                 >
                   {formatAxisCoord(mCoords[ax], ax, units)}
-                </span>
+                </button>
               </div>
             ) : (
-              <span
-                className={`flex-1 text-right font-mono tabular-nums tracking-tight ${isTablet ? 'text-[3rem]' : 'text-[1.75rem]'}`}
+              <button
+                disabled={axisEntryDisabled}
+                onClick={() => openAxisEditor(ax, positionMode, coordValues[ax])}
+                aria-label={`Edit ${ax} ${positionMode === 'WPos' ? 'work' : 'machine'} position`}
+                aria-haspopup="dialog"
+                title={positionMode === 'WPos' ? `Set or go to ${ax} work position` : `Go to ${ax} machine position`}
+                className={`flex-1 text-right font-mono tabular-nums tracking-tight rounded-sm hover:bg-elevated disabled:hover:bg-transparent ${tabletCoordSingleSize}`}
                 style={{ fontWeight: 300, lineHeight: 1.2, color: 'var(--text-primary)' }}
               >
                 {formatAxisCoord(coordValues[ax], ax, units)}
-              </span>
+              </button>
             )}
             {!shouldHideMotionControls && (
               <button
@@ -343,7 +421,7 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
               </button>
             )}
             {!shouldHideMotionControls && (
-              pendingAxisAction?.axis === ax && pendingAxisAction.kind === 'go-to-zero' ? (
+              pendingAxisAction?.axis === ax && pendingAxisAction.kind === 'move' ? (
                 <button
                   className={`shrink-0 flex items-center justify-center rounded-sm
                              border border-danger/50 text-danger bg-danger/10
@@ -401,10 +479,10 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
       </div>
 
       {/* Action buttons */}
-      <div className="border-t border-border px-3 py-2 flex gap-2">
+      <div className={`border-t border-border px-3 flex gap-2 shrink-0 ${topBandLayout ? 'py-1' : 'py-2'}`}>
         {!shouldHideMotionControls && !isHomeAllPending && (
           <button
-            className={`btn btn-warn flex-1 font-bold ${isTablet && isPortrait ? 'h-20 text-xl' : isTablet ? 'h-14 text-lg' : 'h-7 text-base'}`}
+            className={`btn btn-warn flex-1 font-bold ${tabletActionBtnClass}`}
             onClick={zeroAll}
             title="Set current position as work zero for all axes"
             disabled={areAxisButtonsDisabled}
@@ -414,22 +492,22 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
         )}
         {!shouldHideMotionControls && !isHomeAllPending && (
           <button
-            className={`btn btn-ghost flex-1 font-bold flex items-center justify-center gap-1.5 ${isTablet && isPortrait ? 'h-20 text-xl' : isTablet ? 'h-14 text-lg' : 'h-7 text-base'}`}
+            className={`btn btn-ghost flex-1 font-bold flex items-center justify-center gap-1.5 ${tabletActionBtnClass}`}
             onClick={homeAll}
             title="Home all axes"
             disabled={areAxisButtonsDisabled}
           >
-            <Home size={isTablet && isPortrait ? 24 : isTablet ? 20 : 12} />
+            <Home size={isTablet && isPortrait ? 24 : topBandLayout ? 18 : isTablet ? 20 : 12} />
             Home All
           </button>
         )}
         {!shouldHideMotionControls && isHomeAllPending && (
           <button
-            className={`btn btn-warn flex-1 font-bold flex items-center justify-center gap-1.5 ${isTablet && isPortrait ? 'h-20 text-xl' : isTablet ? 'h-14 text-lg' : 'h-7 text-sm'}`}
+            className={`btn btn-warn flex-1 font-bold flex items-center justify-center gap-1.5 ${tabletStopBtnClass}`}
             onClick={cancelPendingAxisAction}
             title="Abort homing (soft reset controller)"
           >
-            <Square size={isTablet && isPortrait ? 24 : isTablet ? 20 : 12} className="fill-current" />
+            <Square size={isTablet && isPortrait ? 24 : topBandLayout ? 18 : isTablet ? 20 : 12} className="fill-current" />
             Abort Homing
           </button>
         )}
@@ -446,26 +524,34 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
       </div>
 
       {status.state === 'Alarm' && (
-        <div className='flex flex-col border-t-2 border-danger bg-danger/10 px-3 py-3 gap-3'>
-          <div className="flex items-center gap-3">
-            <TriangleAlert className="text-danger w-12 h-12" />
-            <div className="flex flex-col gap-2 flex-1 min-w-0">
-              <div className="flex flex-col gap-1 min-w-0">
-                <span className="text-2xl font-black text-danger uppercase tracking-widest leading-none">
-                  Alarm
-                </span>
-
-                <span className="text-2xl font-semibold text-text-primary leading-snug">
-                  {status.alarmName
-                    ?? (status.alarmCode != null
-                      ? (ALARM_MESSAGES[status.alarmCode] ?? `Unknown alarm code ${status.alarmCode}`)
-                      : 'Machine is in alarm state')}
-                </span>
-              </div>
+        <div className={`flex flex-col border-t border-danger bg-danger/10 px-3 shrink-0 ${
+          topBandLayout ? 'py-1.5 gap-1.5' : 'py-2 gap-2'
+        }`}>
+          <div className={`flex items-start ${topBandLayout ? 'gap-2' : 'gap-2.5'}`}>
+            <TriangleAlert
+              className="text-danger shrink-0"
+              size={topBandLayout ? 16 : isTablet ? 20 : 18}
+            />
+            <div className="flex flex-col gap-0.5 flex-1 min-w-0">
+              <span className={`font-bold text-danger uppercase tracking-wide leading-none ${
+                topBandLayout ? 'text-xs' : isTablet ? 'text-sm' : 'text-sm'
+              }`}>
+                Alarm
+              </span>
+              <span className={`text-text-primary leading-snug ${
+                topBandLayout ? 'text-xs' : isTablet ? 'text-sm' : 'text-sm'
+              }`}>
+                {status.alarmName
+                  ?? (status.alarmCode != null
+                    ? (ALARM_MESSAGES[status.alarmCode] ?? `Unknown alarm code ${status.alarmCode}`)
+                    : 'Machine is in alarm state')}
+              </span>
             </div>
           </div>
           <button
-            className="btn btn-danger w-full h-8 text-2xl font-bold"
+            className={`btn btn-danger w-full font-bold ${
+              topBandLayout ? 'h-7 text-xs' : isTablet ? 'h-8 text-sm' : 'h-7 text-sm'
+            }`}
             onClick={() => clearMachineAlarm(status.alarmCode)}
           >
             Clear Alarm
@@ -474,7 +560,9 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
       )}
 
       {/* Feed / Spindle readout */}
-      <div className={`border-t border-border px-3 py-2 flex justify-between font-mono text-text-muted ${isTablet ? 'text-xl' : 'text-base'}`}>
+      <div className={`border-t border-border px-3 flex justify-between font-mono text-text-muted shrink-0 ${
+        topBandLayout ? 'py-0.5' : isTablet ? 'py-2' : 'py-1'
+      } ${tabletFooterTextSize}`}>
         <div className="flex items-center gap-1.5">
           <span>F</span>
           <span className="text-text-primary">{formatFeedRate(status.feed, units)}</span>
@@ -487,7 +575,8 @@ export function DRO({ isTablet = false }: { isTablet?: boolean }) {
         </div>
       </div>
 
-      <GCodeModesRow isTablet={isTablet} />
+      {!topBandLayout && <GCodeModesRow isTablet={isTablet} />}
+      {axisEditor && <AxisPositionDialog {...axisEditor} isTablet={isTablet} disabled={axisEntryDisabled} onAction={applyAxisPosition} onClose={() => setAxisEditor(null)} />}
     </div>
   )
 }

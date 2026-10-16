@@ -2,7 +2,7 @@ import { Sun, Moon, Wifi, WifiOff, Settings, Maximize, Minimize, HelpCircle, Pla
 import fluidncLogo from '../assets/fluidnc-logo.svg'
 import { useMachineStore, stateColor, stateBg } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { useJobRuntimeEstimate } from '../lib/jobRuntime'
+import { formatJobProgress, useJobRuntimeEstimate } from '../lib/jobRuntime'
 import { useControllerJobStarting } from '../lib/jobState'
 import { sendRealtime } from '../lib/ws'
 import { alarmClearActionTitle, clearMachineAlarm } from '../lib/alarm'
@@ -19,9 +19,10 @@ interface Props {
   onSettingsClick: () => void
   onAboutClick: () => void
   isTablet?: boolean
+  sticky?: boolean
 }
 
-export function Header({ onSettingsClick, onAboutClick, isTablet }: Props) {
+export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Props) {
   const connected = useMachineStore(s => s.connected)
   const status = useMachineStore(s => s.status)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
@@ -35,7 +36,7 @@ export function Header({ onSettingsClick, onAboutClick, isTablet }: Props) {
   const loadedPath = useGCodeStore(s => s.loadedPath)
   const fileName = useGCodeStore(s => s.fileName)
   const runtime = useJobRuntimeEstimate(status, model, controllerSettings, loadedPath, fileName)
-  const showHeaderProgress = status.sdFilename && runtime.source === 'estimated' && runtime.progressPercent != null
+  const showHeaderProgress = status.sdFilename && runtime.progressPercent != null
   const headerProgressPercent = runtime.progressPercent ?? 0
   const pinnedMacros = useMemo(() => macros.filter(m => m.pinned), [macros])
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -59,7 +60,7 @@ export function Header({ onSettingsClick, onAboutClick, isTablet }: Props) {
   }
 
   return (
-    <header className="h-12 bg-surface border-b border-border flex items-center px-3 xl:px-4 gap-2 xl:gap-4 shrink-0 overflow-x-auto">
+    <header className={`h-12 bg-surface border-b border-border flex items-center px-3 xl:px-4 gap-2 xl:gap-4 shrink-0 overflow-x-auto ${sticky ? 'sticky top-0 z-50' : ''}`}>
       <div className="flex items-center gap-2 shrink-0">
         <img src={fluidncLogo} alt="FluidNC" className="h-8 w-auto shrink-0" style={theme !== 'light' ? { filter: 'invert(1) hue-rotate(180deg)' } : undefined} />
       </div>
@@ -85,21 +86,22 @@ export function Header({ onSettingsClick, onAboutClick, isTablet }: Props) {
       )}
 
       {status.sdFilename && (
-        <div className="hidden lg:flex items-center gap-2 text-sm text-text-muted min-w-0">
+        <div className="flex items-center gap-2 text-sm text-text-muted min-w-0">
           {showHeaderProgress && (
             <>
-              <div className="w-24 h-1 bg-elevated rounded-full overflow-hidden shrink-0">
+              <div className="hidden lg:block w-24 h-1 bg-elevated rounded-full overflow-hidden shrink-0">
                 <div
                   className="h-full bg-info transition-all"
                   style={{ width: `${headerProgressPercent}%` }}
                 />
               </div>
-              <span className="w-9 text-right font-mono tabular-nums shrink-0">
-                {Math.round(headerProgressPercent)}%
+              <span className="min-w-9 text-right font-mono tabular-nums shrink-0"
+                title={runtime.source === 'sd' ? 'File progress reported by FluidNC' : 'Estimated job progress'}>
+                {formatJobProgress(headerProgressPercent, runtime.source)}
               </span>
             </>
           )}
-          <span className="text-text-dim truncate max-w-32">{status.sdFilename}</span>
+          <span className="hidden lg:inline text-text-dim truncate max-w-32">{status.sdFilename}</span>
         </div>
       )}
 
@@ -165,7 +167,7 @@ export function Header({ onSettingsClick, onAboutClick, isTablet }: Props) {
 
         {!isTablet && (
           <button
-            className="btn-ghost px-2 py-1.5"
+            className="hidden md:inline-flex btn-ghost px-2 py-1.5"
             onClick={() => window.dispatchEvent(new CustomEvent('reset-layout'))}
             title="Reset layout to default"
           >
