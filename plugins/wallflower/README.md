@@ -109,10 +109,12 @@ converting anything.
 **Dwell (s)** (0.2) — Pause written before and after every pen-down, giving the
 servo time to arrive before the machine moves. FluidNC counts `G4 P` in
 **seconds**, not milliseconds — a value like 150 would stop the machine for two
-and a half minutes per line.
+and a half minutes per line. 
 
 **Pen Up Dwell (s)** (0.2) — Pause after lifting. Set it to 0 and no pause line
 gets written at all.
+
+*The **dwell values** are important for accuracy, for something where more accuracy, a longer pause is better as it stabilizes the gondola.*
 
 **Draw Speed (mm/min)** (2300) — Feed rate for drawing moves. Travel moves run
 at the machine's own max rate from the config, so this only affects lines being
@@ -177,11 +179,17 @@ acceleration or junction deviation lets it carry speed around corners.
 
 ## Tutorial
 
-Full build instructions for the wall drawing robot this was written for:
-<!-- TODO: tutorial link -->
+Full build instructions for the wall drawing robot coming soon
+
+## Version history
+
+1.1.0 — The preview now shows the whole machine to scale instead of just the drawing: the two motors drawn at the anchor points from your config, dashed cables down to the gondola, and the axis travel as a dashed box. Scroll to zoom, drag to pan. The machine config is read each time the plugin opens, so edits to config.yaml show up on reopen.
+
+1.0.0 — First release. SVG to G-code with center origin, optional merge, sort and simplify, servo pen control, save to SD card and start the job.
 
 ## Credits
 
 By [Liz Melchor](https://lizmelchor.com) — [@i.draw.monkeys](https://instagram.com/i.draw.monkeys)
+Coded with help from Claude.
 
 Built as a plugin for [FigUI](https://github.com/figamore/FigUI).
