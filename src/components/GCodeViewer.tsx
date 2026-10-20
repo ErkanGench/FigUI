@@ -14,7 +14,7 @@ import { useGCodeSenderStore } from '../store/gcodeSender'
 import { useSingleBlockStore } from '../store/singleBlock'
 import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
-import { controllerRunCommand } from '../lib/controllerFiles'
+import { controllerRunCommand, isRunningFile } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
 
 const GCODE_EXTENSIONS_PREVIEW = '.g, .nc, .gcode, .ngc, .tap, or .cnc'
@@ -170,16 +170,6 @@ const ENTRY_MARKER_LINE = [0.13, 0.77, 0.37, 1.0] as const
 const ENTRY_MARKER_FILL = [0.13, 0.77, 0.37, 0.26] as const
 const EXIT_MARKER_LINE = [0.94, 0.27, 0.27, 1.0] as const
 const EXIT_MARKER_FILL = [0.94, 0.27, 0.27, 0.26] as const
-
-/**
- * Whether the SD file FluidNC reports running is the file loaded in the
- * viewer. A job started from another device may run a different one.
- */
-function isRunningLoadedFile(sdFilename: string, loadedPath: string | null, fileName: string | null) {
-  const baseName = (path: string) => path.slice(path.replace(/\\/g, '/').lastIndexOf('/') + 1).toLowerCase()
-  const running = baseName(sdFilename)
-  return (!!fileName && fileName.toLowerCase() === running) || (!!loadedPath && baseName(loadedPath) === running)
-}
 
 function getAxisEnvelopeOrigin(wco: number, maxTravel: number, homingDirInvert: number, bit: number) {
   return -wco - ((homingDirInvert & bit) ? 0 : maxTravel)
@@ -2754,7 +2744,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
     // A job started elsewhere may run another file: do not track it on this one.
     const runningOtherFile = !senderActive && !!status.sdFilename
-      && !isRunningLoadedFile(status.sdFilename, loadedPath, fileName)
+      && !isRunningFile(status.sdFilename, loadedPath)
     if (isRunning && modelRef.current && !runningOtherFile) {
       // Tracking is cheap at any size; only drawing the completed path is
       // limited to smaller jobs. Program Execution follows this position.

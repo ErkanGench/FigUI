@@ -7,6 +7,7 @@ import { connect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from '
 import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, WebUIBlockedError } from './lib/http'
 import { isWasmBridgeActive, WASM_BRIDGE_BASE } from './wasmBridge/shimTransport'
 import { parseESP800 } from './lib/parser'
+import { isJobActiveState, isRunningFile, jobContinues, runningFilePath } from './lib/controllerFiles'
 import { loadControllerConfigSettings } from './lib/controllerConfig'
 import { scheduleControllerStartup } from './lib/controllerResources'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from './lib/updateCheck'
@@ -109,9 +110,6 @@ function saveControllerJob(job: SavedControllerJob | null) {
 
 // Follows controller (SD) jobs through status reports. It is its own component
 // so that each status report re-renders only this, not the whole app.
-// The safety door pauses a running job like a feed hold.
-const isJobActiveState = (state: string) => state === 'Run' || state === 'Hold' || state === 'Door'
-
 function ControllerJobTracker() {
   const connected = useMachineStore(s => s.connected)
   const machineState = useMachineStore(s => s.status.state)
@@ -131,6 +129,7 @@ function ControllerJobTracker() {
   const controllerTrackedJobStartedAtRef = useRef<number | null>(null)
   const controllerJobConnectionLossRef = useRef<{
     reportCount: number
+    sdFilename: string | null
     sdPercent: number | null
     line: number | null
     mpos: Position
@@ -178,7 +177,7 @@ function ControllerJobTracker() {
       } else if (sdFilename && !adoptionBlockedRef.current) {
         savedJobCheckedRef.current = true
         const saved = loadSavedControllerJob()
-        const resumed = saved?.sdFilename === sdFilename
+        const resumed = saved && isRunningFile(sdFilename, runningFilePath(saved.sdFilename))
           ? { startedAt: saved.startedAt, adopted: saved.adopted }
           : { startedAt: Date.now(), adopted: true }
         resumedJobStartedAtRef.current = resumed.startedAt
@@ -204,6 +203,7 @@ function ControllerJobTracker() {
         const { status, statusReportCount } = useMachineStore.getState()
         controllerJobConnectionLossRef.current = {
           reportCount: statusReportCount,
+          sdFilename: status.sdFilename || null,
           sdPercent: status.sdPercent ?? null,
           line: useGCodeStore.getState().activeSourceLine,
           mpos: status.mpos,
@@ -215,7 +215,9 @@ function ControllerJobTracker() {
     if (loss) {
       if (statusReportCount === loss.reportCount) return
       controllerJobConnectionLossRef.current = null
-      if (!isJobActiveState(machineState)) {
+      // A job of another file (started from another device meanwhile) is
+      // not this one continuing; it is adopted as a new job afterwards.
+      if (!jobContinues(machineState, useMachineStore.getState().status.sdFilename, loss.sdFilename)) {
         // A controller that restarts drops the connection and comes back idle,
         // which used to read as a finished job. Without homing, it also comes
         // back with its machine position at zero while the toolhead stayed put.
