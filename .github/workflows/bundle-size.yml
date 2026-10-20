@@ -1,0 +1,97 @@
+name: ESP32 bundle size
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esp32-bundle-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ESP32 (${{ matrix.revision }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [base, pr]
+    steps:
+      - name: Checkout revision
+        uses: actions/checkout@v4
+        with:
+          # For pull_request events, github.sha is the PR merge commit.
+          ref: ${{ matrix.revision == 'base' && github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies from this revision's lockfile
+        run: npm ci
+
+      - name: Build final ESP32 artifact
+        run: npm run build:esp32
+
+      - name: Upload compressed bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-bundle-${{ matrix.revision }}
+          path: dist/index.html.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  compare:
+    name: Bundle size report
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both builds to succeed
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error title=ESP32 bundle size::Both ESP32 builds must succeed before bundle sizes can be compared."
+            exit 1
+          fi
+
+      - name: Checkout comparison tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test comparison rules
+        run: node --test scripts/test-bundle-size.mjs
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: esp32-bundle-*
+          path: bundle-artifacts
+
+      - name: Compare final gzip sizes
+        env:
+          # Warn if growth exceeds 3 KiB, or the total exceeds the budget.
+          BUNDLE_WARN_BYTES: "3072"
+          BUNDLE_MAX_BYTES: "182272" # 178 KiB; matches scripts/build-esp32.mjs.
+          # Set to "true" to fail this check on size warnings.
+          BUNDLE_FAIL_ON_WARNING: "false"
+        run: >-
+          node scripts/check-bundle-size.mjs
+          bundle-artifacts/esp32-bundle-base/index.html.gz
+          bundle-artifacts/esp32-bundle-pr/index.html.gz
