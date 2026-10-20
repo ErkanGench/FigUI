@@ -12,6 +12,7 @@
     "test": "node scripts/run-tests.mjs && npm run -s test:webui && npm run -s test:resources",
     "test:config": "node scripts/test-config-compatibility.mjs",
     "test:jog": "node scripts/test-jog-settings.mjs",
+    "test:plugins-macros": "esbuild scripts/test-plugins-macros.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-plugins-macros.mjs && node node_modules/.cache/figui-test-plugins-macros.mjs",
     "test:gcode-parser": "esbuild scripts/test-gcode-parser.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-gcode-parser.mjs && node node_modules/.cache/figui-test-gcode-parser.mjs",
     "test:gcode-arcs": "esbuild scripts/test-gcode-arcs.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-gcode-arcs.mjs && node node_modules/.cache/figui-test-gcode-arcs.mjs",
     "test:gcode": "esbuild scripts/test-gcode-preview.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-gcode-preview.mjs && node node_modules/.cache/figui-test-gcode-preview.mjs",
