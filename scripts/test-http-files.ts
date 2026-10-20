@@ -32,7 +32,11 @@ let log: string[] = []
 let fileOp: (params: URLSearchParams) => string | Error = () => '{"status":"Ok"}'
 let reply: ((url: URL, init?: RequestInit) => Response | Promise<Response>) | null = null
 
-const listing = (status: string) => JSON.stringify({ files: [], path: '/', total: '1 MB', used: '0 B', occupation: '0', status })
+// The files of the one folder the save cases use.
+let folder = new Set<string>()
+const listing = (status: string) => JSON.stringify({
+  files: [...folder].map(name => ({ name, size: '1' })), path: '/', total: '1 MB', used: '0 B', occupation: '0', status,
+})
 
 globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   const url = new URL(String(input))
@@ -61,7 +65,9 @@ class FakeXhr {
   open() {}
   abort() { queueMicrotask(() => this.onabort?.()) }
   send(fd: FormData) {
-    log.push(`upload ${(fd.get('myfile[]') as File).name}`)
+    const name = (fd.get('myfile[]') as File).name
+    log.push(`upload ${name}`)
+    folder.add(name.slice(name.lastIndexOf('/') + 1))
     lastXhr = this
     this.responseText = xhrReply
     if (!xhrStalls) queueMicrotask(() => this.onload?.())
@@ -96,33 +102,75 @@ assert.deepEqual((await http.listFiles('/sd/')).files, [])
 fileOp = () => '{"status":"Ok"}'
 
 // ── Saves: the new content goes to a temporary name and is renamed over ──────
+// Like FAT and SPIFFS, the folder refuses to rename onto an existing file.
+// fail(from, to) can make one rename fail, before (lost) or after (done) it.
+const folderOp = (fail?: (from: string, to: string) => { error: string | Error; done?: boolean } | undefined) =>
+  (params: URLSearchParams) => {
+    const action = params.get('action')
+    const name = params.get('filename')!
+    const to = params.get('newname')!
+    if (action === 'delete') folder.delete(name)
+    if (action !== 'rename') return '{"status":"Ok"}'
+    const failure = fail?.(name, to)
+    if (failure && !failure.done) return failure.error
+    if (!folder.has(name) || folder.has(to)) return `{"status":"Cannot rename ${name}"}`
+    folder.delete(name)
+    folder.add(to)
+    return failure?.error ?? '{"status":"Ok"}'
+  }
+
+// A new file is renamed into place.
+folder = new Set()
 log = []
+fileOp = folderOp()
 await http.replaceFileContent('/', 'config.yaml', 'name: A\n', 'local')
 assert.deepEqual(log, ['upload /config.yaml.new', 'rename config.yaml.new -> config.yaml'])
+assert.deepEqual([...folder], ['config.yaml'])
 
-// A filesystem that refuses to rename onto an existing file.
+// Over an existing file, the original is kept as .bak until the new one is in place.
 log = []
-let refused = false
-fileOp = params => {
-  if (params.get('action') === 'rename' && !refused) {
-    refused = true
-    return '{"status":"Cannot rename config.yaml.new File exists"}'
-  }
-  return '{"status":"Ok"}'
-}
-await http.replaceFileContent('/', 'config.yaml', 'name: A\n', 'local')
+await http.replaceFileContent('/', 'config.yaml', 'name: B\n', 'local')
 assert.deepEqual(log, [
   'upload /config.yaml.new',
   'rename config.yaml.new -> config.yaml',
-  'delete config.yaml',
+  'rename config.yaml -> config.yaml.bak',
   'rename config.yaml.new -> config.yaml',
+  'delete config.yaml.bak',
 ])
+assert.deepEqual([...folder].sort(), ['config.yaml'])
 
-// A lost reply may mean the rename happened: never delete the file then.
+// If the new file cannot take its place, the original is put back.
 log = []
-fileOp = params => params.get('action') === 'rename' ? new TypeError('Failed to fetch') : '{"status":"Ok"}'
-await assert.rejects(http.replaceFileContent('/', 'config.yaml', 'name: A\n', 'local'))
+let attempts = 0
+fileOp = folderOp((from, to) => from === 'config.yaml.new' && to === 'config.yaml' && ++attempts === 2
+  ? { error: '{"status":"Cannot rename config.yaml.new: card error"}' } : undefined)
+await assert.rejects(http.replaceFileContent('/', 'config.yaml', 'name: C\n', 'local'), /card error/)
+assert.deepEqual(log.slice(-2), ['rename config.yaml.new -> config.yaml', 'rename config.yaml.bak -> config.yaml'])
+assert.deepEqual([...folder].sort(), ['config.yaml', 'config.yaml.new'])
+
+// A lost reply after the rename happened: the save is done, nothing is deleted.
+folder = new Set(['config.yaml.bak'])
+log = []
+fileOp = folderOp(() => ({ error: new TypeError('Failed to fetch'), done: true }))
+await http.replaceFileContent('/', 'config.yaml', 'name: D\n', 'local')
 assert.deepEqual(log, ['upload /config.yaml.new', 'rename config.yaml.new -> config.yaml'])
+assert.deepEqual([...folder].sort(), ['config.yaml', 'config.yaml.bak'])
+
+// A failure that is not the target existing leaves everything as it was.
+folder = new Set()
+log = []
+fileOp = folderOp(() => ({ error: new TypeError('Failed to fetch') }))
+await assert.rejects(http.replaceFileContent('/', 'config.yaml', 'name: E\n', 'local'), /Failed to fetch/)
+assert.deepEqual(log, ['upload /config.yaml.new', 'rename config.yaml.new -> config.yaml'])
+
+// A backup left by an earlier save may be the only copy of the original.
+folder = new Set(['config.yaml', 'config.yaml.bak'])
+log = []
+fileOp = folderOp()
+await assert.rejects(http.replaceFileContent('/', 'config.yaml', 'name: F\n', 'local'), /config\.yaml\.bak is left/)
+assert.deepEqual([...folder].sort(), ['config.yaml', 'config.yaml.bak', 'config.yaml.new'])
+folder = new Set()
+fileOp = () => '{"status":"Ok"}'
 
 // Saving an edited file whose name looks like a failure status.
 fileOp = () => listing('error.nc.new renamed to error.nc')

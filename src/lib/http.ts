@@ -423,7 +423,9 @@ export async function saveFileContent(
 /**
  * Like saveFileContent, but the old file stays until the new one is complete:
  * FluidNC empties an upload target at once and deletes it if the connection
- * drops, so the content goes to a temporary name and is renamed over it.
+ * drops, so the content goes to <name>.new and is renamed over the original.
+ * FAT and SPIFFS refuse to rename onto an existing file; the original is then
+ * moved to <name>.bak and put back if the new file cannot take its place.
  */
 export async function replaceFileContent(
   path: string,
@@ -432,16 +434,27 @@ export async function replaceFileContent(
   fs: Filesystem,
 ): Promise<void> {
   const temporary = `${filename}.new`
+  const backup = `${filename}.bak`
   await saveFileContent(path, temporary, content, fs)
   try {
     await renameFile(path, temporary, filename, fs)
+    return
   } catch (e) {
-    // FAT and SPIFFS refuse to rename onto an existing file. Anything else,
-    // such as a lost reply, may mean the rename already happened.
-    if (!(e instanceof Error && /^cannot rename/i.test(e.message))) throw e
-    await deleteFile(path, filename, fs)
-    await renameFile(path, temporary, filename, fs)
+    // Look before going on: a lost reply may mean the rename happened, and an
+    // earlier backup may be the only copy of the original.
+    const names = new Set((await listFiles(path, fs)).files.map(file => file.name))
+    if (!names.has(temporary) && names.has(filename)) return
+    if (!names.has(filename)) throw e
+    if (names.has(backup)) throw new Error(`${backup} is left from an earlier save; ${filename} was not changed`)
   }
+  await renameFile(path, filename, backup, fs)
+  try {
+    await renameFile(path, temporary, filename, fs)
+  } catch (e) {
+    await renameFile(path, backup, filename, fs).catch(() => {})
+    throw e
+  }
+  await deleteFile(path, backup, fs).catch(() => {})
 }
 
 // FluidNC's cmd path explicitly allows ESP800 during motion. The plain path
