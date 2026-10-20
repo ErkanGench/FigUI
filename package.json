@@ -19,6 +19,7 @@
     "test:resources": "esbuild scripts/test-resource-loading.tsx --bundle --external:react --external:react-dom --external:lucide-react --external:zustand --loader:.svg=dataurl --define:import.meta.env='{}' --define:import.meta.env.DEV=false --define:__CONFIG_STUDIO_BUILD__='\"test\"' --platform=node --format=esm --outfile=node_modules/.cache/figui-test-resource-loading.mjs && node node_modules/.cache/figui-test-resource-loading.mjs",
     "preview": "vite preview",
     "test:studio": "node scripts/test-config-studio-loader.mjs",
+    "test:plugin-close": "esbuild scripts/test-plugin-close.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-plugin-close.mjs && node node_modules/.cache/figui-test-plugin-close.mjs",
     "test:pack": "node scripts/test-esp32-pack.mjs"
   },
   "dependencies": {

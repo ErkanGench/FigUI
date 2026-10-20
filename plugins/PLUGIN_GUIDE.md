@@ -400,7 +400,7 @@ await call('close')
 ```
 
 #### `setCloseCommand`
-Registers one command line that FigUI sends when the plugin window closes or is unmounted (the Plugins tab is left, another plugin opens). A plugin cannot send anything itself at that point, so use this to switch off what it switched on, for example a laser pointer. An empty string clears it. The line is sent like `sendCommand`, only while connected.
+Registers one command line that FigUI sends when the plugin window closes or is unmounted (the Plugins tab is left, another plugin opens). A plugin cannot send anything itself at that point, so use this to switch off what it switched on, for example a laser pointer. An empty string clears it. FigUI sends the line as soon as the controller is connected and Idle, so a window closed during a jog, an alarm or a dropped connection still gets it sent later (as long as the FigUI page stays open). Register it before switching anything on.
 
 ```js
 await call('setCloseCommand', { command: 'M5' })

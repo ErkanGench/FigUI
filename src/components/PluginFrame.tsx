@@ -4,6 +4,7 @@ import { useMachineStore } from '../store'
 import { sendCommand, listFiles as listDeviceFiles, fetchFileContent, saveFileContent } from '../lib/http'
 import { invalidateFileCache } from './FileManager'
 import { sendRaw, sendRealtime, onLine } from '../lib/ws'
+import { sendCloseCommand } from '../lib/pluginClose'
 import type { Plugin } from '../types'
 
 interface PluginRequest {
@@ -215,7 +216,7 @@ export function PluginFrame({ plugin, onClose, inline }: { plugin: Plugin; onClo
       window.removeEventListener('message', onMessage)
       lineUnsubRef.current?.()
       lineUnsubRef.current = null
-      if (closeCommandRef.current && useMachineStore.getState().connected) sendRaw(closeCommandRef.current)
+      if (closeCommandRef.current) sendCloseCommand(closeCommandRef.current)
       closeCommandRef.current = ''
     }
   }, [plugin.id])
