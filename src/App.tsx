@@ -109,6 +109,9 @@ function saveControllerJob(job: SavedControllerJob | null) {
 
 // Follows controller (SD) jobs through status reports. It is its own component
 // so that each status report re-renders only this, not the whole app.
+// The safety door pauses a running job like a feed hold.
+const isJobActiveState = (state: string) => state === 'Run' || state === 'Hold' || state === 'Door'
+
 function ControllerJobTracker() {
   const connected = useMachineStore(s => s.connected)
   const machineState = useMachineStore(s => s.status.state)
@@ -165,7 +168,7 @@ function ControllerJobTracker() {
       const reportCountAtConnect = reportCountAtConnectRef.current
       if (activeJobSource || !connected || reportCountAtConnect == null || statusReportCount <= reportCountAtConnect) return
       const sdFilename = useMachineStore.getState().status.sdFilename
-      if (machineState !== 'Run' && machineState !== 'Hold') {
+      if (!isJobActiveState(machineState)) {
         adoptionBlockedRef.current = false
         if (!savedJobCheckedRef.current) {
           // The job saved before a reload ended while the page was away.
@@ -212,7 +215,7 @@ function ControllerJobTracker() {
     if (loss) {
       if (statusReportCount === loss.reportCount) return
       controllerJobConnectionLossRef.current = null
-      if (machineState !== 'Run' && machineState !== 'Hold') {
+      if (!isJobActiveState(machineState)) {
         // A controller that restarts drops the connection and comes back idle,
         // which used to read as a finished job. Without homing, it also comes
         // back with its machine position at zero while the toolhead stayed put.
@@ -226,7 +229,7 @@ function ControllerJobTracker() {
       }
     }
 
-    if (machineState === 'Run' || machineState === 'Hold') {
+    if (isJobActiveState(machineState)) {
       controllerJobWasRunningRef.current = true
       controllerJobAwaitingRunAfterSpinupRef.current = false
       const sdFilename = useMachineStore.getState().status.sdFilename

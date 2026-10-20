@@ -2074,6 +2074,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   useEffect(() => {
     if (trackedJobSource === 'controller' && status.state !== 'Idle') {
       controllerJobSeenStartedAtRef.current = trackedJobStartedAt ?? null
+      // An error line from another command may have been taken for a refused start.
+      setControllerStartError(null)
     }
   }, [trackedJobSource, trackedJobStartedAt, status.state])
   useEffect(() => {
