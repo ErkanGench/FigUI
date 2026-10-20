@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Wallflower</title>
+<title>Wallflower Machine View</title>
 <style>
   /* FigUI injects its theme variables; the fallbacks are only for opening
      this file outside FigUI. */
@@ -89,16 +89,25 @@
           border-radius: 6px; background: var(--surface, #111622); overflow: hidden; }
   .wrap.drag { outline: 2px dashed var(--accent, #f0a030); outline-offset: -6px; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-  #empty { position: absolute; inset: 0; place-items: center; color: var(--text-dim, #6c7793); }
-  #empty:not([hidden]) { display: grid; }
-  .caption { color: var(--text-dim, #6c7793); padding-top: 6px; font-size: 11px; }
+  #empty { position: absolute; inset: auto 0 0 0; padding: 10px; text-align: center;
+           color: var(--text-dim, #6c7793); pointer-events: none; }
+  #empty:not([hidden]) { display: block; }
+  .caption { color: var(--text-dim, #6c7793); padding-top: 4px; font-size: 11px; }
+  .viewbar { display: flex; align-items: center; gap: 6px; padding-top: 8px; }
+  .chip { padding: 3px 9px; font-size: 11px; }
+  #zoomlabel { margin-left: auto; font-size: 11px; color: var(--text-dim, #6c7793);
+               font-variant-numeric: tabular-nums; }
+  canvas { cursor: grab; }
+  canvas.panning { cursor: grabbing; }
   input[type=file] { display: none; }
 
-  @media (max-width: 760px) {
+  @media (max-width: 900px) { main { grid-template-columns: 244px 1fr; gap: 10px; } }
+  @media (max-width: 700px) { main { grid-template-columns: 220px 1fr; gap: 8px; padding: 0 8px 8px; } }
+  @media (max-width: 560px) {
     body { overflow: auto; height: auto; }
     main { grid-template-columns: 1fr; }
     .panel { overflow: visible; padding-right: 0; }
-    .wrap { height: 70vw; }
+    .wrap { height: 60vh; min-height: 220px; }
   }
   @media (prefers-reduced-motion: reduce) { .switch input, .switch input::after { transition: none; } }
 </style>
@@ -154,7 +163,13 @@
       <canvas id="canvas"></canvas>
       <div id="empty">Open an SVG, or drop one here.</div>
     </div>
-    <div class="caption">Preview is in machine coordinates: 0,0 at the centre of the page, X right, Y up.</div>
+    <div class="viewbar">
+      <button id="view-machine" class="chip">Whole machine</button>
+      <button id="view-drawing" class="chip">Fit drawing</button>
+      <span id="zoomlabel"></span>
+    </div>
+    <div class="caption">Scroll to zoom, drag to pan, double-click to reset. Motors are the
+      anchors from your FluidNC config, the dashed box is the axis travel, 0,0 is the center of the page.</div>
   </div>
 </main>
 
@@ -903,6 +918,14 @@ if (typeof module !== "undefined") module.exports = WF;
   // Axis travel limits ($130/$131), straight from the controller. Used only to
   // warn when a drawing won't fit - it never changes the gcode.
   let travel = null;
+  // WallPlotter anchor points, i.e. where the two motors hang. Read from the
+  // controller's config; null until they arrive, or if this is not a polargraph.
+  let anchors = null;
+  let configCache = null;
+  // null means frame the whole machine. Once the user zooms or pans, this holds
+  // the view explicitly: scale in px/mm and the machine point at the center.
+  let view = null;
+  let frame = { k: 1, cx: 0, cy: 0, cw: 0, ch: 0, fitK: 1 };   // last drawn transform
 
   const num = (k, fallback) => {
     const v = parseFloat(String(settings[k]).trim().replace(",", "."));
@@ -962,6 +985,7 @@ if (typeof module !== "undefined") module.exports = WF;
     $("sd_name").value = name + ".gcode";
     $("status").textContent = "";
     $("empty").hidden = true;
+    view = null;                  // frame the new drawing in its machine again
     recompute();
   }
 
@@ -1004,6 +1028,8 @@ if (typeof module !== "undefined") module.exports = WF;
     $("info").textContent =
       `page  ${pw.toFixed(0)} x ${ph.toFixed(0)} mm\n` +
       (travel ? `machine  ${travel[0].toFixed(0)} x ${travel[1].toFixed(0)} mm\n` : "") +
+      (anchors ? `motors  (${anchors[0][0].toFixed(0)}, ${anchors[0][1].toFixed(0)}) ` +
+                 `and (${anchors[1][0].toFixed(0)}, ${anchors[1][1].toFixed(0)})\n` : "") +
       `${n(stats.after.lines)} lines, ${n(stats.after.points)} points\n` +
       `draw  ${WF.drawLength(result).toFixed(0)} mm\n` +
       `travel  ${WF.travelLength(result).toFixed(0)} mm\n` +
@@ -1013,39 +1039,215 @@ if (typeof module !== "undefined") module.exports = WF;
       (over ? "\n\nDRAWING EXCEEDS THE MACHINE TRAVEL" : "");
   }
 
+  // ------------------------------------------------------- machine geometry
+
+  // Follow a slash-separated path through indented YAML. Only good enough to
+  // pull one scalar out of a FluidNC config, but it keeps kinematics entries
+  // apart that a plain key search would confuse.
+  function yamlLookup(text, path) {
+    const lines = String(text).split(/\r?\n/)
+      .filter((l) => l.trim() && !l.trim().startsWith("#"));
+    const keys = path.split("/");
+    let start = 0, parent = -1;
+    for (let depth = 0; depth < keys.length; depth++) {
+      const key = keys[depth].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp("^(\\s*)" + key + "\\s*:\\s*(.*)$");
+      let hit = null;
+      for (let i = start; i < lines.length; i++) {
+        const lead = /^(\s*)\S/.exec(lines[i]);
+        const indent = lead ? lead[1].length : 0;
+        if (depth && indent <= parent) break;          // fell out of the block
+        const found = re.exec(lines[i]);
+        if (found && (!depth || found[1].length > parent)) {
+          hit = [i, found[1].length, found[2].trim()];
+          break;
+        }
+      }
+      if (!hit) return null;
+      start = hit[0] + 1;
+      parent = hit[1];
+      if (depth === keys.length - 1) return hit[2];
+    }
+    return null;
+  }
+
+  async function configText() {
+    if (configCache !== null) return configCache;
+    for (const path of ["/config.yaml", "/localfs/config.yaml", "/sd/config.yaml"]) {
+      try {
+        const t = await call("readFile",
+          { path, fs: path.startsWith("/sd") ? "sd" : "local" });
+        if (t && String(t).trim()) { configCache = String(t); return configCache; }
+      } catch (e) { /* try the next location */ }
+    }
+    configCache = "";
+    return configCache;
+  }
+
+  const ANCHOR_KEYS = ["left_anchor_x", "left_anchor_y", "right_anchor_x", "right_anchor_y"];
+
+  // Travel limits and anchor points, both out of the controller's config. The
+  // config file is authoritative and one read beats several round trips, so it
+  // comes first; the controller's own settings are the fallback. This runs once
+  // per window, and the window reloads whenever the plugin is opened, so an
+  // edited config is picked up without anything to press.
+  async function loadMachine() {
+    const text = await configText();
+    const numAt = (path) => {
+      const m = /^\s*(-?\d*\.?\d+)/.exec(yamlLookup(text, path) || "");
+      return m ? parseFloat(m[1]) : null;
+    };
+
+    let tx = text ? numAt("axes/x/max_travel_mm") : null;
+    let ty = text ? numAt("axes/y/max_travel_mm") : null;
+    let reached = !!text;
+
+    if (tx === null || ty === null) {
+      try {
+        const s = await call("getMachineSettings");
+        const x = Number(s && s.maxTravelX), y = Number(s && s.maxTravelY);
+        if (tx === null && Number.isFinite(x) && x > 0) { tx = x; reached = true; }
+        if (ty === null && Number.isFinite(y) && y > 0) { ty = y; reached = true; }
+      } catch (e) { /* leave it unknown */ }
+    }
+
+    const found = {};
+    if (text) {
+      for (const k of ANCHOR_KEYS) {
+        const v = numAt("kinematics/WallPlotter/" + k);
+        if (v !== null) found[k] = v;
+      }
+    }
+    for (const k of ANCHOR_KEYS) {
+      if (k in found) continue;
+      try {
+        const r = await call("sendQuery", { command: "$/kinematics/WallPlotter/" + k });
+        const m = /=\s*(-?\d*\.?\d+)/.exec(String(r || ""));
+        if (m) { found[k] = parseFloat(m[1]); reached = true; }
+      } catch (e) { /* not a polargraph, or unsupported on this firmware */ }
+    }
+
+    // Only overwrite when something actually answered. A failed read should not
+    // wipe numbers that are still correct.
+    if (reached) {
+      travel = (tx > 0 && ty > 0) ? [tx, ty] : null;
+      anchors = ANCHOR_KEYS.every((k) => k in found)
+        ? [[found.left_anchor_x, found.left_anchor_y],
+           [found.right_anchor_x, found.right_anchor_y]]
+        : null;
+    }
+    draw();
+    if (drawing) report();
+    return reached;
+  }
+
   // ---------------------------------------------------------------- preview
 
+  // The view always frames the whole machine, not the drawing: travel limits,
+  // both motors and the sheet, all to scale. A small drawing looks small.
   function draw() {
     const canvas = $("canvas");
     const ctx = canvas.getContext && canvas.getContext("2d");
-    if (!ctx || !drawing) return;
+    if (!ctx) return;
     const css = getComputedStyle(document.documentElement);
-    const color = (name, fallback) => (css.getPropertyValue(name) || "").trim() || fallback;
+    const color = (n, f) => (css.getPropertyValue(n) || "").trim() || f;
     const dpr = window.devicePixelRatio || 1;
-    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    const cw = Math.max(canvas.clientWidth, 50), ch = Math.max(canvas.clientHeight, 50);
     canvas.width = Math.max(1, Math.round(cw * dpr));
     canvas.height = Math.max(1, Math.round(ch * dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
 
-    const [pw, ph] = drawing.page;
-    const hw = pw / 2, hh = ph / 2;
-    const [bx0, by0, bx1, by1] = WF.bbox(result);
-    const minx = Math.min(-hw, bx0), maxx = Math.max(hw, bx1);
-    const miny = Math.min(-hh, by0), maxy = Math.max(hh, by1);
-    const k = Math.min((cw - 24) / Math.max(maxx - minx, 1e-6), (ch - 24) / Math.max(maxy - miny, 1e-6));
-    const mx = (minx + maxx) / 2, my = (miny + maxy) / 2;
+    let minx = Infinity, maxx = -Infinity, miny = Infinity, maxy = -Infinity;
+    const include = (x, y) => {
+      if (x < minx) minx = x;
+      if (x > maxx) maxx = x;
+      if (y < miny) miny = y;
+      if (y > maxy) maxy = y;
+    };
+    if (travel) { include(-travel[0] / 2, -travel[1] / 2); include(travel[0] / 2, travel[1] / 2); }
+    if (anchors) { include(anchors[0][0], anchors[0][1]); include(anchors[1][0], anchors[1][1]); }
+    if (drawing) {
+      const [pw, ph] = drawing.page;
+      include(-pw / 2, -ph / 2); include(pw / 2, ph / 2);
+    }
+    if (result.length) {
+      const b = WF.bbox(result);
+      include(b[0], b[1]); include(b[2], b[3]);
+    }
+    if (minx === Infinity) return;          // nothing known yet
+
+    const pad = 34;                          // room for a motor glyph at the edge
+    const fitK = Math.min((cw - 2 * pad) / Math.max(maxx - minx, 1e-6),
+                          (ch - 2 * pad) / Math.max(maxy - miny, 1e-6));
+    const k = view ? view.k : fitK;
+    const mx = view ? view.cx : (minx + maxx) / 2;
+    const my = view ? view.cy : (miny + maxy) / 2;
+    frame = { k, cx: mx, cy: my, cw, ch, fitK };
     const X = (x) => cw / 2 + (x - mx) * k;
-    const Y = (y) => ch / 2 - (y - my) * k;
+    const Y = (y) => ch / 2 - (y - my) * k;  // machine Y up, canvas Y down
+    $("zoomlabel").textContent = view ? `${(k / fitK * 100).toFixed(0)}%` : "fit";
 
     ctx.lineWidth = 1;
-    ctx.strokeStyle = color("--border-strong", "#3a4463");
-    ctx.strokeRect(X(-hw), Y(hh), pw * k, ph * k);
+
+    // axis travel: the box the machine can actually reach
+    if (travel) {
+      ctx.strokeStyle = color("--border-strong", "#3a4463");
+      ctx.setLineDash([5, 4]);
+      ctx.strokeRect(X(-travel[0] / 2), Y(travel[1] / 2), travel[0] * k, travel[1] * k);
+      ctx.setLineDash([]);
+    }
+
+    // the sheet the drawing sits on
+    if (drawing) {
+      const [pw, ph] = drawing.page;
+      ctx.strokeStyle = color("--border", "#28304a");
+      ctx.strokeRect(X(-pw / 2), Y(ph / 2), pw * k, ph * k);
+    }
+
+    // cables from each motor down to where the pen starts
+    if (anchors) {
+      const pen = result.length ? result[0][0] : [0, 0];
+      ctx.strokeStyle = color("--text-dim", "#6c7793");
+      ctx.globalAlpha = 0.4;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      for (const a of anchors) {
+        ctx.moveTo(X(a[0]), Y(a[1]));
+        ctx.lineTo(X(pen[0]), Y(pen[1]));
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+
+      // the gondola, where the cables meet
+      ctx.beginPath();
+      ctx.arc(X(pen[0]), Y(pen[1]), 3.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // the motors themselves
+      const accent = color("--accent", "#f0a030");
+      for (const a of anchors) {
+        const px = X(a[0]), py = Y(a[1]), half = 7;
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(px - half, py - half, half * 2, half * 2);
+        ctx.fillStyle = accent;
+        ctx.beginPath();
+        ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.lineWidth = 1;
+    }
+
+    // origin
     ctx.strokeStyle = color("--border", "#28304a");
     ctx.beginPath();
     ctx.moveTo(X(0) - 8, Y(0)); ctx.lineTo(X(0) + 8, Y(0));
     ctx.moveTo(X(0), Y(0) - 8); ctx.lineTo(X(0), Y(0) + 8);
     ctx.stroke();
+
+    if (!result.length) return;
 
     if (result.length <= 4000) {
       ctx.strokeStyle = color("--warn", "#c9a227");
@@ -1140,6 +1342,63 @@ if (typeof module !== "undefined") module.exports = WF;
       .catch((e) => machineStatus(`Couldn't send: ${e.message || e}`, "bad"));
   }
 
+  // -------------------------------------------------------------- navigation
+
+  const ZOOM_MIN = 0.4, ZOOM_MAX = 80;      // multiples of the fit scale
+
+  function setZoom(k, cx, cy) {
+    const lo = frame.fitK * ZOOM_MIN, hi = frame.fitK * ZOOM_MAX;
+    view = { k: Math.min(Math.max(k, lo), hi), cx, cy };
+    draw();
+  }
+
+  const fitMachine = () => { view = null; draw(); };
+
+  function fitDrawing() {
+    if (!result.length) return fitMachine();
+    const [x0, y0, x1, y1] = WF.bbox(result);
+    const pad = 28;
+    const k = Math.min((frame.cw - 2 * pad) / Math.max(x1 - x0, 1e-6),
+                       (frame.ch - 2 * pad) / Math.max(y1 - y0, 1e-6));
+    setZoom(k, (x0 + x1) / 2, (y0 + y1) / 2);
+  }
+
+  const canvasEl = $("canvas");
+
+  // Scroll zooms about the pointer, so the thing under the cursor stays put.
+  canvasEl.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const r = canvasEl.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const { k, cx, cy, cw, ch } = frame;
+    const wx = cx + (px - cw / 2) / k;       // machine point under the cursor
+    const wy = cy - (py - ch / 2) / k;
+    const nk = k * Math.exp(-e.deltaY * 0.0015);
+    const lo = frame.fitK * ZOOM_MIN, hi = frame.fitK * ZOOM_MAX;
+    const ck = Math.min(Math.max(nk, lo), hi);
+    setZoom(ck, wx - (px - cw / 2) / ck, wy + (py - ch / 2) / ck);
+  }, { passive: false });
+
+  let panFrom = null;
+  canvasEl.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    panFrom = { x: e.clientX, y: e.clientY };
+    canvasEl.classList.add("panning");
+    if (canvasEl.setPointerCapture) canvasEl.setPointerCapture(e.pointerId);
+  });
+  canvasEl.addEventListener("pointermove", (e) => {
+    if (!panFrom) return;
+    const dx = e.clientX - panFrom.x, dy = e.clientY - panFrom.y;
+    panFrom = { x: e.clientX, y: e.clientY };
+    setZoom(frame.k, frame.cx - dx / frame.k, frame.cy + dy / frame.k);
+  });
+  const endPan = () => { panFrom = null; canvasEl.classList.remove("panning"); };
+  canvasEl.addEventListener("pointerup", endPan);
+  canvasEl.addEventListener("pointercancel", endPan);
+  canvasEl.addEventListener("dblclick", fitMachine);
+  $("view-machine").addEventListener("click", fitMachine);
+  $("view-drawing").addEventListener("click", fitDrawing);
+
   // ----------------------------------------------------------------- wiring
 
   for (const el of controls) {
@@ -1179,17 +1438,14 @@ if (typeof module !== "undefined") module.exports = WF;
     if (drawing) recompute();
   }).catch(() => showSettings());
 
-  // travel limits straight from the controller
-  call("getMachineSettings").then((s) => {
-    const x = Number(s && s.maxTravelX), y = Number(s && s.maxTravelY);
-    if (Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0) {
-      travel = [x, y];
-      if (drawing) report();
-    }
-  }).catch(() => {});
+  // travel limits and motor positions, so the view can show the machine to scale
+  loadMachine().catch(() => {});
 
   window.wallflower = { loadSVGText, gcode: () => WF.emit(result, values()),
-                        info: () => $("info").textContent, settings: () => settings };
+                        info: () => $("info").textContent, settings: () => settings,
+                        redraw: draw, machine: () => ({ travel, anchors }),
+                        frame: () => frame, view: () => view,
+                        fitMachine, fitDrawing, setZoom, loadMachine };
 })();
 </script>
 </body>
