@@ -477,6 +477,10 @@ function AppContent() {
       })
     }
     function park() {
+      // A G-code stream from this page needs its socket: closing it would end
+      // the job with an error.
+      const { phase } = useGCodeSenderStore.getState()
+      if (phase === 'streaming' || phase === 'paused' || phase === 'draining') return
       socketParked.current = true
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current)
