@@ -1592,7 +1592,6 @@ function MachineHub({
       onPointerDown={(e) => {
         e.stopPropagation();
         onSelect();
-        if (!e.isPrimary) return;
         onDrag({
           id: node.id,
           dx: (e.clientX - e.currentTarget.getBoundingClientRect().left) / zoom,
@@ -1748,7 +1747,6 @@ function GraphNode({
       onPointerDown={(e) => {
         e.stopPropagation();
         onSelect();
-        if (!e.isPrimary) return;
         onDrag({
           id: node.id,
           dx: (e.clientX - e.currentTarget.getBoundingClientRect().left) / zoom,
@@ -2234,21 +2232,17 @@ export function ConfigStudio({
     setZoom(nextZoom);
   };
   const handleCanvasDown = (e: React.PointerEvent<HTMLElement>) => {
-    // Only the first finger drives the canvas; a second one would make it jump.
-    if (!e.isPrimary) return;
     if (pendingPlacement && e.target === e.currentTarget) {
       e.preventDefault();
       commitPlacement(screenToWorld(e));
       return;
     }
     if (e.target === e.currentTarget) {
-      drag.current = null;
       panning.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
       e.currentTarget.setPointerCapture(e.pointerId);
     }
   };
   const handleCanvasMove = (e: React.PointerEvent<HTMLElement>) => {
-    if (!e.isPrimary) return;
     if (pendingPlacement) {
       const position = screenToWorld(e);
       setPendingPlacement((current) =>
@@ -2276,8 +2270,7 @@ export function ConfigStudio({
       );
     }
   };
-  const handleCanvasUp = (e: React.PointerEvent<HTMLElement>) => {
-    if (!e.isPrimary) return;
+  const handleCanvasUp = () => {
     drag.current = null;
     panning.current = null;
   };
@@ -2285,15 +2278,10 @@ export function ConfigStudio({
     <div className="config-studio relative flex min-h-0 flex-1 overflow-hidden bg-[#11151d] studio-text">
       <section
         className="relative min-w-0 flex-1 overflow-hidden"
-        // Without touch-action the browser takes a touch drag for its own
-        // panning and cancels the pointer after a few pixels.
-        style={{ touchAction: "none" }}
         onWheel={handleWheel}
         onPointerDown={handleCanvasDown}
         onPointerMove={handleCanvasMove}
         onPointerUp={handleCanvasUp}
-        onPointerCancel={handleCanvasUp}
-        onLostPointerCapture={handleCanvasUp}
       >
         <div
           className="pointer-events-none absolute inset-0 opacity-40"
@@ -2551,7 +2539,6 @@ export function ConfigStudio({
                 onSelect={() => setSelected(n.id)}
                 onDrag={(value) => {
                   recordHistory();
-                  panning.current = null;
                   drag.current = value;
                 }}
                 onAdd={add}
@@ -2565,7 +2552,6 @@ export function ConfigStudio({
                 onSelect={() => setSelected(n.id)}
                 onDrag={(value) => {
                   recordHistory();
-                  panning.current = null;
                   drag.current = value;
                 }}
                 onAdd={addChild}

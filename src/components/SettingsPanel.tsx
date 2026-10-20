@@ -2266,7 +2266,6 @@ export function SettingsPanel({
                   },
                   {
                     label: "Layout",
-                    hint: "Under 768 px wide the phone layout is always used. On a phone, keep Desktop site off.",
                     control: (["auto", "tablet", "desktop"] as const).map(
                       (mode) => (
                         <button
