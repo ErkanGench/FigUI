@@ -2725,20 +2725,20 @@ function genMatrix(p) {
   g.push(`G00 Z${fmt(p.clearance_height)} F${Math.round(p.feed_rate)}`);
   if (holes.length) g.push(`G00 X${fmt(holes[0].x)} Y${fmt(holes[0].y)}`);
 
-  for (const h of holes) {
-    g.push(`; Hole X=${fmt(h.x)} Y=${fmt(h.y)}`);
-    g.push(`G00 X${fmt(h.x)} Y${fmt(h.y)}`);
-    let currentZ = p.start_z;
-    let prevZ = p.start_z;
-    for (let k = 0; k < numPassesZ; k++) {
-      currentZ -= Math.min(p.depth_per_pass, p.total_depth - k * p.depth_per_pass);
-      if (k > 0) g.push(`G00 Z${fmt(prevZ + approachOffset)}`);
-      g.push(`G01 Z${fmt(currentZ)} F${fmt(plunge)}`);
-      prevZ = currentZ;
-      if (k < numPassesZ - 1) g.push(`G00 Z${fmt(p.clearance_height)}`);
-    }
-    //g.push(`G00 Z${fmt(p.clearance_height)}`);
+for (const h of holes) {
+  g.push(`; Hole X=${fmt(h.x)} Y=${fmt(h.y)}`);
+  g.push(`G00 X${fmt(h.x)} Y${fmt(h.y)}`);
+  let currentZ = p.start_z;
+  let prevZ = p.start_z;
+  for (let k = 0; k < numPassesZ; k++) {
+    currentZ -= Math.min(p.depth_per_pass, p.total_depth - k * p.depth_per_pass);
+    if (k > 0) g.push(`G00 Z${fmt(prevZ + approachOffset)}`);
+    g.push(`G01 Z${fmt(currentZ)} F${fmt(plunge)}`);
+    prevZ = currentZ;
+    if (k < numPassesZ - 1) g.push(`G00 Z${fmt(p.clearance_height)}`);
   }
+  g.push(`G00 Z${fmt(p.clearance_height)}`);  // ← toujours, y compris après 1 seule passe
+}
 
   let stockX, stockY;
   if (isPolar) {
