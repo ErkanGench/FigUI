@@ -100,9 +100,9 @@ let message = ''
 let pointerEndsAt = 0
 let pointerTimer = 0
 let offPending = false        // the pointer's M5 waits for Idle
-// While the pointer is on, FigUI is asked to send its M5 when this window
-// closes (setCloseCommand). A FigUI without that call rejects it, and the
-// panel then warns before closing instead.
+// Before the pointer goes on, FigUI is asked to send its M5 when this window
+// closes (setCloseCommand); FigUI keeps that line through a jog or a dropped
+// connection. A FigUI without the call rejects it and gets no pointer.
 let closeArmed = false
 let hostCloses = null         // null until FigUI has answered
 let offInFlight = false
@@ -189,9 +189,18 @@ async function pointerOn() {
   if (pct == null || !isIdle(status) || laserMode !== true || !(spindleMax > 0) || offInFlight) return
   const power = Number((spindleMax * pct / 100).toFixed(3))
   try {
+    await call('setCloseCommand', { command: 'G0 M5' })
+    closeArmed = true
+  } catch {
+    hostCloses = false
+    render()
+    return
+  }
+  try {
     await call('sendCommand', { command: `G1 F100 M3 S${power}` })
   } catch (err) {
     message = `Pointer not sent (${err.message}).`
+    armCloseOff(false)
     render()
     return
   }
@@ -201,7 +210,6 @@ async function pointerOn() {
   clearTimeout(pointerTimer)
   pointerEndsAt = Date.now() + POINTER_MS
   pointerTimer = setTimeout(pointerOff, POINTER_MS)
-  armCloseOff(true)
   if (pct !== savedPct) {
     savedPct = pct
     call('saveSettings', { data: { pointerPct: pct } }).catch(() => {})
@@ -212,9 +220,7 @@ async function pointerOn() {
 function armCloseOff(on) {
   if (closeArmed === on) return
   closeArmed = on
-  call('setCloseCommand', { command: on ? 'G0 M5' : '' })
-    .then(() => { hostCloses = true }, () => { hostCloses = false })
-    .finally(render)
+  call('setCloseCommand', { command: on ? 'G0 M5' : '' }).catch(() => {})
 }
 
 function laserOff() {
@@ -269,14 +275,12 @@ function render() {
   const secondsLeft = Math.ceil(Math.min(POINTER_MS, Math.max(0, pointerEndsAt - Date.now())) / 1000)
   ui.off.textContent = pointerEndsAt ? `Laser Off (auto in ${secondsLeft} s)` : 'Laser Off'
 
-  const canPoint = isIdle(s) && laserMode === true && spindleMax > 0
+  const canPoint = isIdle(s) && laserMode === true && spindleMax > 0 && hostCloses === true
   ui.pointer.hidden = laserOn || !canPoint
   ui.point.disabled = parsePct(ui.pct.value) == null || offInFlight
 
   ui.hint.textContent = pointerEndsAt
-    ? hostCloses === false
-      ? 'Switch it off here before closing this window or leaving the Plugins tab: once closed, this window cannot switch it off.'
-      : 'It also switches off when this window closes.'
+    ? 'It also switches off when this window closes.'
     : !laserOn && canPoint
       ? `Low-power dot for aligning the work zero. It switches itself off after ${POINTER_MS / 1000} s.`
       : jobRunning(s)
@@ -286,7 +290,9 @@ function render() {
 
   const note = message || (laserMode === false
     ? 'Laser mode is off ($32=0): the active spindle is not a laser, so there is no pointer.'
-    : laserMode && !(spindleMax > 0) ? '$30 (maximum power) is unknown, so there is no pointer.' : settingsNote)
+    : laserMode && !(spindleMax > 0) ? '$30 (maximum power) is unknown, so there is no pointer.'
+      : hostCloses === false ? 'This FigUI cannot switch the pointer off when this window closes (no setCloseCommand), so there is no pointer.'
+        : settingsNote)
   ui.note.textContent = note
   ui.note.hidden = !note
 }
@@ -332,6 +338,9 @@ async function init() {
       call('getSettings').catch(() => null),
     ])
     if (!(spindleMax > 0) && machine?.spindleMax > 0) spindleMax = machine.spindleMax
+    // The pointer is offered only by a FigUI that can switch it off when
+    // this window closes.
+    hostCloses = await call('setCloseCommand', { command: '' }).then(() => true, () => false)
     const pct = Number(saved?.pointerPct)
     if (pct > 0 && pct <= POINTER_MAX_PCT) savedPct = pct
     ui.pct.value = String(savedPct)
