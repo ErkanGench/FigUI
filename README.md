@@ -24,6 +24,7 @@ A modern web-based interface built with React & Typescript for [FluidNC](https:/
   - [Responsive Layouts](#responsive-layouts)
 - [Plugin API](#plugin-api)
 - [Deployment](#deployment)
+- [Contributing](#contributing)
 - [Tech Stack](#tech-stack)
 - [License](#license)
 
@@ -193,6 +194,33 @@ The `dist/` directory contains the static index.html.gz file you can upload to t
 Config Studio is built separately with `npm run build:studio`. Production UI builds reference an exact Studio build under `config-studio/<build-id>/` on GitHub Pages; deploy those assets before distributing a custom firmware build. Both Pages workflows build Studio and restore previously published versions through `scripts/prepare-config-studio-pages.mjs`, so older controllers continue to work. The archive is retained as `config-studio/archive.json.gz`; restoration failures stop deployment instead of silently deleting old builds. Keep the build input list in `scripts/config-studio-build-id.mjs` current when adding Studio dependencies.
 
 For local development, `npm run dev` loads Studio from the local source when opened. Run `npm run test:config` and `npm run test:studio` to check config compatibility, remote loading, offline caching, retries, and asset preservation.
+
+---
+
+## Contributing
+
+### Prioritize bundle size
+
+FigUI lives on the ESP32's internal filesystem alongside macros and configuration files. **Bundle size is a primary design constraint for every contribution.** Each increase reduces space available to users and room for future features. Keep changes focused and justify the storage cost of additions to the core UI.
+
+Before submitting a PR, build both the target branch and your changes using the same Node/npm versions and each revision's lockfile:
+
+```bash
+npm ci
+npm run build:esp32
+```
+
+Compare the final **`dist/index.html.gz`** files. Include the before/after sizes in bytes, the increase or decrease, and a brief explanation of any growth in your PR description.
+
+### Keep the bundle small
+
+- **Reuse existing code and UI.** Share repeated controls, parameter rows, probe symbols, SVG definitions, and common logic where doing so reduces the output. Measure the result; extra abstraction can also add bytes.
+- **Choose dependencies carefully.** Prefer existing utilities and browser APIs when they meet the need. Check the actual production cost of a new package, use imports that allow unused code to be removed, and avoid pulling in a general-purpose library for a small helper. Use the existing generated icon system.
+- **Keep specialized features optional.** Consider a [plugin](plugins/PLUGIN_GUIDE.md) for advanced workflows.
+- **Account for the single-file build.** The ESP32 build inlines dynamic imports and assets. Moving code into another file or using `import()` alone does not reduce controller storage.
+- **Preserve safety and readability.** The build already minifies, mangles CSS classes, packs JavaScript, and compresses with Zopfli. Focus on scope, duplication, dependencies, and assets. Keep necessary validation and machine-control safeguards, and let the build tools minify readable source.
+
+Contributions with unexplained or disproportionate bundle growth may need to be reduced or moved out of the core UI before merging.
 
 ---
 

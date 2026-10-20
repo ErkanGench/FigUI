@@ -1,7 +1,7 @@
 {
   "name": "Wallflower",
-  "description": "Convert, save and send SVGs as G-code for vertical plotters and polargraphs with center origin and a servo for pen up/down.",
-  "version": "1.0.0",
+  "description": "Convert, save and send SVGs as G-code for vertical plotters and polargraphs, with center origin, a servo for pen up/down, and the preview drawn to scale inside the whole machine.",
+  "version": "1.1.0",
   "entry": "index.html",
   "icon": "icon.png",
   "layout": "workspace",

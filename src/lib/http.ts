@@ -12,7 +12,8 @@ export const getBase = () => base
  * Commands and the WebSocket still use the independent session and PAGEID.
  */
 export const uiDir: string | null = (() => {
-  const m = /^\/ui\/[^/]+\//.exec(window.location.pathname)
+  // Tests and other non-browser hosts have no location.
+  const m = /^\/ui\/[^/]+\//.exec(globalThis.location?.pathname ?? '')
   return m ? m[0] : null
 })()
 
@@ -421,7 +422,7 @@ function colorToClass(color: Macro['color']): string {
     case 'purple': return 'btn btn-purple'
     case 'teal': return 'btn btn-teal'
     case 'accent': return 'btn btn-primary'
-    default: return 'btn-default'
+    default: return 'btn'
   }
 }
 
