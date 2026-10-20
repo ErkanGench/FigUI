@@ -24,7 +24,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   sendCommand,
   fetchFileContent,
-  saveFileContent,
+  replaceFileContent,
   uploadFirmware,
   getDeviceInfoFast,
   WebUIBlockedError,
@@ -852,7 +852,7 @@ async function updateConfigYamlBatch(
       return updated ?? yaml;
     }, configContent);
     if (missing.length < entries.length) {
-      await saveFileContent(file.dir, file.name, updatedContent, file.fs);
+      await replaceFileContent(file.dir, file.name, updatedContent, file.fs);
     }
     return missing;
   } catch (error) {
@@ -2326,16 +2326,13 @@ export function SettingsPanel({
                       </button>
                     )),
                   },
-                ].map(({ label, hint, control }) => (
+                ].map(({ label, control }) => (
                   <div
                     key={label}
-                    className="flex items-center justify-between gap-3 px-5 py-3.5"
+                    className="flex items-center justify-between px-5 py-3.5"
                   >
-                    <div>
-                      <span className="block text-base text-text-primary">{label}</span>
-                      {hint && <span className="block mt-0.5 text-xs text-text-dim">{hint}</span>}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
+                    <span className="text-base text-text-primary">{label}</span>
+                    <div className="flex items-center gap-0.5 bg-elevated rounded-sm border border-border p-0.5">
                       {control}
                     </div>
                   </div>
