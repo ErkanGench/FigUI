@@ -14,7 +14,7 @@ import { useGCodeSenderStore } from '../store/gcodeSender'
 import { useSingleBlockStore } from '../store/singleBlock'
 import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
-import { controllerRunCommand } from '../lib/controllerFiles'
+import { controllerRunCommand, isRunningFile, runningFilePath } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
 
 const GCODE_EXTENSIONS_PREVIEW = '.g, .nc, .gcode, .ngc, .tap, or .cnc'
@@ -1145,22 +1145,6 @@ function findLastSegmentAtOrBeforeSourceLine(segments: SegmentTable, sourceLine:
   return result
 }
 
-/**
- * Whether the SD file FluidNC reports running is the file loaded in the
- * viewer. A job started from another device may run a different one.
- */
-export function isRunningLoadedFile(sdFilename: string, loadedPath: string | null, fileName: string | null) {
-  const baseName = (path: string) => path.slice(path.replace(/\\/g, '/').lastIndexOf('/') + 1).toLowerCase()
-  const running = baseName(sdFilename)
-  return (!!fileName && fileName.toLowerCase() === running) || (!!loadedPath && baseName(loadedPath) === running)
-}
-
-/** The path to load the file a status report names. FluidNC reports it with its /sd or /localfs mount. */
-export function runningFilePath(sdFilename: string) {
-  const path = sdFilename.replace(/\\/g, '/')
-  return /^\/(sd|localfs)\//i.test(path) ? path : `/sd/${path.replace(/^\/+/, '')}`
-}
-
 function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number, t: Transform, units: Units) {
   const mmPerPx = 1 / t.scale
   const displayPerPx = mmToDisplay(mmPerPx, units)
@@ -2068,7 +2052,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   // another window or device. Its preview cannot be fetched meanwhile, as
   // FluidNC refuses to serve files while the machine moves.
   const otherJobFile = !simulationActive && !senderActive && machineJobActive && !!status.sdFilename
-    && !isRunningLoadedFile(status.sdFilename, loadedPath, fileName)
+    && !isRunningFile(status.sdFilename, loadedPath)
     ? status.sdFilename
     : null
   // The notice outlives the job, so the file can be loaded here once the machine stops.

@@ -1,24 +1,20 @@
 import assert from 'node:assert/strict'
-
-// The viewer's imports touch these when they load.
-const storage = { getItem: () => null, setItem() {}, removeItem() {} }
-Object.assign(globalThis, {
-  localStorage: storage,
-  window: Object.assign(new EventTarget(), { location: { host: 'fluidnc.local', pathname: '/' } }),
-  document: Object.assign(new EventTarget(), {
-    documentElement: { classList: { add() {}, remove() {} } },
-  }),
-})
-
-const { isRunningLoadedFile, runningFilePath } = await import('../src/components/GCodeViewer')
+import { isRunningFile, runningFilePath } from '../src/lib/controllerFiles'
 
 {
-  // Only the file FluidNC reports running counts as the loaded preview's job.
-  assert.equal(isRunningLoadedFile('/sd/F-Cu-Lazer.nc', '/sd/F-Cu-Lazer.nc', 'F-Cu-Lazer.nc'), true)
-  assert.equal(isRunningLoadedFile('/sd/f-cu-lazer.nc', null, 'F-Cu-Lazer.nc'), true)
-  assert.equal(isRunningLoadedFile('/sd/jobs/Maske.nc', 'jobs\\Maske.nc', null), true)
-  assert.equal(isRunningLoadedFile('/sd/Maske-Lazer.nc', '/sd/F-Cu-Lazer.nc', 'F-Cu-Lazer.nc'), false)
-  assert.equal(isRunningLoadedFile('/sd/Maske-Lazer.nc', null, null), false)
+  // Only the file FluidNC reports running counts as the loaded preview's job:
+  // filesystem and full path, not the name alone.
+  assert.equal(isRunningFile('/sd/F-Cu-Lazer.nc', '/sd/F-Cu-Lazer.nc'), true)
+  assert.equal(isRunningFile('/sd/f-cu-lazer.nc', '/sd/F-Cu-Lazer.nc'), true, 'FAT names are case-insensitive')
+  assert.equal(isRunningFile('/sd/jobs/Maske.nc', '/sd/jobs/Maske.nc'), true)
+  assert.equal(isRunningFile('/sd/Maske-Lazer.nc', '/sd/F-Cu-Lazer.nc'), false)
+  assert.equal(isRunningFile('/sd/Maske-Lazer.nc', null), false, 'a preview with no controller path')
+  assert.equal(isRunningFile('/sd/old/Maske.nc', '/sd/jobs/Maske.nc'), false, 'same name, other folder')
+  assert.equal(isRunningFile('/sd/Maske.nc', '/sd/jobs/Maske.nc'), false, 'same name, other folder')
+  assert.equal(isRunningFile('/localfs/Maske.nc', '/sd/Maske.nc'), false, 'same name, other filesystem')
+  assert.equal(isRunningFile('/sd/Maske.nc', '/Maske.nc'), false, 'an internal-flash file is not the SD file')
+  assert.equal(isRunningFile('/localfs/Maske.nc', '/Maske.nc'), true)
+  assert.equal(isRunningFile('Maske.nc', '/sd/Maske.nc'), true, 'a bare name is on the SD card')
 }
 
 {

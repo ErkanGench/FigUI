@@ -16,3 +16,17 @@ export function controllerPathsMatch(runningPath: string, loadedPath: string): b
   return controllerFilesystem(runningPath) === controllerFilesystem(loadedPath)
     && normalizePath(runningPath) === normalizePath(loadedPath)
 }
+
+/**
+ * The loadable path of the file a status report's SD: field names. FluidNC
+ * reports it with its /sd or /localfs mount; a bare name is on the SD card.
+ */
+export function runningFilePath(sdFilename: string) {
+  const path = sdFilename.replace(/\\/g, '/')
+  return /^\/(?:sd|localfs)\//i.test(path) ? path : `/sd/${path.replace(/^\/+/, '')}`
+}
+
+/** Whether the running file a status report names is the file at path: same filesystem and full path. */
+export function isRunningFile(sdFilename: string, path: string | null | undefined) {
+  return !!path && controllerPathsMatch(runningFilePath(sdFilename), path)
+}
