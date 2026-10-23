@@ -393,6 +393,17 @@ function AppContent() {
     }
   }, [connected, phase])
 
+  useEffect(() => () => {
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = null
+    }
+    if (stableConnectionTimer.current) {
+      clearTimeout(stableConnectionTimer.current)
+      stableConnectionTimer.current = null
+    }
+  }, [])
+
   const macrosLoaded = useRef(false)
   useEffect(() => {
     if (phase !== 'ready' || !connected) return

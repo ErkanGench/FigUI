@@ -36,7 +36,7 @@ const ALARM_QUERY_SILENT_RESPONSE: SilentResponseMatcher = {
 // answers with a bare error, which must end it too.
 const isNumberedSettingLine = (line: string) => /^\$\d+=/.test(line)
 const SETTINGS_QUERY_SILENT_RESPONSE: SilentResponseMatcher = {
-  starts: (line) => isNumberedSettingLine(line) || line.startsWith('error:'),
+  starts: (line) => isNumberedSettingLine(line) || line === 'error' || line.startsWith('error:'),
   consume: isNumberedSettingLine,
   done: isCommandEnd,
 }
@@ -577,7 +577,8 @@ function startGcStatePoll() {
     // While auto-reports arrive, $G only runs when no [GC:] came for a while.
     const now = Date.now()
     if (
-      now - autoReportSeenAt < GC_STATE_POLL_INTERVAL_MS
+      !settingsQueryPending
+      && now - autoReportSeenAt < GC_STATE_POLL_INTERVAL_MS
       && now - lastGcStateAt < GC_STATE_FALLBACK_POLL_MS
     ) return
     lastGcStateAt = now
@@ -1049,11 +1050,7 @@ export async function sendStartupQueries(canContinue: () => boolean = () => true
     // FluidNC refuses HTTP commands while the machine moves, so a page opened
     // during a job asks over the websocket, where $$ is allowed in any state
     // ($Report/Inches is not). Status reports are scaled by $13.
-    sendSilentRaw('$$', {
-      starts: (line) => /^\$\d+=|^error/.test(line),
-      consume: (line) => /^\$\d+=/.test(line),
-      done: (line) => line === 'ok' || line.startsWith('error'),
-    })
+    if (!sendSilentRaw('$$', SETTINGS_QUERY_SILENT_RESPONSE)) settingsQueryPending = true
   }
   return canContinue()
 }
