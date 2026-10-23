@@ -519,6 +519,9 @@ export function CodeEditor({
         setDirty(false);
         if (isYamlFile) setSavedOnce(true);
         return true;
+      } catch (e) {
+        alert(e instanceof Error ? e.message : "Save failed");
+        return false;
       } finally {
         setSaving(false);
       }
@@ -1025,7 +1028,11 @@ export const EDITABLE_EXT = new Set([
   ".conf",
 ]);
 
-export function isEditable(name: string): boolean {
+// The highlighter rebuilds the whole document after every edit and the gutter
+// renders one element per line, so a multi-megabyte job file freezes the tab.
+export const MAX_EDITABLE_BYTES = 512 * 1024;
+
+export function isEditable(name: string, size = 0): boolean {
   const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
-  return EDITABLE_EXT.has(ext);
+  return EDITABLE_EXT.has(ext) && size <= MAX_EDITABLE_BYTES;
 }

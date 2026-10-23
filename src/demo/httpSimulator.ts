@@ -97,7 +97,13 @@ function handleFsAction(
   return fileListResponse(fsPrefix, path)
 }
 
-function handleFileDownload(pathname: string): Response {
+function handleFileDownload(encodedPathname: string): Response {
+  let pathname = encodedPathname
+  try {
+    pathname = decodeURIComponent(encodedPathname)
+  } catch {
+    return new Response('Bad request', { status: 400 })
+  }
   const fsPath = pathname.startsWith('/sd/')
     ? pathname
     : '/localfs/' + pathname.split('/').slice(2).join('/')
@@ -191,7 +197,9 @@ export function installXhrInterceptor(): void {
       },
 
       set(target, prop, value) {
-        if (intercept && prop === 'onload') { storedOnload = value; return true }
+        // uploadFile assigns onload before open(), when interception is not decided yet.
+        if (prop === 'onload') storedOnload = value
+        if (intercept && prop === 'onload') return true
         try { Reflect.set(target, prop, value, target) } catch { /* read-only accessor */ }
         return true
       },

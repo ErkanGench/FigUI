@@ -24,13 +24,18 @@ import type { LucideIcon } from "lucide-react";
 import {
   sendCommand,
   fetchFileContent,
-  saveFileContent,
+  replaceFileContent,
   uploadFirmware,
   getDeviceInfoFast,
+  WebUIBlockedError,
 } from "../lib/http";
 import { useMachineStore } from "../store";
 import type { Theme } from "../store";
+import { useGCodeSenderStore } from "../store/gcodeSender";
+import { parseDecimalInput } from "../lib/numberInput";
 import type { FluidNCSetting } from "../types";
+import { yamlCommentStart } from "../lib/configValidation";
+import { useConfirmTap } from "../hooks/useConfirmTap";
 import {
   loadControllerConfigSettings,
   updateControllerConfigSetting,
@@ -444,8 +449,14 @@ interface SettingRowProps {
   onSave: (p: string, t: string, v: string) => Promise<void>;
 }
 
-function isBooleanTreeSetting(setting: Setting): boolean {
-  return setting.F === "tree" && setting.T === "B";
+// FluidNC reports enum items as type B too, with one option per member, and
+// those take a member value or name rather than true/false.
+export function isBooleanTreeSetting(setting: Setting): boolean {
+  if (setting.F !== "tree" || setting.T !== "B") return false;
+  const options = (setting.O ?? []).map((o) => Object.entries(o)[0] ?? []);
+  return options.length === 2
+    && options.some(([label, value]) => /^false$/i.test(String(label)) && value === 0)
+    && options.some(([label, value]) => /^true$/i.test(String(label)) && value === 1);
 }
 
 function normalizeSettingValueForSave(setting: Setting, value: string): string {
@@ -461,9 +472,43 @@ function booleanSettingValueIsOn(value: string): boolean {
   return Number(value) !== 0;
 }
 
+function settingLimit(limit: string | undefined): number | null {
+  if (limit === undefined || limit.trim() === "") return null;
+  const n = Number(limit);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Explains why a typed number cannot be sent to ESP401, or returns null. */
+export function numericSettingError(setting: Setting, value: string): string | null {
+  const n = parseDecimalInput(value);
+  if (n === null) return "Not a number";
+  if (setting.T === "I" && !Number.isInteger(n)) return "Must be a whole number";
+  const min = settingLimit(setting.M);
+  const reportedMax = settingLimit(setting.S);
+  // FluidNC reports a uint32 default maximum as -1: that maximum is unknown,
+  // but the minimum (usually 0) still holds.
+  const max = min !== null && reportedMax !== null && reportedMax < min ? null : reportedMax;
+  if ((min !== null && n < min) || (max !== null && n > max)) {
+    return min !== null && max !== null
+      ? `Must be between ${min} and ${max}`
+      : min !== null
+        ? `Must be at least ${min}`
+        : `Must be at most ${max}`;
+  }
+  return null;
+}
+
+function saveErrorText(e: unknown): string {
+  if (!(e instanceof Error)) return "Save failed";
+  // FluidNC answers 503 to web commands while the machine is moving.
+  if (e instanceof WebUIBlockedError || e.message === "HTTP 503") return "Controller busy: try again when not moving";
+  return `Save failed: ${e.message}`;
+}
+
 function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
   const [value, setValue] = useState(setting.V);
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [saveError, setSaveError] = useState("");
 
   useEffect(() => {
     setValue(setting.V);
@@ -486,12 +531,27 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
 
   async function save() {
     if (!changed || saveState === "saving") return;
+    // FluidNC treats an empty V= as a query: nothing would be set, but the
+    // empty value would be shown as saved and written to the config file.
+    const invalid =
+      value.trim() === ""
+        ? "Enter a value"
+        : isNumeric && !isPassword
+          ? numericSettingError(setting, value)
+          : null;
+    setSaveError(invalid ?? "");
+    if (invalid) return;
     setSaveState("saving");
     try {
-      await onSave(setting.P, setting.T, normalizeSettingValueForSave(setting, value));
+      // A decimal comma must reach the controller as a point: "80,5" steps/mm
+      // was sent as 805.
+      if (isNumeric && parseDecimalInput(value) === null) throw new Error("not a number");
+      const sent = isNumeric ? value.trim().replace(",", ".") : value;
+      await onSave(setting.P, setting.T, normalizeSettingValueForSave(setting, sent));
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 2500);
-    } catch {
+    } catch (e) {
+      setSaveError(saveErrorText(e));
       setSaveState("error");
       setTimeout(() => setSaveState("idle"), 3000);
     }
@@ -516,7 +576,9 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
           setSaveState("saved");
           setTimeout(() => setSaveState("idle"), 1500);
         })
-        .catch(() => {
+        .catch((e) => {
+          setValue(setting.V);
+          setSaveError(saveErrorText(e));
           setSaveState("error");
           setTimeout(() => setSaveState("idle"), 2000);
         });
@@ -542,7 +604,7 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
             <span className="text-sm text-ok">saved</span>
           )}
           {saveState === "error" && (
-            <span className="text-sm text-danger">error</span>
+            <span className="text-sm text-danger">{saveError || "error"}</span>
           )}
           <button
             onClick={toggle}
@@ -582,11 +644,17 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
               {searchBreadcrumb(setting)}
             </div>
           )}
+          {saveError && (
+            <div className="text-sm text-danger mt-0.5">{saveError}</div>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <select
             value={selectValue}
-            onChange={(e) => setValue(e.target.value)}
+            onChange={(e) => {
+              setValue(e.target.value);
+              setSaveError("");
+            }}
             className="input-field py-1 text-sm w-36"
           >
             {opts.map((opt) => {
@@ -628,25 +696,26 @@ function SettingRow({ setting, showPath, onSave }: SettingRowProps) {
       </div>
       <div className="flex items-center gap-2">
         <input
-          type={isPassword ? "password" : isNumeric ? "number" : "text"}
+          type={isPassword ? "password" : "text"}
+          // The iOS decimal keypad has no minus key.
+          inputMode={isNumeric && Number(setting.M) >= 0 ? "decimal" : undefined}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setSaveError("");
+          }}
           onFocus={(e) => {
             if (maskedPassword) e.currentTarget.select();
           }}
           onKeyDown={handleKey}
-          step={isNumeric ? (setting.T === "R" ? "any" : "1") : undefined}
-          min={
-            isNumeric && setting.M !== undefined ? Number(setting.M) : undefined
-          }
-          max={
-            isNumeric && setting.S !== undefined ? Number(setting.S) : undefined
-          }
           className="input-field flex-1 py-1 text-sm font-mono"
           spellCheck={false}
         />
         <SaveBtn state={saveState} changed={changed} onClick={save} />
       </div>
+      {saveError && (
+        <div className="mt-1 text-sm text-danger">{saveError}</div>
+      )}
     </div>
   );
 }
@@ -675,11 +744,12 @@ function SectionHeader({
   );
 }
 
-function updateYamlInPlace(
+/** Returns null when the key is not written in the file. */
+export function updateYamlInPlace(
   yaml: string,
   path: string,
   newValue: string,
-): string {
+): string | null {
   const parts = path
     .replace(/^\/+/, "")
     .split("/")
@@ -716,10 +786,11 @@ function updateYamlInPlace(
       if (matchDepth === parts.length - 1) {
         const lineIndent = line.slice(0, line.length - line.trimStart().length);
         const originalKey = trimmed.slice(0, colonIdx).trim();
-        // Preserve any trailing inline comment (e.g. "# tuned 2024-01-15")
+        // Preserve a trailing inline comment (e.g. "# tuned 2024-01-15") by
+        // the validator's rule: never inside quotes, never in a macro line.
         const afterColon = trimmed.slice(colonIdx + 1);
-        const commentMatch = afterColon.match(/\s+(#.*)$/);
-        const inlineComment = commentMatch ? `  ${commentMatch[1]}` : "";
+        const commentAt = yamlCommentStart(originalKey, afterColon);
+        const inlineComment = commentAt >= 0 ? `  ${afterColon.slice(commentAt)}` : "";
         lines[i] = `${lineIndent}${originalKey}: ${newValue}${inlineComment}`;
         return lines.join("\n");
       }
@@ -728,29 +799,64 @@ function updateYamlInPlace(
     }
   }
 
-  return yaml;
+  return null;
 }
 
 interface PendingConfigChange {
   value: string;
 }
 
+interface ConfigFile {
+  fs: "local" | "sd";
+  dir: string;
+  name: string;
+}
+
+/** The file the controller loads its config from ($Config/Filename, default config.yaml). */
+export function activeConfigFile(settings: Setting[]): ConfigFile {
+  const raw =
+    settings
+      .find((s) => s.P.replace(/^\/+/, "") === "Config/Filename")
+      ?.V.trim() || "config.yaml";
+  let path = raw.replace(/\\/g, "/").replace(/^\/+/, "");
+  let fs: ConfigFile["fs"] = "local";
+  if (/^sd\//i.test(path)) {
+    fs = "sd";
+    path = path.slice(3);
+  } else {
+    path = path.replace(/^localfs\//i, "");
+  }
+  const slash = path.lastIndexOf("/");
+  const name = path.slice(slash + 1);
+  if (!name) return { fs: "local", dir: "/", name: "config.yaml" };
+  return { fs, dir: `/${path.slice(0, slash + 1)}`, name };
+}
+
+/** Writes the changes into the config file; returns the setting paths it does not contain. */
 async function updateConfigYamlBatch(
   changes: Record<string, PendingConfigChange>,
-): Promise<void> {
+  file: ConfigFile,
+): Promise<string[]> {
   const entries = Object.entries(changes);
-  if (entries.length === 0) return;
+  if (entries.length === 0) return [];
 
   try {
-    const configContent = await fetchFileContent("/config.yaml", "local");
-    const updatedContent = entries.reduce(
-      (yaml, [settingPath, change]) =>
-        updateYamlInPlace(yaml, settingPath, change.value),
-      configContent,
+    const configContent = await fetchFileContent(
+      `${file.dir}${file.name}`,
+      file.fs,
     );
-    await saveFileContent("/", "config.yaml", updatedContent, "local");
+    const missing: string[] = [];
+    const updatedContent = entries.reduce((yaml, [settingPath, change]) => {
+      const updated = updateYamlInPlace(yaml, settingPath, change.value);
+      if (updated === null) missing.push(settingPath);
+      return updated ?? yaml;
+    }, configContent);
+    if (missing.length < entries.length) {
+      await replaceFileContent(file.dir, file.name, updatedContent, file.fs);
+    }
+    return missing;
   } catch (error) {
-    console.warn("Failed to update config.yaml:", error);
+    console.warn(`Failed to update ${file.name}:`, error);
     throw error;
   }
 }
@@ -871,8 +977,22 @@ function ProgressBar({
   );
 }
 
+// FluidNC accepts a firmware upload while it moves and reboots once the image
+// is written, which would end a running job.
+const FLASH_AFTER_JOB = "A job is running. Flash the firmware after it has finished.";
+
+function isJobActive(state: string, sdFilename: string | undefined, senderPhase: string) {
+  return state === "Run" || state === "Hold" || !!sdFilename ||
+    senderPhase === "streaming" || senderPhase === "paused" || senderPhase === "draining";
+}
+
 function FirmwareTab() {
   const espInfo = useMachineStore((s) => s.espInfo);
+  const jobRunning = isJobActive(
+    useMachineStore((s) => s.status.state),
+    useMachineStore((s) => s.status.sdFilename),
+    useGCodeSenderStore((s) => s.phase),
+  );
 
   const [phase, setPhase] = useState<FirmwarePhase>("idle");
   const [progress, setProgress] = useState(0);
@@ -980,6 +1100,13 @@ function FirmwareTab() {
   }
 
   async function flashFile(file: File) {
+    // A job may have started while the release was downloading.
+    const { state, sdFilename } = useMachineStore.getState().status;
+    if (isJobActive(state, sdFilename, useGCodeSenderStore.getState().phase)) {
+      setPhase("error");
+      setErrorMsg(FLASH_AFTER_JOB);
+      return;
+    }
     setPhase("uploading");
     setProgress(0);
     setStatusMsg(`Uploading ${file.name}…`);
@@ -993,7 +1120,7 @@ function FirmwareTab() {
   }
 
   async function downloadAndFlash() {
-    if (!selectedTag) return;
+    if (!selectedTag || jobRunning) return;
     if (
       !confirm(
         `Download and flash FluidNC ${selectedTag} (${chip} / ${radio})?\n\nThe device will restart after flashing.`,
@@ -1029,6 +1156,9 @@ function FirmwareTab() {
 
   return (
     <div className="flex flex-col divide-y divide-border max-w-lg">
+      {jobRunning && !busy && (
+        <div className="px-5 py-3 text-sm text-warn">{FLASH_AFTER_JOB}</div>
+      )}
       {/* ── Online Update ── */}
       <div className="flex flex-col gap-4 p-5">
         <div className="flex items-center justify-between">
@@ -1159,7 +1289,7 @@ function FirmwareTab() {
             {!busy && (
               <button
                 onClick={downloadAndFlash}
-                disabled={!selectedTag}
+                disabled={!selectedTag || jobRunning}
                 className="flex items-center justify-center gap-2 px-4 py-2.5 rounded text-sm font-medium
                            bg-accent text-white hover:bg-accent/90 transition-colors
                            disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1262,9 +1392,9 @@ function FirmwareTab() {
         </label>
 
         <button
-          disabled={!file || busy}
+          disabled={!file || busy || jobRunning}
           onClick={() => {
-            if (!file) return;
+            if (!file || jobRunning) return;
             if (
               !confirm(
                 `Flash firmware from "${file.name}"? The device will restart.`,
@@ -1590,6 +1720,23 @@ export function SettingsPanel({
   const [subKey, setSubKey] = useState("");
   const [configSublistExpanded, setConfigSublistExpanded] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const restartTap = useConfirmTap();
+  const machineState = useMachineStore((s) => s.status.state);
+  const senderPhase = useGCodeSenderStore((s) => s.phase);
+  // FluidNC refuses web commands while moving; in Hold the restart goes
+  // through and the job is lost, so say so on the confirm tap.
+  const machineMoving =
+    machineState === "Run" || machineState === "Jog" || machineState === "Home";
+  const jobActive =
+    machineState === "Run" ||
+    machineState === "Hold" ||
+    senderPhase === "streaming" ||
+    senderPhase === "paused" ||
+    senderPhase === "draining";
+  const disarmRestart = restartTap.disarm;
+  useEffect(() => {
+    if (machineMoving) disarmRestart();
+  }, [machineMoving, disarmRestart]);
   const [pendingConfigChanges, setPendingConfigChanges] = useState<
     Record<string, PendingConfigChange>
   >({});
@@ -1651,7 +1798,10 @@ export function SettingsPanel({
     // Always update runtime configuration first
     // FluidNC's V= parser stops at an unescaped space and treats backslash as an escape
     const escaped = v.replace(/\\/g, "\\\\").replace(/ /g, "\\ ");
-    await sendCommand(`[ESP401]P=${p} T=${t} V=${escaped}`);
+    const reply = await sendCommand(`[ESP401]P=${p} T=${t} V=${escaped}`);
+    // FluidNC answers HTTP 200 and puts a refusal in the text ("error:N").
+    const rejected = reply.match(/^\s*error\s*:.*$/im);
+    if (rejected) throw new Error(`controller refused it (${rejected[0].trim()})`);
 
     const setting = settings.find((s) => s.P === p);
     const updatedSettings = updateControllerConfigSetting(
@@ -1679,19 +1829,28 @@ export function SettingsPanel({
       return true;
     }
 
+    const configFile = activeConfigFile(settings);
     const shouldSave = confirm(
-      `Machine config changed. Save ${pendingCount === 1 ? "this change" : "these changes"} to config.yaml?\n\n` +
-        "OK saves the config file. Cancel closes without updating config.yaml.",
+      `Machine config changed. Save ${pendingCount === 1 ? "this change" : "these changes"} to ${configFile.name}?\n\n` +
+        `OK saves the config file. Cancel closes without updating ${configFile.name}.`,
     );
 
     if (shouldSave) {
       setSavingConfigFile(true);
       try {
-        await updateConfigYamlBatch(pendingConfigChanges);
+        const missing = await updateConfigYamlBatch(
+          pendingConfigChanges,
+          configFile,
+        );
         setPendingConfigChanges({});
+        if (missing.length) {
+          alert(
+            `Not in ${configFile.name}, so not saved (back to default after a restart):\n\n${missing.join("\n")}\n\nAdd to the file in Config Studio to keep.`,
+          );
+        }
       } catch (error) {
         alert(
-          `Runtime settings were sent, but config.yaml could not be updated.\n\n${
+          `Runtime settings were sent, but ${configFile.name} could not be updated.\n\n${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -1705,7 +1864,7 @@ export function SettingsPanel({
 
     onClose?.();
     return true;
-  }, [onClose, pendingConfigChanges, savingConfigFile]);
+  }, [onClose, pendingConfigChanges, savingConfigFile, settings]);
 
   useEffect(() => {
     onRequestCloseReady?.(() => {
@@ -1715,7 +1874,7 @@ export function SettingsPanel({
   }, [onRequestCloseReady, requestClose]);
 
   async function restart() {
-    if (!confirm("Restart the device now?")) return;
+    if (machineMoving) return;
     const closed = await requestClose();
     if (!closed) return;
     setRestarting(true);
@@ -1840,15 +1999,29 @@ export function SettingsPanel({
             />
           </button>
           <button
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-sm font-medium
-                       text-text-muted hover:text-danger hover:bg-danger/10 border border-transparent
-                       hover:border-danger/30 transition-colors disabled:opacity-40"
-            onClick={restart}
-            disabled={restarting}
-            title="Restart device"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-sm font-medium
+                       hover:text-danger hover:bg-danger/10 border
+                       hover:border-danger/30 transition-colors disabled:opacity-40 ${
+                         restartTap.armed && !machineMoving
+                           ? "text-danger bg-danger/10 border-danger/30"
+                           : "text-text-muted border-transparent"
+                       }`}
+            onClick={() => restartTap.tap(restart)}
+            disabled={restarting || machineMoving}
+            title={
+              machineMoving
+                ? "Unavailable while the machine is moving"
+                : "Restart device"
+            }
           >
             <RotateCcw size={12} />
-            {restarting ? "Restarting…" : "Restart"}
+            {restarting
+              ? "Restarting…"
+              : restartTap.armed && !machineMoving
+                ? jobActive
+                  ? "Tap again: aborts job"
+                  : "Tap again to restart"
+                : "Restart"}
           </button>
           {onClose && (
             <button
