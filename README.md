@@ -199,6 +199,16 @@ For local development, `npm run dev` loads Studio from the local source when ope
 
 ## Contributing
 
+### Understand and own your changes
+
+**You must read and understand every line of code you submit.** This applies equally to code you write yourself and code produced by AI tools or agents. You must be able to explain what it does, why it is needed, how it interacts with the existing code, and how you verified it. You are responsible for its correctness, safety, scope, and maintenance throughout review. Do not submit generated code you cannot explain or rely on maintainers to review it on your behalf.
+
+### No PR floods
+
+**Do not use AI agents to mass-generate or flood the project with pull requests.**
+
+Submit focused changes you have personally reviewed and tested. Review capacity is limited. PR floods and submissions that do not meet these requirements may be closed without a detailed review of each PR.
+
 ### Prioritize bundle size
 
 FigUI lives on the ESP32's internal filesystem alongside macros and configuration files. **Bundle size is a primary design constraint for every contribution.** Each increase reduces space available to users and room for future features. Keep changes focused and justify the storage cost of additions to the core UI.
