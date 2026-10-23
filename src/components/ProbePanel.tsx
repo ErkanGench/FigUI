@@ -13,7 +13,7 @@ import { useManualAtcStore } from '../store/manualAtc'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
 import { parseProbePoint, type ProbePoint } from '../lib/fluidncReports'
 import { useConfirmTap } from '../hooks/useConfirmTap'
-import { clearProbeRelative, markProbeRelative, setProbeCycleActive } from '../lib/probeAbsoluteMode'
+import { markProbeRelative, restoreProbeAbsolute, setProbeCycleActive } from '../lib/probeAbsoluteMode'
 
 type Axis = 'X' | 'Y' | 'Z'
 type Side = 'negative' | 'positive'
@@ -352,7 +352,11 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
     runningRef.current = next
     setProbeCycleActive(next !== null)
     setRunning(next)
-    if (!next) setProbeHeld(false)
+    if (!next) {
+      setProbeHeld(false)
+      // An Abort armed for this cycle must not carry into the next one.
+      abortConfirm.disarm()
+    }
   }
 
   function selectCycle(cycle: CycleId) {
@@ -398,7 +402,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
   }
 
   function restoreAbsoluteMode() {
-    if (sendRaw('G90')) clearProbeRelative()
+    restoreProbeAbsolute()
   }
 
   function finish(messageText: string, markCycleCompleted = false) {
@@ -565,6 +569,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
     if (!runningRef.current) return
     pauseBackgroundTraffic()
     sendRealtime(0x7e)
+    abortConfirm.disarm()
     setProbeHeld(false)
     armTimeout()
   }

@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { Play, Pause, Square, RotateCcw, DoorOpen, StepForward } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
@@ -39,6 +40,13 @@ export function JobControl() {
   const isAlarm   = state === 'Alarm'
   const isDoor    = state === 'Door'
   const hasSd     = Boolean(sdFilename)
+
+  // The panel stays mounted between jobs: each job asks for its own two taps.
+  const disarmAbort = abortConfirm.disarm
+  useEffect(() => {
+    if (!isRunning && !isHold) disarmAbort()
+  }, [isRunning, isHold, disarmAbort])
+  useEffect(() => disarmAbort(), [sdFilename, senderActive, disarmAbort])
 
   function pause()      { if (senderActive) pauseSender(); else sendRealtime(0x21) }
   // Two taps instead of confirm(), which would stop the page while it is open.
