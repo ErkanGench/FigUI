@@ -29,6 +29,26 @@ export interface Geometry3D extends Built3DGeometry {
 
 type TrackedJobSource = 'local' | 'controller'
 
+/** A controller job whose end FigUI could not confirm because the connection dropped while it ran. */
+export interface InterruptedJob {
+  elapsedMs: number
+  /** Last file progress the controller reported before the connection dropped. */
+  sdPercent: number | null
+  /** Last program line FigUI tracked as executing before the connection dropped. */
+  line: number | null
+  /** The controller came back with its machine position reset to zero, as it does after a restart. */
+  controllerRestarted: boolean
+  /** The job was already running when FigUI first saw it, so elapsedMs only counts from then. */
+  adopted?: boolean
+}
+
+/** A job this page follows. An adopted job was already running when the page first saw it, and startedAt is when it was seen. */
+export interface TrackedJob {
+  source: TrackedJobSource
+  startedAt: number
+  adopted?: boolean
+}
+
 interface GCodeStore {
   // Identity
   loadedPath: string | null
@@ -69,8 +89,11 @@ interface GCodeStore {
   loadError: string | null
 
   // Job completion feedback
-  trackedJob: { source: TrackedJobSource; startedAt: number } | null
+  trackedJob: TrackedJob | null
   finishedJobElapsedMs: number | null
+  /** The finished job was adopted, so its real run time is unknown. */
+  finishedJobAdopted: boolean
+  interruptedJob: InterruptedJob | null
 
   // Actions
   loadFile: (path: string) => Promise<void>
@@ -82,10 +105,12 @@ interface GCodeStore {
   ) => Promise<void>
   restoreRunningFile: (path: string) => Promise<void>
   cancelAndStartJob: (path: string) => boolean
-  startTrackedJob: (source: TrackedJobSource) => void
+  startTrackedJob: (source: TrackedJobSource, resumed?: { startedAt: number; adopted: boolean }) => void
   finishTrackedJob: (source: TrackedJobSource) => void
   cancelTrackedJob: (source?: TrackedJobSource) => void
+  interruptTrackedJob: (source: TrackedJobSource, details: Omit<InterruptedJob, 'elapsedMs'>) => void
   dismissFinishedJobNotice: () => void
+  dismissInterruptedJobNotice: () => void
   setShowRapids: (v: boolean) => void
   setActiveSourceLine: (line: number | null) => void
   beginSdUpload: (path: string) => void
@@ -108,7 +133,10 @@ const WORK_COORDINATE_SYSTEMS = new Set<WorkCoordinateSystem>([
 function isLoadBlockedByMachineState() {
   const machine = useMachineStore.getState()
   const state = machine.status.state
+  // A browser stream reports Idle whenever the planner drains (each M5/M4
+  // pair), so the machine state alone does not show it is running.
   return machine.connected && (!!machine.status.sdFilename || !machine.statusReceived || state === 'Run' || state === 'Hold' || state === 'Door')
+    || useGCodeStore.getState().trackedJob?.source === 'local'
 }
 
 function abortInFlight() {
@@ -152,7 +180,19 @@ function parseWorkOffsetResponse(
   return offsets
 }
 
-async function getParseOptions(): Promise<ParseGCodeOptions> {
+const WORK_OFFSET_QUERY_TIMEOUT_MS = 3000
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer within ${ms} ms`)), ms)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+async function getParseOptions(text: string): Promise<ParseGCodeOptions> {
   const machine = useMachineStore.getState()
   const activeWcs = normalizeWcs(machine.status.gcodeModes?.wcs)
   const currentWco = machine.status.wco
@@ -162,10 +202,14 @@ async function getParseOptions(): Promise<ParseGCodeOptions> {
     workOffsets[activeWcs] = currentWco
   }
 
-  if (canLoadControllerResources(machine)) {
+  // Only programs that select a work offset need the controller's table. The
+  // preview must not wait on the controller otherwise: a $# request that got
+  // no answer left a phone's preview stuck at 5%.
+  if (canLoadControllerResources(machine) && /G\s*5[4-9]/i.test(text)) {
     try {
       const linearScale = machine.controllerSettings.reportInches ? MM_PER_INCH : 1
-      Object.assign(workOffsets, parseWorkOffsetResponse(await sendCommand('$#'), linearScale))
+      const response = await withTimeout(sendCommand('$#', WORK_OFFSET_QUERY_TIMEOUT_MS), WORK_OFFSET_QUERY_TIMEOUT_MS)
+      Object.assign(workOffsets, parseWorkOffsetResponse(response, linearScale))
       if (activeWcs) {
         workOffsets[activeWcs] = currentWco
       }
@@ -204,7 +248,7 @@ async function buildPreview(
   shouldContinue: () => boolean,
   savedOptions?: ParseGCodeOptions,
 ) {
-  const parseOptions = savedOptions ?? await getParseOptions()
+  const parseOptions = savedOptions ?? await getParseOptions(text)
   if (!shouldContinue()) throw new Error('stale-load')
 
   let lastProgress = -1
@@ -232,7 +276,7 @@ async function loadTextPreview(
 ) {
   const { setState: set, getState: get } = useGCodeStore
   const controller = getBase()
-  set({ finishedJobElapsedMs: null })
+  set({ finishedJobElapsedMs: null, interruptedJob: null })
   abortInFlight()
   const requestId = ++loadRequestId
   const current = () => requestId === loadRequestId && canContinue()
@@ -343,12 +387,14 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
   loadError: null,
   trackedJob: null,
   finishedJobElapsedMs: null,
+  finishedJobAdopted: false,
+  interruptedJob: null,
 
   loadFile: async (path: string) => {
     if (isLoadBlockedByMachineState()) return
     if (activeLoadPath === path) return
 
-    set({ finishedJobElapsedMs: null })
+    set({ finishedJobElapsedMs: null, interruptedJob: null })
     abortInFlight()
     activeLoadPath = path
     const controller = getBase()
@@ -510,7 +556,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
   cancelAndStartJob: (path: string) => {
     if (isLoadBlockedByMachineState()) return false
     // Stop any in-flight download immediately. The ESP32 must not be serving a
-    set({ finishedJobElapsedMs: null })
+    set({ finishedJobElapsedMs: null, interruptedJob: null })
     abortInFlight()
     set({
       loading: false,
@@ -537,12 +583,15 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     return sendRaw(controllerRunCommand(path))
   },
 
-  startTrackedJob: source => {
+  startTrackedJob: (source, resumed) => {
     const path = get().loadedPath
     if (source === 'controller' && path) void getCachedRunningGCode(getBase(), path)
     set({
-      trackedJob: { source, startedAt: Date.now() },
+      trackedJob: resumed
+        ? { source, startedAt: resumed.startedAt, adopted: resumed.adopted }
+        : { source, startedAt: Date.now() },
       finishedJobElapsedMs: null,
+      interruptedJob: null,
     })
   },
 
@@ -552,6 +601,7 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     set({
       trackedJob: null,
       finishedJobElapsedMs: Math.max(0, Date.now() - trackedJob.startedAt),
+      finishedJobAdopted: !!trackedJob.adopted,
     })
   },
 
@@ -561,7 +611,21 @@ export const useGCodeStore = create<GCodeStore>((set, get) => ({
     set({ trackedJob: null })
   },
 
+  interruptTrackedJob: (source, details) => {
+    const trackedJob = get().trackedJob
+    if (!trackedJob || trackedJob.source !== source) return
+    set({
+      trackedJob: null,
+      interruptedJob: {
+        ...details,
+        elapsedMs: Math.max(0, Date.now() - trackedJob.startedAt),
+        adopted: !!trackedJob.adopted,
+      },
+    })
+  },
+
   dismissFinishedJobNotice: () => set({ finishedJobElapsedMs: null }),
+  dismissInterruptedJobNotice: () => set({ interruptedJob: null }),
 
   setShowRapids: (v: boolean) => {
     if (get().showRapids === v) return

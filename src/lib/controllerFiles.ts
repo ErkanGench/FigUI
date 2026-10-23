@@ -1,3 +1,16 @@
+// The safety door pauses a running job like a feed hold.
+export const isJobActiveState = (state: string) => state === 'Run' || state === 'Hold' || state === 'Door'
+
+/**
+ * Whether a controller job seen before a dropped connection is still the one
+ * running: the machine is in a job state and, if a file was running, runs the
+ * same file (another device may have started a different job meanwhile).
+ */
+export function jobContinues(state: string, sdFilename: string | undefined, sdFilenameBefore: string | null) {
+  return isJobActiveState(state)
+    && (!sdFilenameBefore || (!!sdFilename && isRunningFile(sdFilename, runningFilePath(sdFilenameBefore))))
+}
+
 export function controllerFilesystem(path: string): 'sd' | 'local' {
   return /^\/sd(?:\/|$)/i.test(path) ? 'sd' : 'local'
 }
