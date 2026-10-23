@@ -2984,14 +2984,31 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
 
   /**
-   * Zoom by `factor` about a screen point between two fingers. In 2D the
-   * fingers' movement (`panX`, `panY`) also moves the view.
+   * Zoom by `factor` about a screen point between two fingers. The fingers'
+   * movement (`panX`, `panY`) also moves the view.
    */
   function applyPinch(factor: number, centerX: number, centerY: number, panX = 0, panY = 0) {
     if (is3D) {
       const smoothFactor = 1 + (factor - 1) * 0.5
       const anchor = getScreenAnchor(centerX, centerY)
-      setOrbitState(prev => zoomOrbitTowardAnchor(prev, 1 / smoothFactor, anchor))
+      setOrbitState(prev => {
+        const zoomed = zoomOrbitTowardAnchor(prev, 1 / smoothFactor, anchor)
+        if (!panX && !panY) return zoomed
+        // As a one-finger pan drag does, in world units per screen pixel.
+        const camera = cameraRef.current
+        const { right, screenUp } = getOrbitCameraBasis(zoomed, camera.up)
+        const halfHeight = projectionMode === 'orthographic'
+          ? zoomed.orthoSize
+          : Math.tan(camera.fov / 2) * zoomed.radius
+        const unitsPerPixel = (halfHeight * 2) / Math.max(containerRef.current?.clientHeight ?? 0, 1)
+        return {
+          ...zoomed,
+          target: addVectors(
+            zoomed.target,
+            addVectors(scaleVector(right, -panX * unitsPerPixel), scaleVector(screenUp, panY * unitsPerPixel)),
+          ),
+        }
+      })
     } else {
       const t = transformRef.current
       const rect = containerRef.current!.getBoundingClientRect()
@@ -3008,14 +3025,17 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   // view. Touch events, not pointer events: the browser keeps one-finger
   // scrolling, and a cancelled two-finger move neither scrolls nor zooms the page.
   touchPinchHandlerRef.current = (e: TouchEvent) => {
-    if (e.type !== 'touchmove' || e.touches.length !== 2) {
+    // Fingers that started elsewhere on the page are not part of the pinch.
+    const container = containerRef.current
+    const touches = Array.from(e.touches).filter(t => !!container?.contains(t.target as Node))
+    if (e.type !== 'touchmove' || touches.length !== 2) {
       touchPinchRef.current = null
       return
     }
     // A move the browser already scrolls with cannot be cancelled; leave it be.
     if (!e.cancelable) return
     e.preventDefault()
-    const [a, b] = [e.touches[0], e.touches[1]]
+    const [a, b] = touches
     const dist = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY)
     const centerX = (a.clientX + b.clientX) / 2
     const centerY = (a.clientY + b.clientY) / 2
