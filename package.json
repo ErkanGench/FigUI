@@ -31,6 +31,7 @@
     "test:terminal": "esbuild scripts/test-terminal.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-terminal.mjs && node node_modules/.cache/figui-test-terminal.mjs",
     "preview": "vite preview",
     "test:studio": "node scripts/test-config-studio-loader.mjs",
+    "test:plugin-close": "esbuild scripts/test-plugin-close.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-plugin-close.mjs && node node_modules/.cache/figui-test-plugin-close.mjs",
     "test:pack": "node scripts/test-esp32-pack.mjs",
     "test:line-gate": "esbuild scripts/test-line-gate.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-line-gate.mjs && node node_modules/.cache/figui-test-line-gate.mjs",
     "test:continuous-jog": "esbuild scripts/test-continuous-jog.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/figui-test-continuous-jog.mjs && node node_modules/.cache/figui-test-continuous-jog.mjs",
