@@ -364,6 +364,15 @@ export function uploadFile(
   })
 }
 
+/**
+ * Percent-encodes each segment of a file path for use in a URL. FluidNC's web
+ * server URL-decodes request paths, so an unencoded "+" in a file name is
+ * read as a space (and "%", "#" or "?" break the request).
+ */
+export function encodeFilePath(path: string): string {
+  return path.split('/').map(encodeURIComponent).join('/')
+}
+
 function mountedFilePath(fullPath: string, fs: Filesystem): string {
   return fs === 'sd' && !/^\/sd(?:\/|$)/.test(fullPath)
     ? `/sd${fullPath.startsWith('/') ? '' : '/'}${fullPath}`
@@ -372,7 +381,7 @@ function mountedFilePath(fullPath: string, fs: Filesystem): string {
 
 export function fetchFileContent(fullPath: string, fs: Filesystem = 'sd'): Promise<string> {
   return serializeFilesystem(fs, () =>
-    fetchFilesystemText(`${base}${mountedFilePath(fullPath, fs)}`))
+    fetchFilesystemText(`${base}${encodeFilePath(mountedFilePath(fullPath, fs))}`))
 }
 
 export function downloadFile(fullPath: string, filename: string, fs: Filesystem): Promise<void> {
@@ -387,7 +396,7 @@ export function downloadFile(fullPath: string, filename: string, fs: Filesystem)
     let objectUrl: string | null = null
 
     try {
-      const res = await fetch(`${base}${mountedFilePath(fullPath, fs)}`, {
+      const res = await fetch(`${base}${encodeFilePath(mountedFilePath(fullPath, fs))}`, {
         cache: 'no-store',
         signal: controller.signal,
       })

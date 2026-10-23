@@ -302,7 +302,8 @@ export function CodeEditor({
   initialView = "code",
   restoreFromHistory = false,
 }: CodeEditorProps) {
-  const canUseStudio = useViewportMetrics().innerWidth >= 768;
+  const viewport = useViewportMetrics();
+  const canUseStudio = viewport.innerWidth >= 768;
   const editorRef = useRef<HTMLDivElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -518,6 +519,9 @@ export function CodeEditor({
         setDirty(false);
         if (isYamlFile) setSavedOnce(true);
         return true;
+      } catch (e) {
+        alert(e instanceof Error ? e.message : "Save failed");
+        return false;
       } finally {
         setSaving(false);
       }
@@ -708,20 +712,27 @@ export function CodeEditor({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      className="fixed z-50 flex items-center justify-center bg-black/50"
+      // Mobile keyboards can resize and pan only the visual viewport.
+      style={{
+        top: viewport.visualViewportOffsetTop,
+        left: viewport.visualViewportOffsetLeft,
+        width: viewport.visualViewportWidth ?? viewport.innerWidth,
+        height: viewport.visualViewportHeight ?? viewport.innerHeight,
+      }}
       onClick={tryClose}
     >
       <div
-        className={`bg-surface border border-border shadow-xl flex flex-col animate-in ${
+        className={`bg-surface border border-border shadow-xl flex flex-col min-h-0 overflow-hidden animate-in ${
           isYamlFile
-            ? "w-screen h-screen rounded-none"
-            : "w-[90vw] h-[85vh] max-w-[1000px] rounded-sm"
+            ? "w-full h-full rounded-none"
+            : "w-[90%] h-[85%] max-w-[1000px] rounded-sm"
         }`}
         onKeyDown={handleKeyDown}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="panel-header justify-between shrink-0">
+        <div className="panel-header flex-wrap justify-between shrink-0">
           <div className="flex items-center gap-2 min-w-0">
             <span className="truncate max-w-[120px] sm:max-w-[300px]">
               {filename}
@@ -735,7 +746,7 @@ export function CodeEditor({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex max-w-full flex-wrap items-center justify-end gap-1 shrink-0">
             {isYamlFile && (
               <div className="mr-1 flex rounded-md border border-border bg-elevated p-0.5">
                 <button
@@ -889,11 +900,11 @@ export function CodeEditor({
       {/* Unsaved changes confirmation */}
       {confirmClose && (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40"
+          className="absolute inset-0 z-[60] flex items-center justify-center bg-black/40 p-3"
           onClick={() => setConfirmClose(false)}
         >
           <div
-            className="bg-surface border border-border rounded-sm shadow-xl p-5 max-w-sm w-full animate-in"
+            className="bg-surface border border-border rounded-sm shadow-xl p-5 max-w-sm w-full max-h-full overflow-auto animate-in"
             onClick={(e) => e.stopPropagation()}
           >
             <p className="text-base text-text-primary mb-1 font-semibold">
@@ -903,7 +914,7 @@ export function CodeEditor({
               Do you want to save your changes to{" "}
               <span className="font-mono">{filename}</span> before closing?
             </p>
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <button
                 className="btn btn-ghost text-sm py-1.5 px-3"
                 onClick={() => setConfirmClose(false)}
@@ -928,14 +939,14 @@ export function CodeEditor({
       )}
       {validationIssues && (
         <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/55 p-4"
+          className="absolute inset-0 z-[70] flex items-center justify-center bg-black/55 p-4"
           onClick={() => setValidationIssues(null)}
         >
           <div
-            className="flex max-h-[75vh] w-full max-w-xl flex-col rounded-lg border border-border bg-surface shadow-2xl"
+            className="flex max-h-full w-full max-w-xl flex-col overflow-auto rounded-lg border border-border bg-surface shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="border-b border-border px-5 py-4">
+            <div className="shrink-0 border-b border-border px-5 py-4">
               <div className="text-base font-semibold text-text-primary">
                 Configuration diagnostics
               </div>
@@ -974,7 +985,7 @@ export function CodeEditor({
                 </button>
               ))}
             </div>
-            <div className="flex justify-end gap-2 border-t border-border p-4">
+            <div className="flex shrink-0 flex-wrap justify-end gap-2 border-t border-border p-4">
               <button
                 className="btn btn-ghost"
                 onClick={() => setValidationIssues(null)}
