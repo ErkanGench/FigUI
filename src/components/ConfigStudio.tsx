@@ -23,6 +23,7 @@ import {
   type FluidConfig,
 } from "../lib/fluidSchema";
 import type { ConfigStudioProps } from "../lib/configStudioContract";
+import { yamlCommentStart } from "../lib/configValidation";
 
 type NodeKind =
   | "machine"
@@ -1140,9 +1141,12 @@ function parseConfig(content: string): Record<string, any> {
     if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
     const match = raw.match(/^(\s*)([^:#]+):(?:\s*(.*))?$/);
     if (!match) continue;
+    const rest = raw.slice(raw.indexOf(":") + 1),
+      commentAt = yamlCommentStart(match[2], rest);
     const indent = match[1].length,
       key = match[2].trim(),
-      sourceToken = match[3] ?? "",
+      sourceToken =
+        commentAt >= 0 ? rest.slice(0, commentAt).trim() : (match[3] ?? ""),
       token = sourceToken.trim();
     while (stack.length > 1 && stack[stack.length - 1].indent >= indent)
       stack.pop();
@@ -3026,7 +3030,7 @@ export function patchYamlValue(
     const old = existing.value;
     const formatted = formatYamlScalar(value, old, path, fieldType);
     lines[existing.line] =
-      `${" ".repeat(existing.indent)}${existing.key}: ${formatted}`;
+      `${" ".repeat(existing.indent)}${existing.key}: ${formatted}${existing.comment}`;
     return joinYamlLines(lines, source);
   }
   const parentPath = path.includes(".")
@@ -3243,7 +3247,7 @@ function mergeGraphYaml(baseSource: string, generatedSource: string) {
     );
     if (existing && entry.hasValue) {
       lines[existing.line] =
-        `${" ".repeat(existing.indent)}${entry.key}: ${entry.value}`;
+        `${" ".repeat(existing.indent)}${entry.key}: ${entry.value}${existing.comment}`;
       continue;
     }
     if (existing) continue;
@@ -3277,6 +3281,8 @@ export function yamlEntries(source: string) {
       key: string;
       value: string;
       hasValue: boolean;
+      /** Trailing comment with the whitespace before it, or "". */
+      comment: string;
       indent: number;
       line: number;
     }[] = [],
@@ -3285,13 +3291,25 @@ export function yamlEntries(source: string) {
     if (!raw.trim() || raw.trimStart().startsWith("#")) return;
     const match = raw.match(/^(\s*)([^:#]+):(?:\s*(.*))?$/);
     if (!match) return;
+    const rest = raw.slice(raw.indexOf(":") + 1),
+      commentAt = yamlCommentStart(match[2], rest),
+      valueText = commentAt >= 0 ? rest.slice(0, commentAt) : rest;
     const indent = match[1].length,
       key = match[2].trim(),
-      value = (match[3] ?? "").trim();
+      value = valueText.trim(),
+      comment = commentAt >= 0 ? rest.slice(valueText.trimEnd().length) : "";
     while (stack.length && stack[stack.length - 1].indent >= indent)
       stack.pop();
     const path = [...stack.map((item) => item.key), key].join(".");
-    result.push({ path, key, value, hasValue: value.length > 0, indent, line });
+    result.push({
+      path,
+      key,
+      value,
+      hasValue: value.length > 0,
+      comment,
+      indent,
+      line,
+    });
     if (!value) stack.push({ indent, key });
   });
   return result;

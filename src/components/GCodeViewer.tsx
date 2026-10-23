@@ -3,7 +3,7 @@ import { Eye, Axis3D, Maximize2, Crosshair, Navigation, Play, Pause, Square, Clo
 import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable } from '../lib/gcode'
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
-import { sendRaw, sendRealtime, sendRealtimeNow, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { onLine, sendRaw, sendRealtime, sendRealtimeNow, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
 import { sendControlLine } from '../lib/macros'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
@@ -15,7 +15,7 @@ import { useGCodeSenderStore } from '../store/gcodeSender'
 import { useSingleBlockStore } from '../store/singleBlock'
 import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
-import { controllerRunCommand } from '../lib/controllerFiles'
+import { controllerRunCommand, isRunningFile } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, programMovesZ, type FramingMode } from '../lib/gcodeOutline'
 import { parseDecimalInput } from '../lib/numberInput'
 
@@ -163,6 +163,10 @@ const FRAMING_TRAVEL_Z_KEY = 'gcode.framingTravelZMm'
 const SIMULATION_SPEED_MIN = 25
 const SIMULATION_SPEED_MAX = 10000
 const SIMULATION_SPEED_STEP = 25
+/** Time beyond the spindle spin-up delay for the controller to report a started SD job. */
+const CONTROLLER_START_TIMEOUT_MS = 5000
+/** An error reply this soon after $SD/Run is taken as the controller refusing the file. */
+const CONTROLLER_START_ERROR_WINDOW_MS = 3000
 
 const ENTRY_MARKER_LINE = [0.13, 0.77, 0.37, 1.0] as const
 const ENTRY_MARKER_FILL = [0.13, 0.77, 0.37, 0.26] as const
@@ -2024,10 +2028,14 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const abortSender = useGCodeSenderStore(s => s.abort)
   const dismissSender = useGCodeSenderStore(s => s.dismiss)
   const trackedJobSource = useGCodeStore(s => s.trackedJob?.source)
+  const trackedJobStartedAt = useGCodeStore(s => s.trackedJob?.startedAt)
   const startTrackedJob = useGCodeStore(s => s.startTrackedJob)
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const finishedJobElapsedMs = useGCodeStore(s => s.finishedJobElapsedMs)
+  const finishedJobAdopted = useGCodeStore(s => s.finishedJobAdopted)
   const dismissFinishedJobNotice = useGCodeStore(s => s.dismissFinishedJobNotice)
+  const interruptedJob = useGCodeStore(s => s.interruptedJob)
+  const dismissInterruptedJobNotice = useGCodeStore(s => s.dismissInterruptedJobNotice)
   const senderActive = senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
   const runtime = useJobRuntimeEstimate(
     status,
@@ -2050,6 +2058,46 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const isJobRunning = senderPhase === 'streaming' || senderPhase === 'draining'
     || (status.state === 'Run' && senderPhase !== 'paused') || controllerJobStarting
   const isJobHeld = senderPhase === 'paused' || status.state === 'Hold'
+
+  // $SD/Run is only queued when Start is pressed. If the controller refuses the
+  // file (moved, renamed, card not mounted) it stays Idle and never reports the
+  // job, which would leave the job "Starting" forever with motion locked.
+  const [controllerStartError, setControllerStartError] = useState<string | null>(null)
+  const controllerJobSeenStartedAtRef = useRef<number | null>(null)
+  const spindleSpinupMs = controllerSettings.spindleSpinupMs ?? 0
+  useEffect(() => {
+    if (trackedJobSource === 'controller' && status.state !== 'Idle') {
+      controllerJobSeenStartedAtRef.current = trackedJobStartedAt ?? null
+      // An error line from another command may have been taken for a refused start.
+      setControllerStartError(null)
+    }
+  }, [trackedJobSource, trackedJobStartedAt, status.state])
+  useEffect(() => {
+    if (!controllerJobStarting || !connected || trackedJobStartedAt == null) return
+    if (controllerJobSeenStartedAtRef.current === trackedJobStartedAt) return
+    const startedAt = trackedJobStartedAt
+    const giveUp = (message: string) => {
+      if (useGCodeStore.getState().trackedJob?.startedAt !== startedAt) return
+      if (useMachineStore.getState().status.state !== 'Idle') return
+      cancelTrackedJob('controller')
+      setControllerStartError(message)
+    }
+    const stopLines = onLine(line => {
+      if (line.startsWith('error') && Date.now() - startedAt < CONTROLLER_START_ERROR_WINDOW_MS) {
+        giveUp(`The controller did not start the job (${line}).`)
+      }
+    })
+    const deadline = Math.max(startedAt + spindleSpinupMs + CONTROLLER_START_TIMEOUT_MS, Date.now() + 2000)
+    const timer = window.setTimeout(
+      () => giveUp('The controller did not report the job as started. Check that the file is still on the SD card.'),
+      deadline - Date.now(),
+    )
+    return () => {
+      stopLines()
+      window.clearTimeout(timer)
+    }
+  }, [controllerJobStarting, connected, trackedJobStartedAt, spindleSpinupMs, cancelTrackedJob])
+
   const singleBlockEnabled = status.pinState.includes('Q')
   const pendingBlock = useSingleBlockStore(s => s.pendingBlock)
   const blockReady = useSingleBlockStore(s => s.ready)
@@ -2065,7 +2113,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const handleStartWithoutPreview = useCallback(() => {
     const path = pendingPath
     if (!path || blockModePending) return
-    if (cancelAndStartJob(path)) startTrackedJob('controller')
+    if (cancelAndStartJob(path)) {
+      setControllerStartError(null)
+      startTrackedJob('controller')
+    }
   }, [pendingPath, blockModePending, cancelAndStartJob, startTrackedJob])
 
   const isViewerStartBlocked = loading || isProcessing2D || pendingPath !== null || !!sdUploadPath || controllerResetPending || blockModePending
@@ -2150,6 +2201,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }, [model, storePaths2D, storeGeometry3D, storeRenderLines, is3D])
 
   useEffect(() => () => window.clearTimeout(static2DSettleTimerRef.current), [])
+
+  // A real job started elsewhere (another device, the console, a macro) takes
+  // over the view; the simulation's own Stop button is hidden while it runs.
+  useEffect(() => {
+    if (machineJobActive && simulationPhaseRef.current !== 'idle') stopSimulation()
+  }, [machineJobActive])
 
   function canvasLogicalSize() {
     const container = containerRef.current
@@ -2683,14 +2740,18 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   useEffect(() => {
     if (simulationActive) {
-      prevIsRunningRef.current = isRunning
+      // A real job that ends the simulation is tracked from a fresh start.
+      prevIsRunningRef.current = false
       prevModelRef.current = model
       setSenderExecutionProgressPercent(null)
       scheduleRender()
       return
     }
 
-    if (isRunning && modelRef.current) {
+    // A job started elsewhere may run another file: do not track it on this one.
+    const runningOtherFile = !senderActive && !!status.sdFilename
+      && !isRunningFile(status.sdFilename, loadedPath)
+    if (isRunning && modelRef.current && !runningOtherFile) {
       // Tracking is cheap at any size; only drawing the completed path is
       // limited to smaller jobs. Program Execution follows this position.
       const freshStart = !prevIsRunningRef.current || model !== prevModelRef.current
@@ -2778,6 +2839,9 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     status.wco.x,
     status.wco.y,
     status.feed,
+    status.sdFilename,
+    loadedPath,
+    fileName,
     controllerSettings.maxTravelX,
     controllerSettings.maxTravelY,
     controllerSettings.homingDirInvert,
@@ -3802,12 +3866,59 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           <div className="rounded border border-ok/40 bg-ok/10 px-3 py-2" role="status" aria-live="polite">
             <div className="flex items-center justify-between gap-3 text-sm">
               <span className="text-ok">
-                Job finished in <span className="font-mono font-semibold">{formatRuntime(finishedJobElapsedMs / 1000)}</span>
+                {/* An adopted job was already running when this page saw it, so its run time is unknown. */}
+                {finishedJobAdopted ? 'Job finished' : <>
+                  Job finished in <span className="font-mono font-semibold">{formatRuntime(finishedJobElapsedMs / 1000)}</span>
+                </>}
               </span>
               <button
                 className="text-text-dim hover:text-text-primary"
                 onClick={dismissFinishedJobNotice}
                 aria-label="Dismiss job finished message"
+                title="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+        {interruptedJob && (
+          <div className="rounded border border-warn/40 bg-warn/10 px-3 py-2" role="alert">
+            <div className="flex items-start justify-between gap-3 text-sm">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 font-semibold text-warn">
+                  <AlertTriangle size={14} className="shrink-0" />
+                  {interruptedJob.controllerRestarted ? 'Controller restarted during the job' : 'Job end not confirmed'}
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-text-primary">
+                  {interruptedJob.controllerRestarted ? 'The job stopped' : 'The connection was lost'}
+                  {!interruptedJob.adopted && <> after <span className="font-mono">{formatRuntime(interruptedJob.elapsedMs / 1000)}</span></>}
+                  {interruptedJob.sdPercent != null && <> at <span className="font-mono">{Math.round(interruptedJob.sdPercent)}%</span></>}
+                  {interruptedJob.line != null && <>, near line <span className="font-mono">{interruptedJob.line.toLocaleString()}</span></>}
+                  {interruptedJob.controllerRestarted
+                    ? '. Its position was reset to zero but the toolhead stayed where it stopped, so home or set the work zero again before restarting.'
+                    : ', and the controller was not running the job when it came back. Check the work before treating the job as finished.'}
+                </p>
+              </div>
+              <button
+                className="text-text-dim hover:text-text-primary"
+                onClick={dismissInterruptedJobNotice}
+                aria-label="Dismiss interrupted job message"
+                title="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+        {controllerStartError && !isJobRunning && !isJobHeld && (
+          <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2" role="alert">
+            <div className="flex items-center justify-between gap-3 text-sm">
+              <span className="text-danger">{controllerStartError}</span>
+              <button
+                className="text-text-dim hover:text-text-primary"
+                onClick={() => setControllerStartError(null)}
+                aria-label="Dismiss job start message"
                 title="Dismiss"
               >
                 <X size={14} />
@@ -3923,7 +4034,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               className={`btn btn-ok-solid gap-2 justify-center font-bold job-action ${isTablet ? 'text-base' : 'text-sm'} flex-1`}
               onClick={() => {
                 if (isLocalFile) startLocalSenderWithWarning()
-                else if (loadedPath && sendRaw(controllerRunCommand(loadedPath))) startTrackedJob('controller')
+                else if (loadedPath && sendRaw(controllerRunCommand(loadedPath))) {
+                  setControllerStartError(null)
+                  startTrackedJob('controller')
+                }
               }}
               disabled={(!loadedPath && !isLocalFile) || !connected || status.state !== 'Idle' || isViewerStartBlocked}
               title={isViewerStartBlocked
