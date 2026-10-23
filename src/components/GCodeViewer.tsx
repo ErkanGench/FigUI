@@ -4,6 +4,7 @@ import { MOVE_FEED, MOVE_RAPID, type GCodeModel, type Segment, type SegmentTable
 import { useMachineStore } from '../store'
 import { useGCodeStore } from '../store/gcode'
 import { sendRaw, sendRealtime, sendRealtimeNow, STATUS_POLL_INTERVAL_MS } from '../lib/ws'
+import { sendControlLine } from '../lib/macros'
 import type { ControllerSettings, MachineStatus, Units } from '../types'
 import { displayToMm, feedUnitLabel, linearUnitLabel, mmToDisplay } from '../lib/units'
 import { buildJobTimingEstimate, formatJobProgress, formatRuntime, useJobRuntimeEstimate, type JobTimingEstimate } from '../lib/jobRuntime'
@@ -15,7 +16,8 @@ import { useSingleBlockStore } from '../store/singleBlock'
 import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
 import { controllerRunCommand, isRunningFile, runningFilePath } from '../lib/controllerFiles'
-import { buildFramingGCode, getFramingRequiredTravelZ, type FramingMode } from '../lib/gcodeOutline'
+import { buildFramingGCode, getFramingRequiredTravelZ, programMovesZ, type FramingMode } from '../lib/gcodeOutline'
+import { parseDecimalInput } from '../lib/numberInput'
 
 const GCODE_EXTENSIONS_PREVIEW = '.g, .nc, .gcode, .ngc, .tap, or .cnc'
 
@@ -1368,6 +1370,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const restoredFromCache = useGCodeStore(s => s.restoredFromCache)
   const restartSource = useGCodeStore(s => s.restartSource)
   const loading = useGCodeStore(s => s.loading)
+  const loadError = useGCodeStore(s => s.loadError)
   const pendingPath = useGCodeStore(s => s.pendingPath)
   const pendingFileName = useGCodeStore(s => s.pendingFileName)
   const downloadProgress = useGCodeStore(s => s.downloadProgress)
@@ -2106,6 +2109,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [framingMode, setFramingMode] = useState<FramingMode>(() => getStoredFramingMode())
   const [framingFeedInput, setFramingFeedInput] = useState(() => formatInputValue(mmToDisplay(getStoredPositiveNumber(FRAMING_FEED_KEY, 1000), units), units === 'in' ? 2 : 0))
   const [framingClearanceInput, setFramingClearanceInput] = useState(() => formatInputValue(mmToDisplay(getStoredFiniteNumber(FRAMING_CLEARANCE_KEY, 5), units), units === 'in' ? 3 : 1))
+  // A program that never commands Z is framed without moving Z.
+  const [framingMovesZ, setFramingMovesZ] = useState(true)
   const [framingTravelZInput, setFramingTravelZInput] = useState(() => formatInputValue(mmToDisplay(getStoredFiniteNumber(FRAMING_TRAVEL_Z_KEY, 5), units), units === 'in' ? 3 : 1))
   const [framingError, setFramingError] = useState<string | null>(null)
   const [restartInitialLine, setRestartInitialLine] = useState<number | null>(null)
@@ -3095,12 +3100,14 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   }
 
   function openFramingDialog() {
-    if (model) {
-      const clearanceDisplay = Number.parseFloat(framingClearanceInput)
-      const travelZDisplay = Number.parseFloat(framingTravelZInput)
-      if (Number.isFinite(clearanceDisplay)) {
+    const movesZ = !sourceText || programMovesZ(sourceText)
+    setFramingMovesZ(movesZ)
+    if (model && movesZ) {
+      const clearanceDisplay = parseDecimalInput(framingClearanceInput)
+      const travelZDisplay = parseDecimalInput(framingTravelZInput)
+      if (clearanceDisplay != null) {
         const requiredTravelZMm = getFramingRequiredTravelZ(model, displayToMm(clearanceDisplay, units))
-        const currentTravelZMm = Number.isFinite(travelZDisplay) ? displayToMm(travelZDisplay, units) : -Infinity
+        const currentTravelZMm = travelZDisplay != null ? displayToMm(travelZDisplay, units) : -Infinity
         if (requiredTravelZMm != null && currentTravelZMm < requiredTravelZMm) {
           setFramingTravelZInput(formatCeilInputValue(mmToDisplay(requiredTravelZMm, units), units === 'in' ? 3 : 1))
         }
@@ -3112,25 +3119,26 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   function startFramingRoutine() {
     if (!model) return
-    const feedDisplay = Number.parseFloat(framingFeedInput)
-    const clearanceDisplay = Number.parseFloat(framingClearanceInput)
-    const travelZDisplay = Number.parseFloat(framingTravelZInput)
-    if (!Number.isFinite(feedDisplay) || feedDisplay <= 0) {
+    // A decimal comma must not shrink "0,5" to 0 (parseFloat stops at it).
+    const feedDisplay = parseDecimalInput(framingFeedInput)
+    const clearanceDisplay = parseDecimalInput(framingClearanceInput)
+    const travelZDisplay = parseDecimalInput(framingTravelZInput)
+    if (feedDisplay == null || feedDisplay <= 0) {
       setFramingError('Enter a framing feed rate greater than zero.')
       return
     }
-    if (!Number.isFinite(clearanceDisplay)) {
+    if (framingMovesZ && clearanceDisplay == null) {
       setFramingError('Enter a valid clearance height.')
       return
     }
-    if (!Number.isFinite(travelZDisplay)) {
+    if (framingMovesZ && travelZDisplay == null) {
       setFramingError('Enter a valid safe travel height.')
       return
     }
 
     const feedMmPerMin = displayToMm(feedDisplay, units)
-    const clearanceMm = displayToMm(clearanceDisplay, units)
-    const travelZMm = displayToMm(travelZDisplay, units)
+    const clearanceMm = clearanceDisplay != null ? displayToMm(clearanceDisplay, units) : NaN
+    const travelZMm = travelZDisplay != null ? displayToMm(travelZDisplay, units) : NaN
     let result: string | null
     try {
       result = buildFramingGCode(model, {
@@ -3138,6 +3146,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         feedMmPerMin,
         clearanceMm,
         travelZMm,
+        movesZ: framingMovesZ,
         displayUnits: units,
       })
     } catch (error) {
@@ -3655,8 +3664,17 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
         {!model && !loading && (
           <div className="absolute inset-0 flex flex-col items-center justify-center text-text-dim text-2xl gap-2">
-            <Eye size={24} className="opacity-30" />
-            <span>Click a G-code file to preview</span>
+            {loadError ? (
+              <>
+                <AlertTriangle size={24} className="text-warn" />
+                <span className="max-w-md px-4 text-center text-base text-warn" role="alert">{loadError}</span>
+              </>
+            ) : (
+              <>
+                <Eye size={24} className="opacity-30" />
+                <span>Click a G-code file to preview</span>
+              </>
+            )}
           </div>
         )}
 
@@ -3929,7 +3947,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               Flood
             </button>}
             <button
-              onClick={() => { if (sendRaw('M9')) setCoolantState('off') }}
+              onClick={() => { if (sendControlLine('M9', 'Coolant off')) setCoolantState('off') }}
               className={`btn gap-1.5 job-action ${isTablet ? 'text-base' : 'text-sm'} justify-center flex-1 ${coolantState === 'off' ? 'border-danger/50 text-danger' : 'btn-ghost'}`}
             >
               <PowerOff size={isTablet ? 18 : 13} />
@@ -4136,6 +4154,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 />
               </label>
 
+              {framingMovesZ ? (<>
               <label className="block">
                 <span className="mb-1.5 block text-xs font-semibold uppercase text-text-muted">Clearance from top ({linearUnitLabel(units)})</span>
                 <input
@@ -4161,6 +4180,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               <div className="rounded border border-warning/35 bg-warning/10 px-3 py-2 text-sm leading-relaxed text-warning">
                 Check Z zero first. Safe travel height must clear clamps and stock.
               </div>
+              </>) : (
+                <div className="rounded border border-info/35 bg-info/10 px-3 py-2 text-sm leading-relaxed text-info">
+                  The program never commands Z, so framing leaves Z where it is.
+                </div>
+              )}
 
               {framingError && (
                 <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
