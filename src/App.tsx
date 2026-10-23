@@ -393,6 +393,14 @@ function AppContent() {
     }
   }, [connected, phase])
 
+  // Unmounting (tests, hot reload) must not leave a reconnect pending.
+  useEffect(() => () => {
+    if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+    if (stableConnectionTimer.current) clearTimeout(stableConnectionTimer.current)
+    reconnectTimer.current = null
+    stableConnectionTimer.current = null
+  }, [])
+
   const macrosLoaded = useRef(false)
   useEffect(() => {
     if (phase !== 'ready' || !connected) return

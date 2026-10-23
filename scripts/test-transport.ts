@@ -170,6 +170,11 @@ await ws.sendStartupQueries()
 await delay(100)
 socket.receive('error:8')
 assert.equal(ws.isResponseTrafficQuiescent(0), true, 'a refused settings query does not stay pending')
+commandReplies = [busy, busy]
+await ws.sendStartupQueries()
+await delay(100)
+socket.receive('error')
+assert.equal(ws.isResponseTrafficQuiescent(0), true, 'a bare error ends the settings query too')
 assert.deepEqual(shownLines, [], 'the query and its reply stay out of the terminal')
 stopShowing()
 useMachineStore.getState().updateControllerSettings({ reportInches: false })
@@ -192,12 +197,23 @@ await autoReports(25)
 assert.equal(polls(), pollsBefore, 'no ? while auto-reports arrive')
 assert.equal(gcQueries(), gcBefore, 'no $G while auto-reports and [GC:] pushes arrive')
 
+const settingsQueries = () => socket.sent.filter(item => item === '$$').length
+const settingsBefore = settingsQueries()
+socket.receive('[MSG:INFO: Changed to spindle:Laser]')
+await autoReports(25)
+assert.equal(settingsQueries(), settingsBefore + 1, 'a spindle change still reads $$ while auto-reports arrive')
+socket.receive('$32=1')
+socket.receive('ok')
+socket.receive('[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]')
+socket.receive('ok')
+const gcAfterSpindle = gcQueries()
+
 const realNow = Date.now
 let clockOffset = 0
 Date.now = () => realNow() + clockOffset
 clockOffset += 30_000 // no [GC:] for 30 s
 await autoReports(25)
-assert.ok(gcQueries() > gcBefore, '$G still runs when no [GC:] has come for 30 s')
+assert.ok(gcQueries() > gcAfterSpindle, '$G still runs when no [GC:] has come for 30 s')
 await delay(1100)
 assert.ok(polls() > pollsBefore, 'polling resumes once auto-reports stop')
 
