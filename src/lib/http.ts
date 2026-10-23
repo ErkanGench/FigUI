@@ -384,6 +384,16 @@ export function fetchFileContent(fullPath: string, fs: Filesystem = 'sd'): Promi
     fetchFilesystemText(`${base}${encodeFilePath(mountedFilePath(fullPath, fs))}`))
 }
 
+/** Object URL for /favicon.ico on LocalFS, or null when it is absent */
+export function fetchLocalFavicon(): Promise<string | null> {
+  return serializeFilesystem('local', async () => {
+    const res = await fetch(`${base}/favicon.ico`)
+    // Some servers answer unknown paths with an HTML page instead of a 404
+    if (!res.ok || !/^image\//i.test(res.headers.get('Content-Type') ?? '')) return null
+    return URL.createObjectURL(await res.blob())
+  })
+}
+
 export function downloadFile(fullPath: string, filename: string, fs: Filesystem): Promise<void> {
 
   return (async () => {
