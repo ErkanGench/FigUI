@@ -12,6 +12,7 @@ import { useJobResume } from '../lib/jobResume'
 
 export function JobControl() {
   const status = useMachineStore(s => s.status)
+  const connected = useMachineStore(s => s.connected)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerJobStarting = useControllerJobStarting()
   const controllerSettings = useMachineStore(s => s.controllerSettings)
@@ -23,26 +24,33 @@ export function JobControl() {
   const progressPercent = runtime.progressPercent
   const cancelTrackedJob = useGCodeStore(s => s.cancelTrackedJob)
   const abortConfirm = useConfirmTap()
+  // A file streamed from the browser has no SD name; it needs the sender's
+  // own pause, resume and abort, as in the Viewer.
   const senderPhase = useGCodeSenderStore(s => s.phase)
+  const pauseSender = useGCodeSenderStore(s => s.pause)
+  const abortSender = useGCodeSenderStore(s => s.abort)
   const senderActive = ['streaming', 'paused', 'draining'].includes(senderPhase)
+  const senderPaused = senderPhase === 'paused'
   const { stepHold, disabled: resumeDisabled, resume } = useJobResume()
 
-  const isRunning = state === 'Run' || controllerJobStarting || controllerResetPending
-  const isHold    = state === 'Hold'
+  const isRunning = (state === 'Run' && !senderPaused) || controllerJobStarting || controllerResetPending
+    || senderPhase === 'streaming' || senderPhase === 'draining'
+  const isHold    = state === 'Hold' || senderPaused
   const isAlarm   = state === 'Alarm'
   const isDoor    = state === 'Door'
   const hasSd     = Boolean(sdFilename)
 
-  function pause()      { sendRealtime(0x21) }
+  function pause()      { if (senderActive) pauseSender(); else sendRealtime(0x21) }
   // Two taps instead of confirm(), which would stop the page while it is open.
   function softReset()  {
     abortConfirm.tap(() => {
-      if (sendRealtimeNow(0x18)) cancelTrackedJob('controller')
+      if (senderActive) abortSender()
+      else if (sendRealtimeNow(0x18)) cancelTrackedJob('controller')
     })
   }
   function clearAlarm() { clearMachineAlarm(status.alarmCode) }
 
-  if (!hasSd && !isAlarm && !isHold && !isDoor && !controllerJobStarting && !controllerResetPending) return null
+  if (!hasSd && !senderActive && !isAlarm && !isHold && !isDoor && !controllerJobStarting && !controllerResetPending) return null
 
   return (
     <div className="panel">
@@ -98,7 +106,7 @@ export function JobControl() {
         {/* Action buttons */}
         {isRunning ? (
           <div className="flex gap-2">
-            <button className="btn btn-warn-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={pause}>
+            <button className="btn btn-warn-solid job-action gap-1.5 text-sm justify-center flex-1" onClick={pause} disabled={!connected}>
               <Pause size={13} />
               Hold
             </button>
@@ -127,7 +135,7 @@ export function JobControl() {
             </button>
 
             {(isAlarm || isDoor) && (
-              <button className="btn btn-ghost gap-1.5 text-sm justify-center flex-1" onClick={clearAlarm}>
+              <button className="btn btn-ghost gap-1.5 text-sm justify-center flex-1 min-h-[44px]" onClick={clearAlarm}>
                 <RotateCcw size={13} />
                 Unlock
               </button>
