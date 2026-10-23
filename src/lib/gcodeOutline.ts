@@ -1,5 +1,5 @@
 import { MOVE_FEED, type GCodeModel, type Segment, type SegmentTable } from './gcode'
-import { getArcGeometry } from './gcodeBuild'
+import { getArcGeometry, getArcPoint, type ArcGeometry } from './gcodeBuild'
 import { linearUnitLabel, mmToDisplay } from './units'
 import type { Units } from '../types'
 
@@ -10,7 +10,20 @@ export interface FramingOptions {
   feedMmPerMin: number
   clearanceMm: number
   travelZMm: number
+  /**
+   * False when the program never commands Z, as in hand-focused laser jobs.
+   * The frame then leaves Z alone and the clearance and travel height are unused.
+   */
+  movesZ?: boolean
   displayUnits?: Units
+}
+
+/** True when a line outside comments mentions Z. Hand-focused laser jobs never do. */
+export function programMovesZ(text: string) {
+  for (const line of text.split('\n')) {
+    if (/z/i.test(line) && /z/i.test(line.replace(/\([^)]*\)?|;.*/g, ''))) return true
+  }
+  return false
 }
 
 interface Point {
@@ -50,6 +63,24 @@ export function buildFramingGCode(model: GCodeModel, options: FramingOptions): s
 
   if (path.length < 2) return null
 
+  const feed = Math.max(1, options.feedMmPerMin)
+  const closedPath = closePath(path)
+  const header = [
+    '(FigUI framing routine)',
+    `(${options.mode === 'rectangle' ? 'Rectangle' : 'Contour'} outline from cutting moves only)`,
+  ]
+  if (options.movesZ === false) {
+    return [
+      ...header,
+      '(THE PROGRAM NEVER COMMANDS Z - Z IS NOT MOVED)',
+      'G21 G90 G94',
+      `G0 X${format(closedPath[0].x, 3)} Y${format(closedPath[0].y, 3)}`,
+      `G1 F${format(feed, 1)}`,
+      ...closedPath.slice(1).map(point => `G1 X${format(point.x, 3)} Y${format(point.y, 3)}`),
+      'M2',
+    ].join('\n')
+  }
+
   const frameZ = envelope.topZ + options.clearanceMm
   if (!Number.isFinite(options.travelZMm)) throw new Error('Safe travel height must be valid.')
   if (options.travelZMm < frameZ) {
@@ -64,12 +95,9 @@ export function buildFramingGCode(model: GCodeModel, options: FramingOptions): s
       + detail,
     )
   }
-  const feed = Math.max(1, options.feedMmPerMin)
   const zApproachFeed = Math.min(feed, Z_APPROACH_FEED_MAX_MM_PER_MIN)
-  const closedPath = closePath(path)
   const lines = [
-    '(FigUI framing routine)',
-    `(${options.mode === 'rectangle' ? 'Rectangle' : 'Contour'} outline from cutting moves only)`,
+    ...header,
     'G21 G90 G94',
     `G0 Z${format(options.travelZMm, 3)}`,
     `G0 X${format(closedPath[0].x, 3)} Y${format(closedPath[0].y, 3)}`,
@@ -151,14 +179,10 @@ function getCutEnvelope(segments: SegmentTable): CutEnvelope | null {
     const segmentPoints: Point[] = [{ x: seg.x0, y: seg.y0 }]
     if (seg.i !== undefined) {
       const arc = getArcGeometry(seg)
-      const samples = Math.max(8, Math.min(ARC_SAMPLE_MAX, Math.ceil((arc.sweep * arc.r) / ARC_SAMPLE_TARGET_MM)))
+      const samples = arcSampleCount(arc)
       for (let index = 1; index < samples; index++) {
-        const fraction = index / samples
-        const angle = arc.startAngle + (seg.cw ? -1 : 1) * arc.sweep * fraction
-        segmentPoints.push({
-          x: arc.cx + Math.cos(angle) * arc.r,
-          y: arc.cy + Math.sin(angle) * arc.r,
-        })
+        const point = getArcPoint(seg, arc, index / samples)
+        segmentPoints.push({ x: point.x, y: point.y })
       }
     }
     segmentPoints.push({ x: seg.x1, y: seg.y1 })
@@ -184,10 +208,24 @@ function isXYCuttingMove(seg: Segment) {
   return (seg.x1 - seg.x0) ** 2 + (seg.y1 - seg.y0) ** 2 > XY_MOVE_TOLERANCE_MM ** 2
 }
 
+function arcSampleCount(arc: ArcGeometry) {
+  return Math.max(8, Math.min(ARC_SAMPLE_MAX, Math.ceil((arc.sweep * arc.r) / ARC_SAMPLE_TARGET_MM)))
+}
+
 function xyMoveLength(seg: Segment) {
   if (seg.i !== undefined) {
     const arc = getArcGeometry(seg)
-    return arc.sweep * arc.r
+    if ((seg.arcPlane ?? 17) === 17) return arc.sweep * arc.r
+    // A G18/G19 arc seen from above: add up its sampled XY steps.
+    const samples = arcSampleCount(arc)
+    let length = 0
+    let from = getArcPoint(seg, arc, 0)
+    for (let index = 1; index <= samples; index++) {
+      const to = getArcPoint(seg, arc, index / samples)
+      length += Math.hypot(to.x - from.x, to.y - from.y)
+      from = to
+    }
+    return length
   }
   return Math.sqrt((seg.x1 - seg.x0) ** 2 + (seg.y1 - seg.y0) ** 2)
 }
