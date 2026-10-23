@@ -10,6 +10,10 @@ reviews:
   review_status: true
   review_details: false
 
+  tools:
+    github-checks:
+      enabled: true
+
   auto_review:
     enabled: true
     drafts: false
@@ -41,6 +45,14 @@ reviews:
     - path: "src/**/*.{ts,tsx}"
       instructions: |
         Focus on correctness, type safety, React state flow, and user-visible regressions.
+        Treat ESP32 bundle size as a primary constraint; follow the README's contribution guidelines.
+        Use the ESP32 bundle size workflow's measured final dist/index.html.gz sizes when available.
+        Flag disproportionate growth, duplicated UI/SVG/logic, and costly new dependencies; suggest shared code or optional plugins while preserving machine-control safeguards.
+        Do not invent byte savings or infer deployed size from source line counts. Dynamic imports are inlined by the ESP32 build and do not save flash on their own.
+    - path: "package.json"
+      instructions: |
+        Check new runtime dependencies for their effect on the final ESP32 bundle and whether existing utilities or browser APIs can meet the need.
+        Ask for measured before/after dist/index.html.gz sizes when runtime dependencies change.
     - path: "plugins/**"
       instructions: |
         Review plugin changes for browser compatibility, sandboxing assumptions, and integration risks.
@@ -51,6 +63,7 @@ reviews:
     - path: "scripts/**"
       instructions: |
         Review scripts for portability, clear failure behavior, and accidental destructive operations.
+        Bundle size comparisons must use the final ESP32 artifacts, report missing or failed builds as errors, and keep warning thresholds visible and configurable.
 
 chat:
   auto_reply: true
