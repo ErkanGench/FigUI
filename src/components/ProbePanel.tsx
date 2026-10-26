@@ -58,8 +58,8 @@ const CYCLE_INSTRUCTIONS: Record<CycleId, string> = {
   'y-center': 'Start between the opposing Y faces near center, with both faces within the configured travel.',
   'bore-center': 'Start inside the bore near center. The cycle touches X−/X+, centers X, then touches Y−/Y+ and sets X0 Y0.',
   'rectangle-center': 'Start inside the feature near center. The cycle touches X−/X+, centers X, then touches Y−/Y+ and sets X0 Y0.',
-  'edge-center-x': 'Start OUTSIDE the X− edge of the workpiece at probing height, with clear +X travel. The cycle probes both edges and sets X0 at the midpoint. Set Z lift to clear the tallest obstruction on the cross-over path.',
-  'edge-center-y': 'Start OUTSIDE the Y− edge of the workpiece at probing height, with clear +Y travel. The cycle probes both edges and sets Y0 at the midpoint. Set Z lift to clear the tallest obstruction on the cross-over path.',
+  'edge-center-x': 'Start OUTSIDE the X− edge of the workpiece at probing height, with clear +X travel. The cycle probes both edges and sets X0 at the midpoint. Enter the actual work size and probe diameter. Set Z lift to clear the tallest obstruction on the cross-over path.',
+  'edge-center-y': 'Start OUTSIDE the Y− edge of the workpiece at probing height, with clear +Y travel. The cycle probes both edges and sets Y0 at the midpoint. Enter the actual work size and probe diameter. Set Z lift to clear the tallest obstruction on the cross-over path.',
 }
 
 const TOOLSETTER_ONLY_HINT = 'Only a toolsetter is configured. Only Z-height setting is available; X/Y and center probing require a probe input.'
@@ -468,6 +468,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
   const [completedCycle, setCompletedCycle] = useState<CycleId | null>(null)
   const runningRef = useRef<RunningCycle | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const timeoutDurationRef = useRef(90_000)
   const backgroundPausedRef = useRef(false)
   const [message, setMessage] = useState(() => CYCLE_INSTRUCTIONS[selected])
   const [probeFeed, setProbeFeed] = usePersisted('probe.feed', 100)
@@ -519,6 +520,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
 
   function armTimeout(ms = 90_000) {
     if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    timeoutDurationRef.current = ms
     timeoutRef.current = setTimeout(() => {
       restoreBackgroundTraffic()
       updateRun(null)
@@ -657,7 +659,9 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
         sendRaw('G4 P0.15')
         sendRaw(`G21 G91 G0 ${moveWord(axis, 'negative', retract)}`)
         sendRaw(`G21 G91 G0 Z${number(edgeZLift)}`)
-        sendRaw(`G21 G91 G0 ${axis}${number(edgeWorkSize + retract * 2)}`)
+        // Opposite contact positions are one work width plus one probe
+        // diameter apart; leave a retract of clearance beyond each face.
+        sendRaw(`G21 G91 G0 ${axis}${number(edgeWorkSize + probeDiameter + retract * 2)}`)
         // One guarded descent for the full lift distance: a rapid drop would
         // strike a higher far-side surface before the probe move can stop.
         sendRaw(`G21 G91 G38.3 F${number(slowFeed)} Z${number(-edgeZLift)}`)
@@ -809,7 +813,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
     pauseBackgroundTraffic()
     sendRealtime(0x7e)
     setProbeHeld(false)
-    armTimeout()
+    armTimeout(timeoutDurationRef.current)
   }
 
   function abortProbe() {
@@ -820,7 +824,7 @@ export function ProbePanel({ isTablet, embedded = false }: { isTablet?: boolean;
 
   const selectedCycle = CYCLES.find(c => c.id === selected)!
   const isEdgeCenter = selected === 'edge-center-x' || selected === 'edge-center-y'
-  const usesDiameter = selected !== 'z-surface' && !isEdgeCenter
+  const usesDiameter = selected !== 'z-surface'
   const selectedCycleUnavailable = toolsetterOnly && selected !== 'z-surface'
   const canRunSelectedCycle = canProbe && !selectedCycleUnavailable
 
