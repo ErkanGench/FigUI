@@ -37,7 +37,7 @@ if (existsSync(faviconPath)) {
 }
 console.log('\n[4/5] Packing inline app...')
 const unpackedHtml = html
-if (!process.argv.includes('--no-pack')) html = await packEsp32Html(html)
+if (!process.argv.includes('--no-pack')) html = await packEsp32Html(html, { packStyles: true })
 else console.log('  Packing disabled by --no-pack')
 
 console.log('\n[5/5] Compressing with Zopfli...')

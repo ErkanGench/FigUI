@@ -35,9 +35,18 @@ export default defineConfig(({ mode }) => ({
       'lucide-react':      fileURLToPath(new URL('./src/icons.tsx', import.meta.url)),
     },
   },
+  // Classic JSX uses the existing compat createElement path and packs smaller
+  // than automatic JSX's children arrays and separate jsx/jsxs runtime.
+  ...(mode === 'esp32' ? {
+    esbuild: {
+      jsxFactory: '__jsx',
+      jsxFragment: '__Fragment',
+      jsxInject: "import { createElement as __jsx, Fragment as __Fragment } from 'react'",
+    },
+  } : {}),
   base: mode === 'demo' ? '/FigUI/' : '/',
   plugins: [
-    react(),
+    react({ jsxRuntime: mode === 'esp32' ? 'classic' : 'automatic' }),
     ...(mode === 'esp32' ? [
       tailwindMangle({
         filter: shouldMangleClass,
