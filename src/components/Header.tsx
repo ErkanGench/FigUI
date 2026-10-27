@@ -2,6 +2,7 @@ import { Sun, Moon, Wifi, WifiOff, Settings, Maximize, Minimize, HelpCircle, Pla
 import fluidncLogo from '../assets/fluidnc-logo.svg'
 import { useMachineStore, stateColor, stateBg } from '../store'
 import { useGCodeStore } from '../store/gcode'
+import { useGCodeSenderStore } from '../store/gcodeSender'
 import { formatJobProgress, useJobRuntimeEstimate } from '../lib/jobRuntime'
 import { useControllerJobStarting } from '../lib/jobState'
 import { sendRealtime } from '../lib/ws'
@@ -35,7 +36,11 @@ export function Header({ onSettingsClick, onAboutClick, isTablet, sticky }: Prop
   const model = useGCodeStore(s => s.model)
   const loadedPath = useGCodeStore(s => s.loadedPath)
   const fileName = useGCodeStore(s => s.fileName)
-  const runtime = useJobRuntimeEstimate(status, model, controllerSettings, loadedPath, fileName)
+  const senderActive = useGCodeSenderStore(s => ['streaming', 'paused', 'draining'].includes(s.phase))
+  const senderJobId = useGCodeSenderStore(s => s.jobId)
+  // Keep local job timing current when a full-layout plugin unmounts the Viewer.
+  const runtime = useJobRuntimeEstimate(status, model, controllerSettings, loadedPath, fileName,
+    { active: senderActive, key: `${senderJobId}|${fileName ?? ''}` })
   const showHeaderProgress = status.sdFilename && runtime.progressPercent != null
   const headerProgressPercent = runtime.progressPercent ?? 0
   const pinnedMacros = useMemo(() => macros.filter(m => m.pinned), [macros])
