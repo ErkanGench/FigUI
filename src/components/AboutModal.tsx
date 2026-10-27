@@ -2,11 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { X, Download, CheckCircle2, AlertCircle, ArrowUp, RefreshCw, Heart } from 'lucide-react'
 import fluidncLogo from '../assets/fluidnc-logo.svg'
 import { useMachineStore } from '../store'
+import { useGCodeSenderStore } from '../store/gcodeSender'
 import { uploadFile, uiDir, putUiFile } from '../lib/http'
 import { CURRENT_VERSION, GITHUB_REPO, DISMISSED_VERSION_KEY, semverGt } from '../lib/updateCheck'
 
 const FIRMWARE_URL = 'https://figamore.github.io/FigUI/firmware/index.html.gz'
-const MARKED_CDN_URL = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js'
+// Pinned with a hash: this script runs with the page's access to the machine.
+const MARKED_CDN_URL = 'https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js'
+const MARKED_SRI = 'sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+'
 const IS_DEMO = Boolean(import.meta.env.VITE_DEMO_MODE)
 
 type MarkedParser = {
@@ -28,6 +31,8 @@ function loadMarkedFromCdn(): Promise<void> {
   markedLoadPromise = new Promise((resolve, reject) => {
     const script = document.createElement('script')
     script.src = MARKED_CDN_URL
+    script.integrity = MARKED_SRI
+    script.crossOrigin = 'anonymous'
     script.async = true
     script.onload = () => resolve()
     script.onerror = () => reject(new Error('Failed to load markdown renderer'))
@@ -35,6 +40,14 @@ function loadMarkedFromCdn(): Promise<void> {
   })
 
   return markedLoadPromise
+}
+
+// Writing the web UI to flash mid-job only adds load to the controller.
+const UPDATE_AFTER_JOB = 'A job is running. Update after it has finished.'
+
+function jobActive(state: string, sdFilename: string | undefined, senderPhase: string) {
+  return state === 'Run' || state === 'Hold' || Boolean(sdFilename) ||
+    senderPhase === 'streaming' || senderPhase === 'paused' || senderPhase === 'draining'
 }
 
 type UpdateState = 'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'uploading' | 'done' | 'error'
@@ -241,6 +254,10 @@ export function AboutModal({ onClose }: Props) {
   const espInfo = useMachineStore(s => s.espInfo)
   const pendingUpdateVersion = useMachineStore(s => s.pendingUpdateVersion)
   const setPendingUpdateVersion = useMachineStore(s => s.setPendingUpdateVersion)
+  const machineState = useMachineStore(s => s.status.state)
+  const sdFilename = useMachineStore(s => s.status.sdFilename)
+  const senderPhase = useGCodeSenderStore(s => s.phase)
+  const updateBlocked = jobActive(machineState, sdFilename, senderPhase)
 
   const [updateState, setUpdateState] = useState<UpdateState>(
     () => pendingUpdateVersion ? 'available' : 'idle'
@@ -324,6 +341,12 @@ export function AboutModal({ onClose }: Props) {
       const dlRes = await fetch(FIRMWARE_URL)
       if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`)
       downloadedBuffer.current = await dlRes.arrayBuffer()
+
+      // A job may have started while the file was downloading.
+      const { status } = useMachineStore.getState()
+      if (jobActive(status.state, status.sdFilename, useGCodeSenderStore.getState().phase)) {
+        throw new Error(UPDATE_AFTER_JOB)
+      }
 
       setUpdateState('uploading')
       setUploadProgress(0)
@@ -483,19 +506,24 @@ export function AboutModal({ onClose }: Props) {
                   )}
                   <div className="flex items-center gap-2">
                     <button
-                      className="btn-primary self-start flex items-center gap-1.5 text-[13px] py-1.5 px-3"
+                      className="btn-primary self-start flex items-center gap-1.5 text-[13px] py-1.5 px-3 disabled:opacity-50 disabled:cursor-not-allowed"
                       onClick={performUpdate}
+                      disabled={updateBlocked}
+                      title={updateBlocked ? 'Update after the running job has finished' : undefined}
                     >
                       <ArrowUp size={13} />
                       Update to v{latestVersion}
                     </button>
                     <button
-                      className="btn-default self-start text-[13px] py-1.5 px-3"
+                      className="btn btn-ghost self-start text-[13px] py-1.5 px-3"
                       onClick={dismissUpdate}
                     >
                       Dismiss
                     </button>
                   </div>
+                  {updateBlocked && (
+                    <span className="text-[11px] text-text-dim">{UPDATE_AFTER_JOB}</span>
+                  )}
                 </div>
               )}
 
@@ -541,7 +569,7 @@ export function AboutModal({ onClose }: Props) {
                     {updateError}
                   </span>
                   <button
-                    className="btn-default self-start text-[13px] py-1.5 px-3"
+                    className="btn btn-ghost self-start text-[13px] py-1.5 px-3"
                     onClick={() => setUpdateState('idle')}
                   >
                     Dismiss

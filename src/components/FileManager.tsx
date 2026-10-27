@@ -29,12 +29,13 @@ import {
   downloadFile,
   fetchFileContent,
   saveFileContent,
+  replaceFileContent,
 } from "../lib/http";
 import { CodeEditor, isEditable } from "./CodeEditor";
 import { useMachineStore } from "../store";
 import { useGCodeStore } from "../store/gcode";
 import type { FileEntry, FileListResult } from "../types";
-import { isGCodeFileName } from "../lib/gcodeFiles";
+import { isGCodeFileName, pathHoldsRunningFile } from "../lib/gcodeFiles";
 
 type Filesystem = "sd" | "local";
 type UploadTarget = { fs: Filesystem; path: string; name: string };
@@ -62,6 +63,8 @@ interface FileRowProps {
   path: string;
   fs: Filesystem;
   canLoadGcode: boolean;
+  /** The running job reads this file (or a file in this folder). */
+  inUseByJob: boolean;
   selectionMode: boolean;
   selected: boolean;
   selectionDisabled: boolean;
@@ -77,6 +80,7 @@ function FileRow({
   path,
   fs,
   canLoadGcode,
+  inUseByJob,
   selectionMode,
   selected,
   selectionDisabled,
@@ -92,36 +96,51 @@ function FileRow({
   const [newName, setNewName] = useState(entry.name);
   const [showMenu, setShowMenu] = useState(false);
   const renameRef = useRef<HTMLInputElement>(null);
+  const renameCommitted = useRef(false);
 
   const fullPath = path.endsWith("/") ? path : `${path}/`;
   const fullName = `${fullPath}${entry.name}`;
 
   function startRename() {
+    if (inUseByJob) return;
     setNewName(entry.name);
+    renameCommitted.current = false;
     setRenaming(true);
     setTimeout(() => renameRef.current?.select(), 0);
   }
 
   async function commitRename() {
+    // Enter, the confirm button and the input's blur can all fire for one
+    // rename; only the first may send it.
+    if (renameCommitted.current) return;
     const trimmed = newName.trim();
-    if (!trimmed || trimmed === entry.name) {
+    // FatFs must not rename an open file; the job may have started while the
+    // name was typed.
+    if (!trimmed || trimmed === entry.name || inUseByJob) {
       setRenaming(false);
       return;
     }
+    renameCommitted.current = true;
     try {
       await renameFile(fullPath, entry.name, trimmed, fs);
       onRefresh();
-    } catch {}
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Rename failed");
+    }
     setRenaming(false);
   }
 
   async function handleDelete() {
-    if (!confirm(`Delete ${entry.name}?`)) return;
+    // The controller does not lock a file a job is reading; deleting it frees
+    // the clusters under the running job.
+    if (inUseByJob || !confirm(`Delete ${entry.name}?`)) return;
     setDeleting(true);
     try {
       if (entry.isDir) await deleteDir(fullPath, entry.name, fs);
       else await deleteFile(fullPath, entry.name, fs);
       onRefresh();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Delete failed");
     } finally {
       setDeleting(false);
     }
@@ -270,7 +289,7 @@ function FileRow({
               </span>
             )}
             <div className="hidden group-hover:flex items-center gap-1">
-              {!entry.isDir && isEditable(entry.name) && (
+              {!entry.isDir && isEditable(entry.name, entry.size) && (
                 <button
                   className="p-1.5 rounded text-info hover:bg-info/10 transition-colors"
                   onClick={() => onEdit(fullPath, entry.name)}
@@ -290,17 +309,18 @@ function FileRow({
                 </button>
               )}
               <button
-                className="p-1.5 rounded text-text-muted hover:text-text-primary hover:bg-elevated transition-colors"
+                className="p-1.5 rounded text-text-muted hover:text-text-primary hover:bg-elevated transition-colors disabled:opacity-50"
                 onClick={startRename}
-                title="Rename"
+                disabled={inUseByJob}
+                title={inUseByJob ? "In use by the running job" : "Rename"}
               >
                 <Pencil size={12} />
               </button>
               <button
-                className="p-1.5 rounded text-danger hover:bg-danger/10 transition-colors"
+                className="p-1.5 rounded text-danger hover:bg-danger/10 transition-colors disabled:opacity-50"
                 onClick={handleDelete}
-                disabled={deleting}
-                title="Delete"
+                disabled={deleting || inUseByJob}
+                title={inUseByJob ? "In use by the running job" : "Delete"}
               >
                 <Trash2 size={12} />
               </button>
@@ -366,7 +386,7 @@ function FileRow({
                   )}
                 </button>
               )}
-              {!entry.isDir && isEditable(entry.name) && (
+              {!entry.isDir && isEditable(entry.name, entry.size) && (
                 <button
                   className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-info hover:bg-info/10 transition-colors"
                   onClick={handleMenuEdit}
@@ -386,16 +406,17 @@ function FileRow({
                 </button>
               )}
               <button
-                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-text-primary hover:bg-elevated transition-colors"
+                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-text-primary hover:bg-elevated transition-colors disabled:opacity-50"
                 onClick={handleMenuRename}
+                disabled={inUseByJob}
               >
                 <Pencil size={22} />
                 <span>Rename</span>
               </button>
               <button
-                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-danger hover:bg-danger/10 transition-colors"
+                className="flex items-center gap-4 px-4 py-4 rounded-lg text-xl w-full text-left text-danger hover:bg-danger/10 transition-colors disabled:opacity-50"
                 onClick={handleMenuDelete}
-                disabled={deleting}
+                disabled={deleting || inUseByJob}
               >
                 <Trash2 size={22} />
                 <span>Delete</span>
@@ -444,6 +465,7 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   const resourcesReady = useControllerResourcesReady();
   const espInfo = useMachineStore((s) => s.espInfo);
   const machineState = useMachineStore((s) => s.status.state);
+  const runningFile = useMachineStore((s) => s.status.sdFilename);
   const loadGCodeFromText = useGCodeStore((s) => s.loadFromText);
   const beginSdUpload = useGCodeStore((s) => s.beginSdUpload);
   const completeSdUpload = useGCodeStore((s) => s.completeSdUpload);
@@ -786,6 +808,19 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
             : null;
         let previewLoad: Promise<void> | null = null;
 
+        // Uploading truncates the target, and the controller does not lock
+        // the file a running job reads. Checked per file: a job may start
+        // while an earlier file of the selection uploads.
+        if (
+          pathHoldsRunningFile(
+            useMachineStore.getState().status.sdFilename,
+            fs,
+            `${path.endsWith("/") ? path : `${path}/`}${file.name}`,
+          )
+        ) {
+          throw new Error(`${file.name} is in use by the running job. Try again after the job.`);
+        }
+
         setUploadIdx(i + 1);
         setUploadPct(0);
         setUploadPhase("preparing");
@@ -826,6 +861,8 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
       });
     } catch (e) {
       alert(e instanceof Error ? e.message : "Upload failed");
+      // Show the files of the selection that did arrive.
+      void load(path, fs);
     } finally {
       setUploading(false);
       if (fileInput.current) fileInput.current.value = "";
@@ -834,7 +871,12 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   async function handleCreateDir() {
     if (!newDirName.trim()) return;
-    await createDir(path, newDirName.trim(), fs);
+    try {
+      await createDir(path, newDirName.trim(), fs);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Could not create folder");
+      return;
+    }
     setNewDirName("");
     setShowNewDir(false);
     load(path, fs);
@@ -881,20 +923,41 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
   async function handleSaveFile(content: string) {
     if (!editing) return;
     if (
+      pathHoldsRunningFile(
+        useMachineStore.getState().status.sdFilename,
+        editing.fs,
+        `${editing.path}${editing.filename}`,
+      )
+    ) {
+      throw new Error(`${editing.filename} is in use by the running job. Try again after the job.`);
+    }
+    if (
       isYamlFile(editing.filename) &&
       content.includes("# Edited using Config Studio") &&
       !editing.content.includes("# Edited using Config Studio")
     ) {
       const extensionIndex = editing.filename.lastIndexOf(".");
       const backupName = `${editing.filename.slice(0, extensionIndex)}_backup${editing.filename.slice(extensionIndex)}`;
-      await saveFileContent(
-        editing.path,
-        backupName,
-        editing.content,
-        editing.fs,
-      );
+      try {
+        await saveFileContent(
+          editing.path,
+          backupName,
+          editing.content,
+          editing.fs,
+        );
+      } catch (e) {
+        // The main file is left untouched when its backup could not be written.
+        throw new Error(
+          `backup ${backupName} could not be written (${e instanceof Error ? e.message : String(e)}), ${editing.filename} was not changed`,
+        );
+      }
     }
-    await saveFileContent(editing.path, editing.filename, content, editing.fs);
+    await replaceFileContent(
+      editing.path,
+      editing.filename,
+      content,
+      editing.fs,
+    );
     setEditing((current) => (current ? { ...current, content } : current));
     load(path, fs);
   }
@@ -941,6 +1004,13 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
 
   async function handleDeleteSelected() {
     if (!selectedEntries.length) return;
+    const busy = selectedEntries.find((entry) =>
+      pathHoldsRunningFile(runningFile, fs, `${path.endsWith("/") ? path : `${path}/`}${entry.name}`),
+    );
+    if (busy) {
+      setError(`${busy.name} is in use by the running job. Try again after the job.`);
+      return;
+    }
     const folderCount = selectedEntries.filter((entry) => entry.isDir).length;
     const itemLabel =
       selectedEntries.length === 1
@@ -1339,6 +1409,11 @@ export function FileManager({ isTablet }: { isTablet?: boolean }) {
               path={path}
               fs={fs}
               canLoadGcode={canLoadGcode}
+              inUseByJob={pathHoldsRunningFile(
+                runningFile,
+                fs,
+                `${path.endsWith("/") ? path : `${path}/`}${entry.name}`,
+              )}
               selectionMode={selectionMode}
               selected={selectedNames.has(entry.name)}
               selectionDisabled={deletingSelected}

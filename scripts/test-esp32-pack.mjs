@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
+import lzma from 'lzma'
 import { packEsp32Html } from './pack-esp32.mjs'
 
-async function unpack(html) {
+async function unpack(html, expectedStyles = []) {
   const loader = html.match(/<script\b[^>]*data-figui-packed[^>]*>([\s\S]*?)<\/script>/)?.[1]
   assert.ok(loader, 'packed module is present')
   const root = { textContent: '' }
   let removed = false
   const errors = []
+  const styles = [...html.matchAll(/<style\b[^>]*data-figui-style="(\d+)"[^>]*>([\s\S]*?)<\/style>/g)]
+    .map(match => ({
+      index: Number(match[1]), textContent: match[2], removedMarker: false,
+      removeAttribute(name) {
+        assert.equal(name, 'data-figui-style')
+        this.removedMarker = true
+      },
+    }))
   const result = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Loader did not finish')), 5000)
     const packedScript = {
@@ -19,6 +28,8 @@ async function unpack(html) {
       ],
       nonce: 'test-nonce',
       after(script) {
+        assert.deepEqual(styles.map(style => style.textContent), expectedStyles, 'restore every stylesheet before inserting the module')
+        assert.ok(styles.every(style => style.removedMarker), 'remove stylesheet markers after restoration')
         assert.equal(script.type, 'module')
         assert.equal(script.nonce, 'test-nonce')
         assert.equal(script['data-figui-packed'], undefined)
@@ -30,7 +41,7 @@ async function unpack(html) {
       remove() { removed = true },
     }
     const context = {
-      setTimeout, clearTimeout, atob, Uint8Array,
+      setTimeout, clearTimeout, atob, Uint8Array, TextDecoder,
       console: { error: (...args) => {
         errors.push(args)
         clearTimeout(timeout)
@@ -42,6 +53,8 @@ async function unpack(html) {
           return { setAttribute(name, value) { this[name] = value } }
         },
         querySelector(selector) {
+          const style = selector.match(/^style\[data-figui-style="(\d+)"\]$/)
+          if (style) return styles.find(candidate => candidate.index === Number(style[1])) ?? null
           assert.equal(selector, 'script[data-figui-packed]')
           return packedScript
         },
@@ -75,6 +88,46 @@ assert.equal(loaded.source, source, 'recover the exact original module, includin
 assert.equal(loaded.removed, true, 'release the packed script without a load event')
 assert.deepEqual(loaded.errors, [])
 
+// Varied records keep repeated property names separated by distinct values.
+// This exercises the dictionary path through the actual generated browser loader.
+let seed = 1
+const records = Array.from({ length: 3000 }, () => {
+  seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+  return { controllerPosition: seed, reportedFilename: `part-${seed}.nc`, commandPending: seed % 3 === 0 }
+})
+const largeSource = `const records = ${JSON.stringify(records)};\n${source}`
+const dictionaryPacked = await packEsp32Html(`${prefix}<script type="module">${largeSource}</script>${suffix}`)
+assert.ok(dictionaryPacked.includes('TextDecoder'), 'large fixture uses dictionary decoding')
+const dictionaryLoaded = await unpack(dictionaryPacked)
+assert.equal(dictionaryLoaded.source, largeSource, 'browser loader restores the original module byte for byte')
+assert.deepEqual(dictionaryLoaded.errors, [])
+const invalidDictionary = await new Promise((resolve, reject) => {
+  lzma.compress([255, ...Buffer.from('1 word'), 0, 129], 3, (data, error) => error ? reject(error) : resolve(Buffer.from(data)))
+})
+const damagedDictionary = dictionaryPacked.replace(/atob\("[A-Za-z0-9+/=]+"\)/, `atob("${invalidDictionary.toString('base64')}")`)
+const dictionaryFailed = await unpack(damagedDictionary)
+assert.equal(dictionaryFailed.source, null, 'do not execute a damaged dictionary payload')
+assert.equal(dictionaryFailed.errors.length, 1)
+assert.match(dictionaryFailed.root.textContent, /Please reload/)
+
+const css = ':root{--bg:#123}body{background:var(--bg);margin:0}.label:after{content:"Café 中文 🛠️ $&"}@media print{.label{color:red}}'
+const secondCss = '.label{color:green}'
+const styleTag = `<style rel="stylesheet">${secondCss}</style>`
+// An identical-looking tag inside JavaScript must not be mistaken for HTML.
+const styledSource = `const sample = ${JSON.stringify(styleTag)};\n${largeSource}`
+const styledHtml = `${prefix}<script type="module">${styledSource}</script><style rel="stylesheet" nonce="style-nonce" media="screen">${css}</style>${styleTag}${suffix}`
+const styledPacked = await packEsp32Html(styledHtml, { packStyles: true })
+assert.ok(styledPacked.startsWith(prefix), 'ordinary inline styles remain native')
+assert.ok(styledPacked.includes('nonce="style-nonce" media="screen"'), 'keep stylesheet attributes')
+assert.ok(styledPacked.includes(':root{--bg:#123}body{background:var(--bg);margin:0}'), 'first-paint page styling remains native')
+const styledLoaded = await unpack(styledPacked, [css, secondCss])
+assert.equal(styledLoaded.source, styledSource, 'recover JS separately from CSS, including Unicode and literal style tags')
+assert.deepEqual(styledLoaded.errors, [])
+const missingStyle = await unpack(styledPacked.replace('data-figui-style="0"', 'data-missing-style="0"'))
+assert.equal(missingStyle.source, null, 'do not execute the app without its styles')
+assert.equal(missingStyle.errors.length, 1)
+assert.match(missingStyle.root.textContent, /Please reload/)
+
 // A damaged download produces a visible error, not a silent blank screen.
 const corrupt = packed.replace(/atob\("[A-Za-z0-9+/=]+"\)/, 'atob("AA==")')
 assert.notEqual(corrupt, packed)
@@ -91,4 +144,4 @@ for (const invalid of [
 ]) {
   await assert.rejects(packEsp32Html(invalid))
 }
-console.log('ESP32 packer tests passed: exact module recovery, offline loader, cleanup and errors')
+console.log('ESP32 packer tests passed: exact JS/CSS recovery, dictionary loader, first-paint styles, cleanup and errors')
