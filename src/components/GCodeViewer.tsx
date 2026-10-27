@@ -16,7 +16,7 @@ import { useSingleBlockStore } from '../store/singleBlock'
 import { SingleBlockNotice, SingleBlockToggle } from './SingleBlockControl'
 import { useConfirmTap } from '../hooks/useConfirmTap'
 import { GCODE_ACCEPT_ATTRIBUTE, isGCodeFileName } from '../lib/gcodeFiles'
-import { controllerRunCommand, isRunningFile } from '../lib/controllerFiles'
+import { controllerRunCommand, isRunningFile, runningFilePath } from '../lib/controllerFiles'
 import { buildFramingGCode, getFramingRequiredTravelZ, programMovesZ, type FramingMode } from '../lib/gcodeOutline'
 import { parseDecimalInput } from '../lib/numberInput'
 
@@ -136,11 +136,15 @@ const PROGRESS_HINT_SLACK_SEGMENTS = 300
 const LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT = 100_000
 /** Above this many lines, 2D pan and zoom stretch the cached layer until the view settles. */
 const LARGE_2D_LAYER_LINE_LIMIT = 100_000
+/** Opacity of a loaded toolpath while another window or device runs a different file. */
+const STALE_PREVIEW_ALPHA = 0.3
 const STATIC_2D_SETTLE_MS = 150
 /** Share of the view size drawn beyond each edge of the cached 2D layer. */
 const STATIC_2D_LAYER_PAD_RATIO = 0.25
 const FOLLOW_EDGE_MARGIN_PX = 40
 const FOLLOW_EDGE_MARGIN_RATIO = 0.1
+/** A 2D drag longer than this while a job runs turns Follow off, so the view stays where it was dragged. */
+const FOLLOW_PAN_RELEASE_PX = 8
 const FOLLOW_MODE_KEY = 'gcode.followMode'
 const EMPTY_FLOAT32 = new Float32Array(0)
 const WHEEL_ZOOM_SENSITIVITY = 0.0012
@@ -173,6 +177,21 @@ const ENTRY_MARKER_LINE = [0.13, 0.77, 0.37, 1.0] as const
 const ENTRY_MARKER_FILL = [0.13, 0.77, 0.37, 0.26] as const
 const EXIT_MARKER_LINE = [0.94, 0.27, 0.27, 1.0] as const
 const EXIT_MARKER_FILL = [0.94, 0.27, 0.27, 0.26] as const
+
+/**
+ * zustand's useShallow for a selector that returns a flat object of the same
+ * keys, without the Map, Set and iterable handling this one does not need.
+ */
+function useShallow<S, T extends object>(selector: (state: S) => T) {
+  const prev = useRef<T>()
+  return (state: S) => {
+    const next = selector(state)
+    const last = prev.current as Record<string, unknown> | undefined
+    return last && Object.entries(next).every(([key, value]) => Object.is(last[key], value))
+      ? prev.current!
+      : (prev.current = next)
+  }
+}
 
 function getAxisEnvelopeOrigin(wco: number, maxTravel: number, homingDirInvert: number, bit: number) {
   return -wco - ((homingDirInvert & bit) ? 0 : maxTravel)
@@ -1409,9 +1428,13 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [senderExecutionProgressPercent, setSenderExecutionProgressPercent] = useState<number | null>(null)
   const showRapidsRef = useRef(true)
   const showToolRef = useRef(true)
+  /** Another window or device runs a different file: the loaded toolpath is only a faint backdrop. */
+  const staleModelRef = useRef(false)
   const hiddenToolsRef = useRef<Set<number>>(new Set())
   const transformRef = useRef<Transform>({ ox: 0, oy: 0, scale: 1 })
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
+  // Follow was turned off by panning during a job (not by the Follow button); the next job turns it back on.
+  const followReleasedByPanRef = useRef(false)
   const activePointersRef = useRef<Map<number, { x: number; y: number; dragMode: DragMode }>>(new Map())
   const lastPinchDistRef = useRef<number | null>(null)
   const animRef = useRef(0)
@@ -1456,6 +1479,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const [dragMode, setDragMode] = useState<DragMode>('orbit')
   const [hoveredViewTarget, setHoveredViewTarget] = useState<string | null>(null)
   const rendererRef = useRef<WebGLRenderer | null>(null)
+  const webglContextLostRef = useRef(false)
   const cameraRef = useRef<Camera>({
     position: { x: 100, y: 100, z: 100 },
     target: { x: 0, y: 0, z: 0 },
@@ -1527,7 +1551,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
   function initWebGLRenderer() {
     const canvas = webglCanvasRef.current
-    if (!canvas) return
+    if (!canvas || webglContextLostRef.current) return
 
     rendererRef.current = null
     const renderer = createRenderer(canvas)
@@ -1947,6 +1971,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
    * into place and stroked again once the view settles.
    */
   function drawStatic2DLayer(ctx: CanvasRenderingContext2D, paths: Static2DPaths, t: Transform, w: number, h: number, lineCount: number) {
+    // A hidden viewer has no size; a zero-sized layer canvas cannot be drawn.
+    if (w < 1 || h < 1) return
     const dpr = window.devicePixelRatio || 1
     const showRapids = showRapidsRef.current
     const hiddenTools = hiddenToolsRef.current
@@ -2010,7 +2036,22 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     return cached.path
   }
 
-  const status = useMachineStore(s => s.status)
+  // Only the fields the viewer uses: modal-state [GC:] reports, which arrive at
+  // every laser M4/M5 change during a job, must not re-render the whole viewer.
+  // Draw code reads the rest from getState().
+  const status = useMachineStore(useShallow(s => ({
+    state: s.status.state,
+    wpos: s.status.wpos,
+    wco: s.status.wco,
+    feed: s.status.feed,
+    feedOverride: s.status.feedOverride,
+    rapidOverride: s.status.rapidOverride,
+    spindleOverride: s.status.spindleOverride,
+    sdFilename: s.status.sdFilename,
+    sdPercent: s.status.sdPercent,
+    pinState: s.status.pinState,
+    holdComplete: s.status.holdComplete,
+  })))
   const connected = useMachineStore(s => s.connected)
   const controllerResetPending = useMachineStore(s => s.controllerResetPending)
   const controllerSettings = useMachineStore(s => s.controllerSettings)
@@ -2056,6 +2097,31 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   const controllerJobStarting = trackedJobSource === 'controller' && status.state === 'Idle'
   const machineJobActive = status.state === 'Run' || status.state === 'Hold' || senderActive || controllerJobStarting
   const isRunning = machineJobActive || simulationActive
+  // An SD job running a file this page has not loaded: one started from
+  // another window or device. Its preview cannot be fetched meanwhile, as
+  // FluidNC refuses to serve files while the machine moves.
+  const otherJobFile = !simulationActive && !senderActive && machineJobActive && !!status.sdFilename
+    && !isRunningFile(status.sdFilename, loadedPath)
+    ? status.sdFilename
+    : null
+  // The notice outlives the job, so the file can be loaded here once the machine stops.
+  const [otherJobNotice, setOtherJobNotice] = useState<string | null>(null)
+  // A job or simulation of the file loaded here ends it.
+  const runningLoadedFile = simulationActive || senderActive || (!!status.sdFilename && !otherJobFile)
+  useEffect(() => {
+    if (otherJobFile) setOtherJobNotice(otherJobFile)
+    else if (runningLoadedFile) setOtherJobNotice(null)
+  }, [otherJobFile, runningLoadedFile])
+  const noticeModelRef = useRef(model)
+  useEffect(() => {
+    if (noticeModelRef.current === model) return
+    noticeModelRef.current = model
+    setOtherJobNotice(null)
+  }, [model])
+  useEffect(() => {
+    staleModelRef.current = !!otherJobFile
+    scheduleRender()
+  }, [otherJobFile])
   const isJobRunning = senderPhase === 'streaming' || senderPhase === 'draining'
     || (status.state === 'Run' && senderPhase !== 'paused') || controllerJobStarting
   const isJobHeld = senderPhase === 'paused' || status.state === 'Hold'
@@ -2309,7 +2375,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       }
       const modelW = bMaxX - bMinX || 1
       const modelH = bMaxY - bMinY || 1
-      const pad = 40
+      // Shrink the margin on a very small viewer so the scale never goes to zero or negative.
+      const pad = Math.min(40, w / 4, h / 4)
       const scale = Math.min((w - pad * 2) / modelW, (h - pad * 2) / modelH)
       const cx = (bMinX + bMaxX) / 2
       const cy = (bMinY + bMaxY) / 2
@@ -2529,7 +2596,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
       const progress3d = running3d ? progressRef.current : null
       const use3DProgressOverlay = mdl !== null && progress3d !== null && mdl.segments.length <= LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
       const wpos3d = showToolRef.current ? (simulationRendering3d ? simulationToolPosRef.current : store.status.wpos) : null
-      const markerGeometry = mdl ? ensureEntryExitMarkerGeometry(mdl) : { vertices: EMPTY_FLOAT32, colors: EMPTY_FLOAT32, triangleVertices: EMPTY_FLOAT32, triangleColors: EMPTY_FLOAT32 }
+      const staleModel = staleModelRef.current
+      const markerGeometry = mdl && !staleModel ? ensureEntryExitMarkerGeometry(mdl) : { vertices: EMPTY_FLOAT32, colors: EMPTY_FLOAT32, triangleVertices: EMPTY_FLOAT32, triangleColors: EMPTY_FLOAT32 }
       const bed3d = getBedEnvelope(store.controllerSettings, store.status)
       const bedGeometry = bed3d ? buildBedLineGeometry(bed3d.width, bed3d.height, bed3d.originX, bed3d.originY) : null
 
@@ -2563,7 +2631,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         const bedVertexCount = bedGeometry ? bedGeometry.vertices.length / 3 : 0
         const markerVertexCount = markerGeometry.vertices.length / 3
         const toolVertexStart = toolGeometry.vertices.length > 0 ? bedVertexCount + markerVertexCount : mergedVertices.length / 3
-        renderLines(rendererRef.current, cameraRef.current, mergedVertices, mergedColors, toolVertexStart, 3, mergedTriangleVertices, mergedTriangleColors)
+        renderLines(rendererRef.current, cameraRef.current, mergedVertices, mergedColors, toolVertexStart, 3, mergedTriangleVertices, mergedTriangleColors, staleModel ? STALE_PREVIEW_ALPHA : 1)
       } else {
         clearStaticPathGeometryUpload()
         const { vertices, colors, triangleVertices, triangleColors, toolVertexStart } = createVertexData(mdl.segments, progress3d, wpos3d)
@@ -2641,7 +2709,11 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
 
       // Null while a large job's paths are still being prepared.
       const staticPaths = ensureStatic2DPaths(mdl)
-      if (staticPaths) drawStatic2DLayer(ctx, staticPaths, t, w, h, renderLinesRef.current?.count ?? mdl.segments.length)
+      if (staticPaths) {
+        ctx.globalAlpha = staleModelRef.current ? STALE_PREVIEW_ALPHA : 1
+        drawStatic2DLayer(ctx, staticPaths, t, w, h, renderLinesRef.current?.count ?? mdl.segments.length)
+        ctx.globalAlpha = 1
+      }
 
       const use2DProgressOverlay = progress !== null && mdl.segments.length <= LARGE_PROGRESS_OVERLAY_SEGMENT_LIMIT
 
@@ -2712,6 +2784,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     setFollowMode(mode)
     localStorage.setItem(FOLLOW_MODE_KEY, mode)
     setShowFollowMenu(false)
+    followReleasedByPanRef.current = false
     setAutoFollow(true)
     centerOnRunningTool()
   }
@@ -2755,9 +2828,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     }
 
     // A job started elsewhere may run another file: do not track it on this one.
-    const runningOtherFile = !senderActive && !!status.sdFilename
-      && !isRunningFile(status.sdFilename, loadedPath)
-    if (isRunning && modelRef.current && !runningOtherFile) {
+    if (isRunning && modelRef.current && !otherJobFile) {
       // Tracking is cheap at any size; only drawing the completed path is
       // limited to smaller jobs. Program Execution follows this position.
       const freshStart = !prevIsRunningRef.current || model !== prevModelRef.current
@@ -2820,10 +2891,15 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         ? segmentAt(trackedModel.segments, trackedProgress.segmentIndex)?.sourceLine ?? null
         : null,
     )
+    if (isRunning && !prevIsRunningRef.current && followReleasedByPanRef.current) {
+      followReleasedByPanRef.current = false
+      setAutoFollow(true)
+    }
     prevIsRunningRef.current = isRunning
     prevModelRef.current = model
 
-    if (isRunning && autoFollow && showTool) {
+    // Leave the view alone while a 2D drag is in progress; the drag rebuilds the offset from where it started.
+    if (isRunning && autoFollow && showTool && !dragRef.current) {
       if (followMode === 'center') centerViewOn(status.wpos.x, status.wpos.y)
       else ensureToolVisible(status.wpos.x, status.wpos.y)
     }
@@ -2835,6 +2911,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     showTool,
     hiddenTools,
     isRunning,
+    otherJobFile,
     senderActive,
     senderAcceptedLine,
     autoFollow,
@@ -2910,6 +2987,29 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
     })
     ro.observe(container)
     return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const canvas = webglCanvasRef.current
+    if (!canvas) return
+    // The browser only restores a lost context when the loss is preventDefault()ed.
+    // The next 3D render then builds a new renderer and uploads the paths again.
+    const onContextLost = (e: Event) => {
+      e.preventDefault()
+      webglContextLostRef.current = true
+      rendererRef.current = null
+      uploadedPathGeometryRef.current = null
+    }
+    const onContextRestored = () => {
+      webglContextLostRef.current = false
+      scheduleRender()
+    }
+    canvas.addEventListener('webglcontextlost', onContextLost)
+    canvas.addEventListener('webglcontextrestored', onContextRestored)
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onContextLost)
+      canvas.removeEventListener('webglcontextrestored', onContextRestored)
+    }
   }, [])
 
   useEffect(() => {
@@ -3028,6 +3128,10 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
         const t = transformRef.current
         t.ox = d.ox + (e.clientX - d.sx)
         t.oy = d.oy + (e.clientY - d.sy)
+        if (isRunning && autoFollow && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > FOLLOW_PAN_RELEASE_PX) {
+          followReleasedByPanRef.current = true
+          setAutoFollow(false)
+        }
         scheduleRender()
       }
     }
@@ -3347,6 +3451,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 className={`${btnCls} rounded-r-none ${isTablet ? 'pr-1' : 'pr-0.5'} ${autoFollow ? 'text-info bg-info/10' : 'text-text-dim bg-elevated hover:text-text-primary'}`}
                 onClick={() => {
                   const follow = !autoFollow
+                  followReleasedByPanRef.current = false
                   setAutoFollow(follow)
                   if (follow) centerOnRunningTool()
                 }}
@@ -3424,6 +3529,46 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
         />
+
+        {otherJobNotice && !loading && (
+          <div className="absolute top-2 inset-x-2 z-30 flex justify-center pointer-events-none">
+            <div className="pointer-events-auto max-w-full flex items-start gap-3 rounded-lg border border-info/40 bg-surface shadow-lg px-3 py-2 text-sm" role="status" aria-live="polite">
+              <div className="min-w-0">
+                <div className="font-semibold text-info [overflow-wrap:anywhere]">
+                  {otherJobFile ? 'Running ' : 'Ran '}
+                  <span className="font-mono">{otherJobNotice.slice(otherJobNotice.replace(/\\/g, '/').lastIndexOf('/') + 1)}</span>
+                  {' from another window or device'}
+                </div>
+                <div className="mt-0.5 text-xs text-text-muted">
+                  {otherJobFile
+                    ? <>Its live preview is shown there. {fileName
+                      ? <>This page shows <span className="font-mono">{fileName}</span>, dimmed.</>
+                      : 'No file is loaded on this page.'}</>
+                    : 'Load it to see it here.'}
+                </div>
+              </div>
+              {!otherJobFile && (
+                <>
+                  <button
+                    className="btn btn-primary shrink-0 px-3 py-1 text-sm"
+                    onClick={() => void loadFile(runningFilePath(otherJobNotice))}
+                    disabled={isRunning}
+                  >
+                    Load
+                  </button>
+                  <button
+                    className="shrink-0 self-center text-text-dim hover:text-text-primary"
+                    onClick={() => setOtherJobNotice(null)}
+                    aria-label="Dismiss message about the job from another window or device"
+                    title="Dismiss"
+                  >
+                    <X size={14} />
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         {isFileDragging && !isRunning && (
           <div className={`absolute inset-3 z-40 flex items-center justify-center rounded-xl border-2 border-dashed pointer-events-none backdrop-blur-sm ${
@@ -3630,7 +3775,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 </div>
                 <button
                   type="button"
-                  className={`h-8 rounded border px-2.5 text-sm font-semibold ${simulationPaused ? 'border-ok/40 bg-ok/10 text-ok' : 'border-warning/40 bg-warning/10 text-warning'} disabled:opacity-50`}
+                  className={`h-8 rounded border px-2.5 text-sm font-semibold ${simulationPaused ? 'border-ok/40 bg-ok/10 text-ok' : 'border-warn/40 bg-warn/10 text-warn'} disabled:opacity-50`}
                   onClick={simulationPaused ? resumeSimulation : pauseSimulation}
                   disabled={simulationPhase === 'completed'}
                   title={simulationPaused ? 'Resume preview simulation' : 'Pause preview simulation'}
@@ -3960,12 +4105,12 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
               </button>
             )}
             {senderNotice && (
-              <div className="mt-2 text-[11px] text-warning">{senderNotice}</div>
+              <div className="mt-2 text-[11px] text-warn">{senderNotice}</div>
             )}
           </div>
         )}
         {senderPhase === 'streaming' && senderNotice && (
-          <div className="rounded border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] text-warning">
+          <div className="rounded border border-warn/30 bg-warn/5 px-3 py-2 text-[11px] text-warn">
             {senderNotice}
           </div>
         )}
@@ -4222,7 +4367,7 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
                 />
               </label>
 
-              <div className="rounded border border-warning/35 bg-warning/10 px-3 py-2 text-sm leading-relaxed text-warning">
+              <div className="rounded border border-warn/35 bg-warn/10 px-3 py-2 text-sm leading-relaxed text-warn">
                 Check Z zero first. Safe travel height must clear clamps and stock.
               </div>
               </>) : (

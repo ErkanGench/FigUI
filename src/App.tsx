@@ -4,7 +4,7 @@ import { useGCodeStore } from './store/gcode'
 import { useGCodeSenderStore } from './store/gcodeSender'
 import { useTerminalStore } from './store/terminal'
 import { connect, disconnect, isSocketOpen, onLine, onSoftReset, sendStartupQueries } from './lib/ws'
-import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, WebUIBlockedError } from './lib/http'
+import { setBase, getBase, getDeviceInfo, getDeviceInfoFast, loadMacroCfg, fetchLocalFavicon, WebUIBlockedError } from './lib/http'
 import { isWasmBridgeActive, WASM_BRIDGE_BASE } from './wasmBridge/shimTransport'
 import { parseESP800 } from './lib/parser'
 import { isJobActiveState, isRunningFile, jobContinues, runningFilePath } from './lib/controllerFiles'
@@ -421,9 +421,11 @@ function AppContent() {
     cachedHostFailures.current = 0
     // Only refresh ESP info on a fresh probe.
     const axes = (info['Axisletters'] ?? '').length
+    const hostname = info['HostName']?.trim()
+    document.title = hostname || 'FluidNC'
     setEspInfo({
       version:        info['FWVersion']?.trim()       ?? '',
-      hostname:       info['HostName']?.trim()         ?? httpHost,
+      hostname:       hostname                         ?? httpHost,
       authentication: info['Authentication']?.trim()   === 'Enabled',
       asyncMode,
       wsPort:         parseInt(wsPort, 10),
@@ -552,6 +554,7 @@ function AppContent() {
   }, [])
 
   const macrosLoaded = useRef(false)
+  const faviconLoaded = useRef(false)
   useEffect(() => {
     if (phase !== 'ready' || !connected) return
     return scheduleControllerStartup(async canContinue => {
@@ -566,6 +569,16 @@ function AppContent() {
       }
       if (!canContinue()) return false
       await prefetchInternalFiles()
+      if (!canContinue()) return false
+      if (!faviconLoaded.current) {
+        const url = await fetchLocalFavicon().catch(() => null)
+        const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
+        if (url && link) {
+          link.removeAttribute('type')
+          link.href = url
+        }
+        faviconLoaded.current = true
+      }
       return canContinue()
     }, setStartupPending)
   }, [connected, phase, setMacros, setStartupPending])
@@ -826,7 +839,7 @@ function AppContent() {
         : 'landscape:h-[100svh] landscape:overflow-hidden'
     }`}>
       {restarting ? (
-        <div className="fixed md:absolute inset-0 z-[120] bg-[var(--bg)]/80 backdrop-blur-sm
+        <div className="fixed md:absolute inset-0 z-[120] bg-[color-mix(in_srgb,var(--bg)_80%,transparent)] backdrop-blur-sm
                         flex flex-col items-center justify-center gap-3">
           <RefreshCw size={24} className="text-accent animate-spin" />
           <span className="text-text-primary text-base font-medium">Restarting controller…</span>
@@ -834,7 +847,7 @@ function AppContent() {
           {streamRecoveryNotice}
         </div>
       ) : showReconnectOverlay && (
-        <div className="fixed md:absolute inset-0 z-[120] bg-[var(--bg)]/80 backdrop-blur-sm
+        <div className="fixed md:absolute inset-0 z-[120] bg-[color-mix(in_srgb,var(--bg)_80%,transparent)] backdrop-blur-sm
                         flex flex-col items-center justify-center gap-3">
           <RefreshCw size={24} className="text-accent animate-spin" />
           <span className="text-text-muted text-base">Reconnecting…</span>
