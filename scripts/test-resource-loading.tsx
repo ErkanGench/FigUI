@@ -16,6 +16,10 @@ Object.assign(globalThis, {
 
 const { useMachineStore } = await import('../src/store')
 const { useGCodeStore } = await import('../src/store/gcode')
+const { useGCodeSenderStore } = await import('../src/store/gcodeSender')
+const { parseGCode } = await import('../src/lib/gcode')
+const { buildJobTimingEstimate, useJobRuntimeEstimate } = await import('../src/lib/jobRuntime')
+const { Header } = await import('../src/components/Header')
 const { setBase } = await import('../src/lib/http')
 const { FileManager } = await import('../src/components/FileManager')
 const { PluginLauncher } = await import('../src/components/PluginLauncher')
@@ -246,6 +250,85 @@ try {
   assert(app.slots.some(slot => Array.isArray(slot?.value) && slot.value.includes(secondError)), 'subscription must survive startupPending changes and previous batches')
   app.unmount()
   disconnect()
+
+  // A full-layout plugin unmounts the Viewer, but the Header stays mounted.
+  // Its clock must follow local jobs through holds while the Viewer is away.
+  const originalNow = Date.now
+  const originalSetInterval = window.setInterval
+  const originalClearInterval = window.clearInterval
+  let now = 1_000_000
+  let nextTimer = 1
+  const timers = new Map<number, () => void>()
+  Date.now = () => now
+  window.setInterval = ((fn: () => void) => {
+    const id = nextTimer++
+    timers.set(id, fn)
+    return id
+  }) as typeof window.setInterval
+  window.clearInterval = id => { timers.delete(id) }
+  const advance = (ms: number) => {
+    now += ms
+    for (const tick of [...timers.values()]) tick()
+  }
+  try {
+    const model = parseGCode('G21 G90\nG1 X1000 F600')
+    const settings = { maxRateX: 3000, maxRateY: 3000, maxRateZ: 1000, accelX: 200, accelY: 200, accelZ: 100 }
+    useMachineStore.setState({
+      status: { ...useMachineStore.getState().status, state: 'Run', sdFilename: undefined, sdPercent: undefined, feedOverride: 100, rapidOverride: 100 },
+      controllerSettings: { ...useMachineStore.getState().controllerSettings, ...settings },
+    })
+    useGCodeStore.setState({ model, loadedPath: null, fileName: 'local.nc' })
+    useGCodeSenderStore.setState({ phase: 'streaming', jobId: 100, fileName: 'local.nc' })
+    const header = panel(Header)
+    const viewer = () => panel(() => useJobRuntimeEstimate(
+      useMachineStore.getState().status, model, useMachineStore.getState().controllerSettings, null, 'local.nc',
+      { active: true, key: `${useGCodeSenderStore.getState().jobId}|local.nc` },
+    ))
+    header.render()
+    let currentViewer = viewer()
+    currentViewer.render()
+    advance(4000)
+    assert.equal(currentViewer.render().elapsedSeconds, 4)
+
+    for (const state of ['Hold', 'Door'] as const) {
+      currentViewer.unmount()
+      useMachineStore.setState({ status: { ...useMachineStore.getState().status, state } })
+      header.render()
+      advance(30_000)
+      currentViewer = viewer()
+      const held = currentViewer.render()
+      assert.equal(held.elapsedSeconds, 4, `${state} while the Viewer is unmounted must not count as running time`)
+      const total = buildJobTimingEstimate(model, settings)!.totalSeconds
+      assert.ok(Math.abs(held.remainingSeconds - (total - 4)) < 0.01, `${state} must preserve remaining time`)
+    }
+
+    currentViewer.unmount()
+    useMachineStore.setState({ status: { ...useMachineStore.getState().status, state: 'Run' } })
+    header.render()
+    advance(2000)
+    currentViewer = viewer()
+    assert.equal(currentViewer.render().elapsedSeconds, 6, 'running time continues while the Viewer is unmounted')
+    currentViewer.unmount()
+
+    useGCodeSenderStore.setState({ phase: 'completed' })
+    useMachineStore.setState({ status: { ...useMachineStore.getState().status, state: 'Idle' } })
+    header.render()
+    useGCodeSenderStore.setState({ phase: 'streaming', jobId: 101 })
+    useMachineStore.setState({ status: { ...useMachineStore.getState().status, state: 'Run' } })
+    header.render()
+    currentViewer = viewer()
+    assert.equal(currentViewer.render().elapsedSeconds, 0, 'the next local job starts a fresh clock')
+    currentViewer.unmount()
+    useGCodeSenderStore.setState({ phase: 'idle' })
+    useMachineStore.setState({ status: { ...useMachineStore.getState().status, state: 'Idle' } })
+    header.render()
+    header.unmount()
+  } finally {
+    Date.now = originalNow
+    window.setInterval = originalSetInterval
+    window.clearInterval = originalClearInterval
+    useGCodeSenderStore.setState({ phase: 'idle' })
+  }
   console.log('Deferred file listings, plugin scan ordering, job cache restoration, and configuration error checks passed')
 } finally {
   disconnect()
