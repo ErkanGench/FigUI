@@ -20,6 +20,12 @@ import {
   type ConfigIssue,
 } from "../lib/configValidation";
 import { GCODE_EXTENSION_SET } from "../lib/gcodeFiles";
+import {
+  indentLines,
+  smartHomeOffset,
+  indentBackspace,
+} from "../lib/editorIndent";
+import { applySearchMarks, findEditorMatches } from "../lib/editorSearch";
 
 function escapeHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -124,7 +130,7 @@ function mapOffsetThroughEdits(
   return offset + delta;
 }
 
-/** Toggle indentation-aware YAML comments on every line touched by a selection. */
+/** Toggle column-one YAML comments while preserving each line's indentation. */
 export function toggleYamlLineComments(
   code: string,
   selectionStart: number,
@@ -134,7 +140,7 @@ export function toggleYamlLineComments(
   const focus = Math.max(0, Math.min(code.length, selectionEnd));
   const low = Math.min(anchor, focus);
   const high = Math.max(anchor, focus);
-  const lineStart = code.lastIndexOf("\n", low - 1) + 1;
+  const lineStart = low === 0 ? 0 : code.lastIndexOf("\n", low - 1) + 1;
   // A selection ending at column zero belongs to the preceding selected line.
   const effectiveEnd = high > low && code[high - 1] === "\n" ? high - 1 : high;
   const nextNewline = code.indexOf("\n", effectiveEnd);
@@ -156,8 +162,7 @@ export function toggleYamlLineComments(
           insert: "",
         });
       } else {
-        const indentation = line.match(/^\s*/)?.[0].length ?? 0;
-        edits.push({ at: offset + indentation, remove: 0, insert: "# " });
+        edits.push({ at: offset, remove: 0, insert: "# " });
       }
     }
     offset += line.length + 1;
@@ -192,60 +197,6 @@ function getHighlighter(kind: FileKind) {
   };
 }
 
-function applySearchMarks(
-  editor: HTMLElement,
-  term: string,
-  activeIndex: number,
-): number {
-  if (!term) return 0;
-  const needle = term.toLowerCase();
-  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-  const textNodes: Text[] = [];
-  while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
-
-  let matchIdx = 0;
-  for (const node of textNodes) {
-    const text = node.textContent ?? "";
-    const lower = text.toLowerCase();
-    let searchStart = 0;
-    let idx = lower.indexOf(needle, searchStart);
-    if (idx === -1) continue;
-
-    const frag = document.createDocumentFragment();
-    let last = 0;
-    while (idx !== -1) {
-      if (idx > last)
-        frag.appendChild(document.createTextNode(text.slice(last, idx)));
-      const mark = document.createElement("mark");
-      mark.className =
-        matchIdx === activeIndex ? "hl-search-active" : "hl-search";
-      mark.textContent = text.slice(idx, idx + needle.length);
-      frag.appendChild(mark);
-      matchIdx++;
-      last = idx + needle.length;
-      idx = lower.indexOf(needle, last);
-    }
-    if (last < text.length)
-      frag.appendChild(document.createTextNode(text.slice(last)));
-    node.parentNode!.replaceChild(frag, node);
-  }
-  return matchIdx;
-}
-
-/** Count matches in plain text */
-function countMatches(text: string, term: string): number {
-  if (!term) return 0;
-  const lower = text.toLowerCase();
-  const needle = term.toLowerCase();
-  let count = 0;
-  let idx = 0;
-  while ((idx = lower.indexOf(needle, idx)) !== -1) {
-    count++;
-    idx += 1;
-  }
-  return count;
-}
-
 function applyDiagnosticLine(
   editor: HTMLElement,
   line: number,
@@ -262,7 +213,7 @@ const CLOSE_CHARS = new Set([")", "]", "}", '"', "'"]);
 
 /** If the char being typed is already the next char (auto-inserted), skip over it instead of doubling */
 function handleOvertype(e: KeyboardEvent) {
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
   if (!CLOSE_CHARS.has(e.key)) return;
   const sel = window.getSelection();
   if (!sel || !sel.isCollapsed || !sel.focusNode) return;
@@ -324,6 +275,7 @@ export function CodeEditor({
     severity: "error" | "warning";
   } | null>(null);
   const [lineCount, setLineCount] = useState(1);
+  const [cursor, setCursor] = useState({ line: 1, column: 1, selected: 0 });
   const [showSearch, setShowSearch] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [matchIndex, setMatchIndex] = useState(0);
@@ -336,6 +288,8 @@ export function CodeEditor({
   const kind = detectKind(filename);
 
   const currentContent = useRef(content);
+  const savedContent = useRef(content);
+  const composingRef = useRef(false);
   const searchTermRef = useRef("");
   const matchIndexRef = useRef(0);
   const historyEntryRef = useRef(false);
@@ -348,26 +302,33 @@ export function CodeEditor({
   } | null>(null);
 
   function updateLineCount(code: string) {
-    // contentEditable often appends a trailing newline — don't count it as an extra line
-    let count = code.split("\n").length;
-    if (code.endsWith("\n")) count--;
-    setLineCount(Math.max(1, count));
+    setLineCount(code.split("\n").length);
   }
+
+  useEffect(() => {
+    savedContent.current = content;
+  }, [content]);
 
   // Wrap the syntax highlighter to also apply search marks
   const makeHighlighter = useCallback((kind: FileKind) => {
     const base = getHighlighter(kind);
     return (editor: HTMLElement) => {
+      if (composingRef.current) return;
       base(editor);
-      if (searchTermRef.current) {
-        applySearchMarks(editor, searchTermRef.current, matchIndexRef.current);
-      }
+      // Decoration only: clipboard text and cursor offsets keep the real spaces.
+      editor.innerHTML = editor.innerHTML.replace(
+        /^[ \t]+/gm,
+        '<span class="hl-indent">$&</span>',
+      );
       if (diagnosticRef.current)
         applyDiagnosticLine(
           editor,
           diagnosticRef.current.line,
           diagnosticRef.current.severity,
         );
+      if (searchTermRef.current) {
+        applySearchMarks(editor, searchTermRef.current, matchIndexRef.current);
+      }
     };
   }, []);
 
@@ -375,9 +336,13 @@ export function CodeEditor({
     const el = editorRef.current;
     if (!el) return;
     const jar = CodeJar(el, makeHighlighter(kind), { tab: "  " });
+    // CodeJar sets wrapping inline; wrapped lines otherwise drift from the gutter.
+    el.style.whiteSpace = "pre";
+    el.style.overflowWrap = "normal";
+    el.style.overflowY = "visible";
     jar.updateCode(currentContent.current);
     updateLineCount(currentContent.current);
-    jar.onUpdate((code) => {
+    const syncCode = (code: string) => {
       if (
         diagnosticRef.current &&
         code.split("\n")[diagnosticRef.current.line - 1] !==
@@ -387,21 +352,136 @@ export function CodeEditor({
         setDiagnosticHighlight(null);
       }
       currentContent.current = code;
-      setDirty(code !== content);
+      setDirty(code !== savedContent.current);
       updateLineCount(code);
       // Update match count as content changes
       if (searchTermRef.current) {
-        const c = countMatches(code, searchTermRef.current);
+        const c = findEditorMatches(code, searchTermRef.current).length;
         setMatchCount(c);
         if (matchIndexRef.current >= c) {
           matchIndexRef.current = Math.max(0, c - 1);
           setMatchIndex(matchIndexRef.current);
         }
       }
-    });
+    };
+    jar.onUpdate(syncCode);
+    const updateCursor = () => {
+      const selection = window.getSelection();
+      if (
+        !selection?.focusNode ||
+        !el.contains(selection.focusNode) ||
+        !selection.anchorNode ||
+        !el.contains(selection.anchorNode)
+      )
+        return;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.setEnd(selection.focusNode, selection.focusOffset);
+      const before = range.toString();
+      const line = before.split("\n").length;
+      const column =
+        before
+          .slice(before.lastIndexOf("\n") + 1)
+          .split("")
+          .reduce((col, char) => col + (char === "\t" ? 2 - (col % 2) : 1), 0) +
+        1;
+      const selected = selection.toString().length;
+      setCursor((previous) =>
+        previous.line === line &&
+        previous.column === column &&
+        previous.selected === selected
+          ? previous
+          : { line, column, selected },
+      );
+    };
+    let highlightTimer = 0;
+    let historyTimer = 0;
+    let historyPending = false;
+    const finishHistory = () => {
+      window.clearTimeout(historyTimer);
+      if (historyPending && !composingRef.current) {
+        jar.recordHistory();
+        historyPending = false;
+      }
+    };
+    const beginInput = () => {
+      if (!historyPending && !composingRef.current) jar.recordHistory();
+      historyPending = true;
+    };
+    const onInput = () => {
+      // Mobile keyboards and dictation may never dispatch a keyboard keyup.
+      syncCode(jar.toString());
+      updateCursor();
+      historyPending = true;
+      window.clearTimeout(highlightTimer);
+      window.clearTimeout(historyTimer);
+      if (composingRef.current) return;
+      highlightTimer = window.setTimeout(() => {
+        const position = document.activeElement === el ? jar.save() : null;
+        makeHighlighter(kind)(el);
+        if (position) jar.restore(position);
+      }, 30);
+      historyTimer = window.setTimeout(finishHistory, 300);
+    };
+    const onCompositionStart = () => {
+      finishHistory();
+      beginInput();
+      composingRef.current = true;
+    };
+    const onCompositionEnd = () => {
+      composingRef.current = false;
+      onInput();
+    };
+    const recordOnFocus = () => jar.recordHistory();
+    // Capture before CodeJar: its default Tab replaces a selected block.
+    const handleIndent = (event: KeyboardEvent) => {
+      if (event.isComposing || composingRef.current) return;
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        finishHistory();
+        return;
+      }
+      if (
+        !["Tab", "Home", "Backspace"].includes(event.key) ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey
+      )
+        return;
+      const position = jar.save();
+      const code = jar.toString();
+      if (event.key === "Home") {
+        event.preventDefault();
+        const end = smartHomeOffset(code, position.end);
+        const start = event.shiftKey ? position.start : end;
+        jar.restore({ start, end, dir: start <= end ? "->" : "<-" });
+        updateCursor();
+        return;
+      }
+      if (
+        event.key === "Tab" &&
+        position.start === position.end &&
+        !event.shiftKey
+      )
+        return;
+      const changed =
+        event.key === "Backspace"
+          ? indentBackspace(code, position.start, position.end)
+          : indentLines(code, position.start, position.end, event.shiftKey);
+      if (!changed) return;
+      event.preventDefault();
+      if (changed.code === code) return;
+      finishHistory();
+      jar.recordHistory();
+      jar.updateCode(changed.code);
+      jar.restore({ ...changed, dir: position.dir });
+      jar.recordHistory();
+      updateCursor();
+    };
     // Overtype handler must fire before CodeJar's keydown (capture phase)
     const handleYamlCommentShortcut = (event: KeyboardEvent) => {
       if (
+        event.isComposing ||
+        composingRef.current ||
         kind !== "yaml" ||
         (!event.metaKey && !event.ctrlKey) ||
         (event.key !== "/" && event.code !== "Slash")
@@ -426,34 +506,47 @@ export function CodeEditor({
       jar.recordHistory();
     };
     el.addEventListener("keydown", handleOvertype, true);
+    el.addEventListener("keydown", handleIndent, true);
     el.addEventListener("keydown", handleYamlCommentShortcut, true);
+    el.addEventListener("focus", recordOnFocus, { once: true });
+    // Capture before CodeJar marks itself unfocused, so quick saves retain undo.
+    el.addEventListener("blur", finishHistory, true);
+    el.addEventListener("beforeinput", beginInput);
+    el.addEventListener("input", onInput);
+    el.addEventListener("compositionstart", onCompositionStart);
+    el.addEventListener("compositionend", onCompositionEnd);
+    document.addEventListener("selectionchange", updateCursor);
+    el.addEventListener("keyup", updateCursor);
+    updateCursor();
     jarRef.current = jar;
     return () => {
       el.removeEventListener("keydown", handleOvertype, true);
+      el.removeEventListener("keydown", handleIndent, true);
       el.removeEventListener("keydown", handleYamlCommentShortcut, true);
+      el.removeEventListener("focus", recordOnFocus);
+      el.removeEventListener("blur", finishHistory, true);
+      el.removeEventListener("beforeinput", beginInput);
+      el.removeEventListener("input", onInput);
+      el.removeEventListener("compositionstart", onCompositionStart);
+      el.removeEventListener("compositionend", onCompositionEnd);
+      document.removeEventListener("selectionchange", updateCursor);
+      el.removeEventListener("keyup", updateCursor);
+      window.clearTimeout(highlightTimer);
+      window.clearTimeout(historyTimer);
+      composingRef.current = false;
       jar.destroy();
     };
   }, [content, kind, makeHighlighter, view]);
 
-  // Keep gutter horizontal position pinned when scrolling horizontally
-  useEffect(() => {
-    const scrollEl = scrollRef.current;
-    if (!scrollEl) return;
-    const onScroll = () => {
-      if (gutterRef.current) {
-        gutterRef.current.style.transform = `translateX(${scrollEl.scrollLeft}px)`;
-      }
-    };
-    scrollEl.addEventListener("scroll", onScroll);
-    return () => scrollEl.removeEventListener("scroll", onScroll);
-  }, []);
-
   // Re-apply search highlights when term or active index changes, and scroll active into view
   useEffect(() => {
-    if (!editorRef.current) return;
+    if (!editorRef.current || composingRef.current) return;
     const editor = editorRef.current;
+    const position =
+      document.activeElement === editor ? jarRef.current?.save() : null;
     // Re-run the full highlighter (syntax + search marks)
     makeHighlighter(kind)(editor);
+    if (position) jarRef.current?.restore(position);
     // Scroll the active match into view
     requestAnimationFrame(() => {
       const active = editor.querySelector(".hl-search-active");
@@ -503,9 +596,10 @@ export function CodeEditor({
 
   const handleSave = useCallback(
     async (force = false) => {
+      const code = currentContent.current;
       if (isYamlFile && !force) {
         const issues = await validateFluidConfigForSave(
-          currentContent.current,
+          code,
           useMachineStore.getState().espInfo?.version,
         );
         if (issues.length) {
@@ -515,8 +609,9 @@ export function CodeEditor({
       }
       setSaving(true);
       try {
-        await onSave(currentContent.current);
-        setDirty(false);
+        await onSave(code);
+        savedContent.current = code;
+        setDirty(currentContent.current !== code);
         if (isYamlFile) setSavedOnce(true);
         return true;
       } catch (e) {
@@ -534,7 +629,7 @@ export function CodeEditor({
       if (!code.includes("# Edited using Config Studio"))
         code = `# Edited using Config Studio\n${code}`;
       currentContent.current = code;
-      setDirty(code !== content);
+      setDirty(code !== savedContent.current);
       updateLineCount(code);
       jarRef.current?.updateCode(code);
     },
@@ -660,7 +755,7 @@ export function CodeEditor({
     matchIndexRef.current = 0;
     setSearchTerm(term);
     setMatchIndex(0);
-    setMatchCount(countMatches(currentContent.current, term));
+    setMatchCount(findEditorMatches(currentContent.current, term).length);
   }
 
   function nextMatch() {
@@ -753,7 +848,11 @@ export function CodeEditor({
                   className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:opacity-40 ${view === "studio" ? "bg-surface text-accent shadow-sm" : "text-text-muted"}`}
                   onClick={switchToStudio}
                   disabled={!canUseStudio}
-                  title={!canUseStudio ? "Config Studio is available on tablets and desktops" : undefined}
+                  title={
+                    !canUseStudio
+                      ? "Config Studio is available on tablets and desktops"
+                      : undefined
+                  }
                 >
                   <SlidersHorizontal size={12} /> Studio
                 </button>
@@ -876,7 +975,7 @@ export function CodeEditor({
           ref={scrollRef}
           className={`${isYamlFile && view === "studio" ? "hidden" : "block"} flex-1 overflow-auto min-h-0 bg-elevated/50`}
         >
-          <div className="flex min-h-full">
+          <div className="flex min-h-full min-w-full w-max">
             {/* Gutter */}
             <div
               ref={gutterRef}
@@ -884,17 +983,46 @@ export function CodeEditor({
               aria-hidden="true"
             >
               {Array.from({ length: lineCount }, (_, i) => (
-                <div key={i} className="code-gutter-line">
+                <div
+                  key={i}
+                  className={`code-gutter-line ${cursor.line === i + 1 ? "code-gutter-active" : ""}`}
+                >
                   {i + 1}
                 </div>
               ))}
             </div>
             {/* Code area */}
-            <div className="flex-1 min-w-0">
-              <div ref={editorRef} className="code-editor" />
+            <div className="flex-1 relative">
+              <div
+                className="code-active-line"
+                aria-hidden="true"
+                style={{ top: `calc(16px + ${cursor.line - 1} * 1.6em)` }}
+              />
+              <div
+                ref={editorRef}
+                className="code-editor"
+                role="textbox"
+                aria-label={`${filename} code editor`}
+                aria-multiline="true"
+                aria-describedby="code-editor-help"
+                autoCapitalize="off"
+                autoCorrect="off"
+              />
             </div>
           </div>
         </div>
+        {view === "code" && (
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-border bg-surface px-3 py-1 text-xs text-text-muted shrink-0">
+            <span className="font-mono">
+              Ln {cursor.line}, Col {cursor.column}
+              {cursor.selected > 0 && ` · ${cursor.selected} selected`} ·
+              Spaces: 2
+            </span>
+            <span id="code-editor-help">
+              Tab / Shift+Tab: indent selection · Paste keeps spacing
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Unsaved changes confirmation */}
