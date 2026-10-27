@@ -389,15 +389,17 @@ export function findPlungePoints(segments: SegmentTable): PlungePoints {
     if (segments.moveCode(index) !== MOVE_FEED || segments.isArc(index) || !(pz[index + 1] < pz[index])) continue
     const x = px[index], y = py[index]
     if (Math.abs(px[index + 1] - x) > SAME_XY_MM || Math.abs(py[index + 1] - y) > SAME_XY_MM) continue
+    const tool = segments.tools[index]
     const last = holeSegments.length - 1
-    if (last >= 0 && Math.abs(xy[2 * last] - x) <= SAME_XY_MM && Math.abs(xy[2 * last + 1] - y) <= SAME_XY_MM) {
+    // Another tool at the same spot is its own hole, in its own colour.
+    if (last >= 0 && tools[last] === tool && Math.abs(xy[2 * last] - x) <= SAME_XY_MM && Math.abs(xy[2 * last + 1] - y) <= SAME_XY_MM) {
       holeSegments[last] = index
       continue
     }
     if (holeSegments.length >= MAX_PLUNGE_POINTS) break
     xy.push(x, y)
     holeSegments.push(index)
-    tools.push(segments.tools[index])
+    tools.push(tool)
   }
   return {
     count: holeSegments.length,

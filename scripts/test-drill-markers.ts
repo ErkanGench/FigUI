@@ -36,6 +36,13 @@ const plunges = (lines: string[]) => findPlungePoints(parseGCode(lines.join('\n'
 }
 
 {
+  // A tool change between plunges at one spot keeps the holes apart.
+  const holes = plunges(['G21 G90', 'T1 M6', 'G0 Z2', 'G0 X1 Y1', 'G1 Z-1 F100', 'G0 Z25', 'T2 M6', 'G0 Z2', 'G1 Z-3', 'G0 Z2'])
+  assert.equal(holes.count, 2)
+  assert.deepEqual(Array.from(holes.tools), [1, 2])
+}
+
+{
   // Laser work never plunges; upward feeds and ramps are not holes.
   assert.equal(plunges(['G21 G90', 'G0 X0 Y0', 'M4 S500', 'G1 X10 F1000', 'G1 Y10', 'M5']).count, 0)
   assert.equal(plunges(['G21 G90', 'G0 Z-3', 'G1 Z2 F100']).count, 0)
