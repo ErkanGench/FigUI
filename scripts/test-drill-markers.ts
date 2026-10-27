@@ -43,6 +43,14 @@ const plunges = (lines: string[]) => findPlungePoints(parseGCode(lines.join('\n'
 }
 
 {
+  // Leaving a hole and coming back without drilling elsewhere starts a new one,
+  // so the first is marked done after its own plunge.
+  const holes = plunges(['G21 G90', 'G0 Z2', 'G0 X1 Y1', 'G1 Z-1 F100', 'G0 Z2', 'G0 X5 Y1', 'G0 X1 Y1', 'G1 Z-3', 'G0 Z2'])
+  assert.equal(holes.count, 2)
+  assert.equal(completedPlungeCount(holes, holes.segments[0] + 1), 1)
+}
+
+{
   // Laser work never plunges; upward feeds and ramps are not holes.
   assert.equal(plunges(['G21 G90', 'G0 X0 Y0', 'M4 S500', 'G1 X10 F1000', 'G1 Y10', 'M5']).count, 0)
   assert.equal(plunges(['G21 G90', 'G0 Z-3', 'G1 Z2 F100']).count, 0)

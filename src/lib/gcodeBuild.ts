@@ -385,14 +385,19 @@ export function findPlungePoints(segments: SegmentTable): PlungePoints {
   const xy: number[] = []
   const holeSegments: number[] = []
   const tools: number[] = []
+  // Pecks belong to the last hole only while the tool has not moved off it.
+  let inHole = false
   for (let index = 0; index < segments.length; index++) {
-    if (segments.moveCode(index) !== MOVE_FEED || segments.isArc(index) || !(pz[index + 1] < pz[index])) continue
     const x = px[index], y = py[index]
-    if (Math.abs(px[index + 1] - x) > SAME_XY_MM || Math.abs(py[index + 1] - y) > SAME_XY_MM) continue
+    if (segments.isArc(index) || Math.abs(px[index + 1] - x) > SAME_XY_MM || Math.abs(py[index + 1] - y) > SAME_XY_MM) {
+      inHole = false
+      continue
+    }
+    if (segments.moveCode(index) !== MOVE_FEED || !(pz[index + 1] < pz[index])) continue
     const tool = segments.tools[index]
     const last = holeSegments.length - 1
     // Another tool at the same spot is its own hole, in its own colour.
-    if (last >= 0 && tools[last] === tool && Math.abs(xy[2 * last] - x) <= SAME_XY_MM && Math.abs(xy[2 * last + 1] - y) <= SAME_XY_MM) {
+    if (inHole && tools[last] === tool) {
       holeSegments[last] = index
       continue
     }
@@ -400,6 +405,7 @@ export function findPlungePoints(segments: SegmentTable): PlungePoints {
     xy.push(x, y)
     holeSegments.push(index)
     tools.push(tool)
+    inHole = true
   }
   return {
     count: holeSegments.length,
