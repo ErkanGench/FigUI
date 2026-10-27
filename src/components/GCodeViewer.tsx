@@ -2130,6 +2130,8 @@ export function GCodeViewer({ className, isTablet, showOverrides, fitToViewSigna
   useEffect(() => {
     if (!isJobRunning && !isJobHeld) disarmAbort()
   }, [isJobRunning, isJobHeld, disarmAbort])
+  // Another job may follow without an Idle report in between.
+  useEffect(() => disarmAbort(), [senderJobId, trackedJobStartedAt, status.sdFilename, disarmAbort])
 
   // $SD/Run is only queued when Start is pressed. If the controller refuses the
   // file (moved, renamed, card not mounted) it stays Idle and never reports the

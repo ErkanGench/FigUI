@@ -116,9 +116,22 @@ report('Idle')
 await delay(250)
 assert.equal(g90Count(), 2, 'no G90 after a soft reset')
 
-// The watch ends only when a [GC:] report shows G90: a queued line can be
-// lost, so G90 goes out again while reports still show G91.
-const gc = (distance: string) => socket.receive(`[GC:G0 G54 G17 G21 ${distance} G94 M5 M9 T0 F0 S0]`)
+// G90 is followed by its own $G, and only that reply ends the watch: a lost
+// G90 goes out again, a G91 typed later is left alone. Replies come in the
+// order the $G queries went out (the status poll sends some too).
+const gc = (distance: string) => {
+  socket.receive(`[GC:G0 G54 G17 G21 ${distance} G94 M5 M9 T0 F0 S0]`)
+  socket.receive('ok')
+}
+let answered = 0
+const answerAfterLastG90 = (distance: string) => {
+  const g90At = socket.sent.lastIndexOf('G90')
+  const earlier = socket.sent.slice(0, g90At).filter(item => item === '$G').length
+  for (; answered < earlier; answered++) gc('G91')
+  assert.equal(socket.sent.indexOf('$G', g90At), g90At + 1, '$G goes out right after G90')
+  gc(distance)
+  answered++
+}
 probeMode.setProbeCycleActive(true)
 probeMode.markProbeRelative()
 report('Idle')
@@ -128,16 +141,16 @@ assert.equal(g90Count(), 3, 'the end of a cycle sends G90')
 probeMode.setProbeCycleActive(false)
 report('Idle')
 await delay(250)
-assert.equal(g90Count(), 3, 'no second G90 before a report says whether it took')
-gc('G91')
+assert.equal(g90Count(), 3, 'no second G90 before its $G is answered')
+answerAfterLastG90('G91')
 await delay(50)
-assert.equal(g90Count(), 4, 'sent again when the next report still shows G91')
-gc('G90')
+assert.equal(g90Count(), 4, 'sent again when its $G still shows G91')
+answerAfterLastG90('G90')
 await delay(50)
-gc('G91') // a relative move typed later is not the probe's
+socket.receive('[GC:G0 G54 G17 G21 G91 G94 M5 M9 T0 F0 S0]') // a G91 typed later
 report('Idle')
 await delay(250)
-assert.equal(g90Count(), 4, 'a report showing G90 ends the watch')
+assert.equal(g90Count(), 4, 'its $G showing G90 ends the watch; a later G91 is left alone')
 
 // A drop while G90 was on its way: it is sent again after reconnecting.
 probeMode.setProbeCycleActive(true)
