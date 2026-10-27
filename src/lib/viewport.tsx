@@ -8,6 +8,8 @@ export interface ViewportMetrics {
   innerHeight: number
   visualViewportWidth: number | null
   visualViewportHeight: number | null
+  visualViewportOffsetTop: number
+  visualViewportOffsetLeft: number
   devicePixelRatio: number
   isPortrait: boolean
   isLandscape: boolean
@@ -29,6 +31,8 @@ function readViewportMetrics(): ViewportMetrics {
     innerHeight,
     visualViewportWidth: vv?.width ?? null,
     visualViewportHeight: vv?.height ?? null,
+    visualViewportOffsetTop: vv?.offsetTop ?? 0,
+    visualViewportOffsetLeft: vv?.offsetLeft ?? 0,
     devicePixelRatio: typeof window === 'undefined' ? 1 : window.devicePixelRatio,
     isPortrait,
     isLandscape,
@@ -54,6 +58,7 @@ function subscribeViewport(listener: () => void) {
     window.addEventListener('resize', scheduleViewportUpdate)
     window.addEventListener('orientationchange', scheduleViewportUpdate)
     window.visualViewport?.addEventListener('resize', scheduleViewportUpdate)
+    window.visualViewport?.addEventListener('scroll', scheduleViewportUpdate)
   }
   return () => {
     listeners.delete(listener)
@@ -61,6 +66,7 @@ function subscribeViewport(listener: () => void) {
       window.removeEventListener('resize', scheduleViewportUpdate)
       window.removeEventListener('orientationchange', scheduleViewportUpdate)
       window.visualViewport?.removeEventListener('resize', scheduleViewportUpdate)
+      window.visualViewport?.removeEventListener('scroll', scheduleViewportUpdate)
     }
   }
 }

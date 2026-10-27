@@ -3,7 +3,8 @@ import { Puzzle, X, RefreshCw } from 'lucide-react'
 import { useMachineStore } from '../store'
 import { sendCommand, listFiles as listDeviceFiles, fetchFileContent, saveFileContent } from '../lib/http'
 import { invalidateFileCache } from './FileManager'
-import { sendRaw, sendRealtime, onLine } from '../lib/ws'
+import { lineRefusalReason, sendRaw, sendRealtime, onLine } from '../lib/ws'
+import { sendCloseCommand } from '../lib/pluginClose'
 import type { Plugin } from '../types'
 
 interface PluginRequest {
@@ -50,6 +51,9 @@ export function PluginFrame({ plugin, onClose, inline }: { plugin: Plugin; onClo
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const statusSubscribed = useRef(false)
   const lineUnsubRef = useRef<(() => void) | null>(null)
+  // A line the plugin asked to be sent when its window goes away (a laser
+  // pointer's M5): the plugin itself is unreachable by then.
+  const closeCommandRef = useRef('')
   const [srcDoc, setSrcDoc] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [frameLoaded, setFrameLoaded] = useState(false)
@@ -91,8 +95,8 @@ export function PluginFrame({ plugin, onClose, inline }: { plugin: Plugin; onClo
         case 'sendCommand': {
           const cmd = String(msg.params?.command ?? '')
           if (!useMachineStore.getState().connected) { reply(null, 'Not connected'); break }
-          sendRaw(cmd)
-          reply(null)
+          if (sendRaw(cmd)) reply(null)
+          else reply(null, lineRefusalReason())
           break
         }
         case 'sendRealtime': {
@@ -162,6 +166,10 @@ export function PluginFrame({ plugin, onClose, inline }: { plugin: Plugin; onClo
           reply(null)
           onClose()
           break
+        case 'setCloseCommand':
+          closeCommandRef.current = String(msg.params?.command ?? '').trim()
+          reply(null)
+          break
         case 'getDeviceInfo':
           reply(useMachineStore.getState().espInfo); break
         case 'getMachineSettings':
@@ -208,6 +216,8 @@ export function PluginFrame({ plugin, onClose, inline }: { plugin: Plugin; onClo
       window.removeEventListener('message', onMessage)
       lineUnsubRef.current?.()
       lineUnsubRef.current = null
+      if (closeCommandRef.current) sendCloseCommand(closeCommandRef.current)
+      closeCommandRef.current = ''
     }
   }, [plugin.id])
 

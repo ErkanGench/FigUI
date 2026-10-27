@@ -238,6 +238,8 @@ interface Store {
   controllerResetPending: boolean
   startupPending: boolean
   status: MachineStatus
+  /** Counts updates that carried a controller state, so a stale state kept across a reconnect can be told apart from a fresh one. */
+  statusReportCount: number
   espInfo: ESPInfo | null
   controllerSettings: ControllerSettings
   controllerConfigSettings: FluidNCSetting[] | null
@@ -250,6 +252,8 @@ interface Store {
   positionMode: PositionMode
   sidebarTab: SidebarTab
   jogStep: JogStep
+  /** Fine jog: the 0.1 mm step becomes 0.01 mm. Shared by every jog pad, not kept across a reload. */
+  fineJog: boolean
   axes: number
   macros: Macro[]
   watchdog: WatchdogState
@@ -278,6 +282,7 @@ interface Store {
   setPositionMode: (m: PositionMode) => void
   setSidebarTab: (t: SidebarTab) => void
   setJogStep: (s: JogStep) => void
+  setFineJog: (on: boolean) => void
   setAxes: (n: number) => void
   setMacros: (macros: Macro[]) => void
   setWatchdogState: (state: Partial<WatchdogState>) => void
@@ -293,6 +298,7 @@ export const useMachineStore = create<Store>((set) => ({
   controllerResetPending: false,
   startupPending: false,
   status: DEFAULT_STATUS,
+  statusReportCount: 0,
   espInfo: null,
   controllerSettings: {},
   controllerConfigSettings: null,
@@ -308,6 +314,7 @@ export const useMachineStore = create<Store>((set) => ({
   positionMode: 'WPos',
   sidebarTab: 'files',
   jogStep: 1,
+  fineJog: false,
   axes: 3,
   macros: [],
   watchdog: DEFAULT_WATCHDOG_STATE,
@@ -346,6 +353,8 @@ export const useMachineStore = create<Store>((set) => ({
         countDefinedAxes(merged.wpos),
       )
 
+      const statusReportCount = s.state !== undefined ? state.statusReportCount + 1 : state.statusReportCount
+
       const detectedSettings: Partial<ControllerSettings> = {}
       const xRange = inferMachineRangeFromPosition(merged.mpos.x, state.controllerSettings.maxTravelX)
       const yRange = inferMachineRangeFromPosition(merged.mpos.y, state.controllerSettings.maxTravelY)
@@ -381,13 +390,14 @@ export const useMachineStore = create<Store>((set) => ({
       return Object.keys(detectedSettings).length > 0
         ? {
             status: merged,
+            statusReportCount,
             axes: detectedAxes,
             controllerSettings: {
               ...state.controllerSettings,
               ...detectedSettings,
             },
           }
-        : { status: merged, axes: detectedAxes }
+        : { status: merged, statusReportCount, axes: detectedAxes }
     }),
 
   setEspInfo: (espInfo) =>
@@ -453,6 +463,7 @@ export const useMachineStore = create<Store>((set) => ({
   setPositionMode: (positionMode) => set({ positionMode }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   setJogStep: (jogStep) => set({ jogStep }),
+  setFineJog: (fineJog) => set({ fineJog }),
   setAxes: (axes) => set({ axes }),
 
   setMacros: (macros) => set({ macros }),
